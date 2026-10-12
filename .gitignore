@@ -1,0 +1,19 @@
+# Go build output
+*.exe
+*.test
+*.out
+*.prof
+
+# Results (raw data is too large for version control)
+results/raw/
+
+# Editor and OS files
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# IDE
+.idea/
+.vscode/
+*.iml
