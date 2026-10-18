@@ -154,16 +154,16 @@ func TestCrashCyclePartialRetention(t *testing.T) {
 		}
 	}
 
-	if err := db.Close(); err != nil {
-		t.Fatalf("close: %v", err)
-	}
-
 	// Crash with 0% retention of unsynced data.
 	rng := rand.New(rand.NewPCG(99, 0))
 	crashedFS := memFS.CrashClone(vfs.CrashCloneCfg{
 		UnsyncedDataPercent: 0,
 		RNG:                 rng,
 	})
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
 
 	result := recovery.SafeOpen(crashedFS, "", 30*time.Second)
 	if result.Panic != "" {
@@ -172,11 +172,11 @@ func TestCrashCyclePartialRetention(t *testing.T) {
 	if result.Timeout {
 		t.Fatal("recovery timed out")
 	}
-	// Open errors are possible with 0% retention — the WAL or manifest
-	// may be truncated. This is a valid crash outcome per the crash model.
 	if result.Err != nil {
-		t.Logf("open returned error (valid crash outcome): %v", result.Err)
-		return
+		t.Fatalf("recovery open error: %v", result.Err)
+	}
+	if result.DB == nil {
+		t.Fatal("recovery returned nil DB without error")
 	}
 	defer result.DB.Close()
 
@@ -202,13 +202,26 @@ func TestCrashCyclePartialRetention(t *testing.T) {
 		}
 	}
 
-	// Unsynced keys may or may not be present — both are valid.
 	unsyncedCount := 0
+	missingUnsynced := false
 	for i := 0; i < 5; i++ {
 		key := fmt.Sprintf("unsynced-%03d", i)
-		if _, ok := contents[key]; ok {
-			unsyncedCount++
+		got, ok := contents[key]
+		if !ok {
+			missingUnsynced = true
+			continue
 		}
+		if missingUnsynced {
+			t.Errorf("unsynced key %s survived after an earlier key was lost", key)
+		}
+		expected := fmt.Sprintf("uval-%03d", i)
+		if got != expected {
+			t.Errorf("key %s: got %q, want %q", key, got, expected)
+		}
+		unsyncedCount++
+	}
+	if len(contents) != 5+unsyncedCount {
+		t.Errorf("expected %d keys, got %d", 5+unsyncedCount, len(contents))
 	}
 	t.Logf("unsynced keys surviving: %d/5 (0%% retention)", unsyncedCount)
 }
