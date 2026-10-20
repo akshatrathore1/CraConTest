@@ -29,8 +29,9 @@ every mutating filesystem call. The recording runs on `vfs.NewMem()` (not
   `DiskWriteCategory`, operation markers (`OpBegin`/`OpEnd` around each client
   API call), and engine event annotations (from `Options.EventListener`).
 - A **history ledger**: for each client operation, the operation ID, kind, key,
-  value hash, sync flag, and the trace positions where it began and was
-  acknowledged.
+  complete ordered mutation payloads, sync flag, and the trace event IDs
+  where it began and was acknowledged. Hashes alone cannot reconstruct legal
+  states or verify atomic batches.
 - An optional **fault label**: which seeded fault was active, or none for the
   null control.
 
@@ -59,18 +60,25 @@ crash candidates, and rank them by strategy.
 
 **Outputs:**
 - A **persistence DAG**: same-file write ordering, sync barriers,
-  rename/link/directory-sync edges, cross-file manifest-to-SSTable
-  dependencies.
+  rename/link/directory-sync edges and observed cross-file listener
+  dependencies. Filename-only guesses do not constitute manifest parsing.
 - A **persistence-state view**: for each event index *k*, which files hold
   unsynced data, which directory entries are pending, and how many persistence
   events are downstream.
 - A **candidate universe** *U*: each candidate is a tuple
-  *(event index k, retention percentage, seed)*.
-  - *k*: where the crash occurs in the trace.
+  *(event cutoff k, retention percentage, seed)*.
+  - *k*: after one-based events `1..k`; zero is before the trace.
   - *retention percentage*: what share of unsynced data survives (maps to
     `CrashCloneCfg.UnsyncedDataPercent`).
-  - *seed*: which deterministic realization of that retention policy.
+  - *seed*: derived from the base seed, cutoff and percentage by the
+    version-one SHA-256 encoding.
 - **Rankings**: one ordered list of candidates per strategy.
+
+The initial execution profile uses 0% and 100% retention. Pinned CrashClone
+does not reproduce intermediate-retention images from a seed alone because
+map traversal affects RNG consumption. The tuple can represent 0..100, but
+intermediate policies require a separately validated sampler or saved image.
+The complete tuple, not a truncated hash, identifies a candidate and outcome.
 
 **Strategies** rank *U* using only trace-derived features. They cannot observe
 outcomes, history, or recovery results. This constraint is enforced by Go
@@ -84,11 +92,13 @@ outcome table.
 
 **Steps per candidate:**
 
-1. **Replay**: apply trace events `[0..k]` to a fresh `vfs.NewCrashableMem()`.
+1. **Replay**: apply trace events `events[:k]` to a fresh `vfs.NewCrashableMem()`.
    For increasing *k*, a single forward pass can serve multiple candidates.
    Replay must stop mutating the filesystem before calling `CrashClone()` —
    the v2.1.7 `MemFS.CrashClone` acquires an exclusive write lock
    (`cloneMu.Lock()`) that blocks all mutations.
+  Preserve open resource handles and cursor/alias behavior. Do not close
+  or synchronize those handles before the snapshot.
 
 2. **Clone**: call `CrashClone(CrashCloneCfg{UnsyncedDataPercent: p, RNG: rng})`
    on the replayed filesystem to produce the post-crash state.
@@ -104,7 +114,12 @@ outcome table.
    agree, dump all key-value pairs.
 
 5. **Oracle**: compare the dump against the history ledger using the prefix
-   (no-hole) rule. Emit exactly one outcome class per candidate.
+  (no-hole) rule. Legal states are whole-operation prefixes between the last
+  acknowledged synchronous mutation and the latest begun mutation at the
+  cutoff. In-flight batches are wholly present or absent. A later Sync also
+  covers earlier NoSync mutations. Compare whole states before diagnosing
+  divergence so overwrites, deletes and repeated states remain legal.
+  Emit exactly one outcome class per candidate.
 
 **Outputs:**
 - An **outcome table**: one record per candidate with outcome class, violated
@@ -143,13 +158,10 @@ measure each component at 20 evenly spaced event indices, extrapolate to
 estimate the affordable universe size for the full experiment. This cost check
 is a Week 2–3 milestone.
 
-For a 1,000-operation workload with small memtables:
-- Trace: ~5,000–20,000 events (writes, syncs, flushes, compactions).
-- Candidate universe with 3 retention policies and 1 seed each: ~15,000–60,000
-  candidates.
-- At 10ms average per candidate (clone + recovery + check), the full pass takes
-  2.5–10 minutes. If too expensive, the universe is reduced to a fixed
-  stratified sample.
+Trace size, selected cutoffs and total execution cost require measurement
+with the recorder and replay active. Historical close-first clone timings
+exclude replay and do not establish an experiment budget. If the full pass
+is too expensive, all strategies use the same fixed stratified universe.
 
 ## Package Structure
 
@@ -249,7 +261,11 @@ history    trace          strategies ──► rankings           outcome table
 | Evaluation results | `results/processed/` | Yes |
 | Figures | `results/plots/`, `paper/` | Yes |
 
-The run ID is a hash of the workload specification, ensuring reproducibility.
+Trace, history, universe, ranking and outcome documents use schema_version=1
+and ordered non-null arrays. Outcomes persist the complete candidate tuple.
+Each run records its configuration, seeds, weights, fault identity, Pebble
+version, Go version and platform. Run directories are explicit identifiers;
+canonical run-ID hashing remains a separate design task.
 
 ## Risks and Early Measurements
 
@@ -277,6 +293,12 @@ The run ID is a hash of the workload specification, ensuring reproducibility.
 
 - **Go toolchain**: pinned version (see `go.mod`). Build and test:
   `go build ./...`, `go vet ./...`, `go test ./...`.
+
+## Revision History
+
+| Date | Section | Correction |
+|---|---|---|
+| 2026-10-20 | Pipeline and artifacts | Defined event-ID cutoffs, endpoint retention, full mutation history and full-tuple outcomes; removed uncertified cost and run-hash claims. |
 
 - **Python**: for `analysis/` scripts (statistics, plotting). Not required for
   the Go pipeline.

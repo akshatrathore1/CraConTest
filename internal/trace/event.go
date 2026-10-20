@@ -10,16 +10,16 @@ type Kind string
 
 const (
 	// Filesystem operations.
-	KindCreate       Kind = "Create"
-	KindLink         Kind = "Link"
-	KindLock         Kind = "Lock"
-	KindMkdirAll     Kind = "MkdirAll"
-	KindOpen         Kind = "Open"
-	KindOpenDir      Kind = "OpenDir"
+	KindCreate        Kind = "Create"
+	KindLink          Kind = "Link"
+	KindLock          Kind = "Lock"
+	KindMkdirAll      Kind = "MkdirAll"
+	KindOpen          Kind = "Open"
+	KindOpenDir       Kind = "OpenDir"
 	KindOpenReadWrite Kind = "OpenReadWrite"
-	KindRemove       Kind = "Remove"
-	KindRemoveAll    Kind = "RemoveAll"
-	KindRename       Kind = "Rename"
+	KindRemove        Kind = "Remove"
+	KindRemoveAll     Kind = "RemoveAll"
+	KindRename        Kind = "Rename"
 	KindReuseForWrite Kind = "ReuseForWrite"
 
 	// File operations.
@@ -28,6 +28,9 @@ const (
 	KindSyncData Kind = "SyncData"
 	KindSyncTo   Kind = "SyncTo"
 	KindClose    Kind = "Close"
+	KindRead     Kind = "Read"
+	KindWriteAt  Kind = "WriteAt"
+	KindUnlock   Kind = "Unlock"
 
 	// Annotations.
 	KindOpBegin     Kind = "OpBegin"
@@ -37,7 +40,7 @@ const (
 
 // Event represents a single VFS operation or annotation in the trace.
 type Event struct {
-	// ID is a monotonically increasing identifier assigned at record time.
+	// ID is a consecutive one-based identifier assigned at record time.
 	ID uint64 `json:"id"`
 
 	// Kind identifies the operation type.
@@ -48,17 +51,16 @@ type Event struct {
 	// target a specific file.
 	File string `json:"file,omitempty"`
 
-	// File2 is the second path for two-path operations (Rename, Link).
+	// File2 is the destination path for Rename, Link and ReuseForWrite.
 	File2 string `json:"file2,omitempty"`
 
-	// Off is the byte offset for positioned writes.
+	// Off is the input offset for Read, Write and WriteAt.
 	Off int64 `json:"off,omitempty"`
 
-	// Len is the number of bytes written. The actual data is stored
-	// separately if payload recording is enabled.
+	// Len is the returned byte count for Read, Write and WriteAt.
 	Len int `json:"len,omitempty"`
 
-	// Data holds the write payload (a copy of the bytes passed to Write).
+	// Data holds the complete write input, copied before the underlying call.
 	// Nil for non-write events.
 	Data []byte `json:"data,omitempty"`
 
@@ -78,4 +80,15 @@ type Event struct {
 	// Err records any error returned by the operation, as a string.
 	// Empty on success.
 	Err string `json:"err,omitempty"`
+
+	Handle   uint64   `json:"handle,omitempty"`
+	Dir      bool     `json:"dir,omitempty"`
+	Created  bool     `json:"created,omitempty"`
+	Size     int64    `json:"size,omitempty"`
+	Mode     uint32   `json:"mode,omitempty"`
+	FullSync bool     `json:"full_sync,omitempty"`
+	OpKind   string   `json:"op_kind,omitempty"`
+	Job      uint64   `json:"job,omitempty"`
+	Inputs   []string `json:"inputs,omitempty"`
+	Outputs  []string `json:"outputs,omitempty"`
 }
