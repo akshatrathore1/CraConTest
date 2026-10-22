@@ -1,7 +1,9 @@
 package graph_test
 
 import (
+	"bytes"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/akshatrathore1/CraConTest/internal/graph"
@@ -226,5 +228,45 @@ func TestContractTraceBuilds(test *testing.T) {
 	}
 	if view.Cuts[22].OpKind != "set" || view.Cuts[23].OpKind != graph.Background {
 		test.Fatal("OpEnd cutoff must carry the completed kind")
+	}
+}
+
+
+func TestWriteDOT(t *testing.T) {
+	events := walTrace()
+	view, err := graph.Build(events)
+	if err != nil {
+		t.Fatalf("graph.Build: %v", err)
+	}
+
+	var buf1, buf2 bytes.Buffer
+	if err := view.WriteDOT(&buf1); err != nil {
+		t.Fatalf("WriteDOT 1: %v", err)
+	}
+	if err := view.WriteDOT(&buf2); err != nil {
+		t.Fatalf("WriteDOT 2: %v", err)
+	}
+
+	out1 := buf1.String()
+	out2 := buf2.String()
+
+	if out1 != out2 {
+		t.Error("WriteDOT output is not deterministic")
+	}
+
+	if !strings.HasPrefix(out1, "digraph G {") {
+		t.Errorf("expected digraph header, got:\n%s", out1[:50])
+	}
+	if !strings.HasSuffix(strings.TrimSpace(out1), "}") {
+		t.Errorf("expected closing brace, got:\n%s", out1[len(out1)-50:])
+	}
+	if !strings.Contains(out1, "->") {
+		t.Errorf("expected edges in DOT output, got none:\n%s", out1)
+	}
+
+	var nilView *graph.View
+	var nilBuf bytes.Buffer
+	if err := nilView.WriteDOT(&nilBuf); err == nil {
+		t.Error("expected error on nil view WriteDOT, got nil")
 	}
 }

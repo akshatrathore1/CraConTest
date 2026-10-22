@@ -16,9 +16,11 @@ package graph
 
 import (
 	"crypto/sha256"
+	"errors"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math/bits"
 	"path"
 	"sort"
@@ -69,6 +71,57 @@ func (view *View) Successors(id uint64) []uint64 {
 
 // IsVertex reports whether the event is a persistence vertex.
 func (view *View) IsVertex(id uint64) bool { return view.vertices[id] }
+
+// WriteDOT exports the dependency graph in Graphviz DOT format for inspection.
+// Vertices are labeled with event Kind, File, and Op (SRS CCT-REQ-022).
+func (view *View) WriteDOT(w io.Writer) error {
+	if view == nil {
+		return errors.New("graph: nil view")
+	}
+
+	fmt.Fprintln(w, "digraph G {")
+	fmt.Fprintln(w, "  rankdir=LR;")
+	fmt.Fprintln(w, "  node [shape=box, fontname=\"sans-serif\", fontsize=10];")
+	fmt.Fprintln(w, "  edge [fontname=\"sans-serif\", fontsize=9];")
+
+	vIDs := make([]uint64, 0, len(view.vertices))
+	for id := range view.vertices {
+		vIDs = append(vIDs, id)
+	}
+	sort.Slice(vIDs, func(i, j int) bool { return vIDs[i] < vIDs[j] })
+
+	for _, id := range vIDs {
+		var kind, file string
+		var op uint64
+		if id > 0 && int(id) <= len(view.Events) {
+			ev := view.Events[id-1]
+			kind = string(ev.Kind)
+			file = ev.File
+			op = ev.Op
+		}
+		label := fmt.Sprintf("%d: %s", id, kind)
+		if file != "" {
+			label += fmt.Sprintf("\\n%s", file)
+		}
+		if op > 0 {
+			label += fmt.Sprintf("\\nop=%d", op)
+		}
+		fmt.Fprintf(w, "  n%d [label=%q];\n", id, label)
+	}
+
+	for _, id := range vIDs {
+		succs := view.successors[id]
+		sortedSuccs := append([]uint64(nil), succs...)
+		sort.Slice(sortedSuccs, func(i, j int) bool { return sortedSuccs[i] < sortedSuccs[j] })
+		for _, s := range sortedSuccs {
+			fmt.Fprintf(w, "  n%d -> n%d;\n", id, s)
+		}
+	}
+
+	fmt.Fprintln(w, "}")
+	return nil
+}
+
 
 type interval struct{ start, end int64 }
 

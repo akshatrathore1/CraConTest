@@ -244,6 +244,68 @@ func (strategy combined) Rank(view *graph.View, universe []candidate.Candidate) 
 	return result
 }
 
+// ScoreRecord records the exact components and total score of a candidate at selection time.
+type ScoreRecord struct {
+	Candidate candidate.Candidate `json:"candidate"`
+	Rank      int                 `json:"rank"` // zero-based position in the ranking
+	Desc      uint64              `json:"desc"`
+	CrossFile uint64              `json:"cross_file"`
+	Semantic  uint64              `json:"semantic"`
+	Novelty   uint64              `json:"novelty"` // at selection time
+	Score     float64             `json:"score"`
+}
+
+// Explain produces the detailed audit records explaining combined strategy ranking,
+// reproducing NewCombined(w).Rank exactly.
+func Explain(view *graph.View, universe []candidate.Candidate, w Weights) ([]ScoreRecord, error) {
+	for name, value := range map[string]float64{"alpha": w.Alpha, "beta": w.Beta, "gamma": w.Gamma, "delta": w.Delta} {
+		if math.IsNaN(value) || math.IsInf(value, 0) || value < 0 {
+			return nil, fmt.Errorf("strategy: weight %s=%v must be finite and nonnegative", name, value)
+		}
+	}
+
+	ordered := canonical(universe)
+	labels, ok := features(view, ordered)
+	if !ok {
+		return nil, errors.New("strategy: view missing features for candidates")
+	}
+
+	base := make([]float64, len(ordered))
+	queue := make(scoreHeap, 0, len(ordered))
+	for index, label := range labels {
+		base[index] = w.Alpha*float64(label.Desc) + w.Beta*float64(label.CrossFile) + w.Gamma*float64(label.Semantic)
+		queue = append(queue, scored{position: index, score: base[index] + w.Delta, novel: true})
+	}
+	heap.Init(&queue)
+
+	seen := make(map[groupKey]bool)
+	records := make([]ScoreRecord, 0, len(ordered))
+	for queue.Len() > 0 {
+		top := heap.Pop(&queue).(scored)
+		key := groupKey{labels[top.position].StateKey, ordered[top.position].Percent}
+		if top.novel && seen[key] {
+			heap.Push(&queue, scored{position: top.position, score: base[top.position], novel: false})
+			continue
+		}
+		seen[key] = true
+		var novelty uint64
+		if top.novel {
+			novelty = 1
+		}
+		records = append(records, ScoreRecord{
+			Candidate: ordered[top.position],
+			Rank:      len(records),
+			Desc:      labels[top.position].Desc,
+			CrossFile: labels[top.position].CrossFile,
+			Semantic:  labels[top.position].Semantic,
+			Novelty:   novelty,
+			Score:     top.score,
+		})
+	}
+
+	return records, nil
+}
+
 // ErrUnknownStrategy is returned by ByName for an unrecognized name.
 var ErrUnknownStrategy = errors.New("strategy: unknown strategy name")
 

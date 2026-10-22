@@ -101,9 +101,10 @@ func TestFaultMUT1SyncDropping(t *testing.T) {
 
 func runWorkloadWithFS(t *testing.T, wrappedFS vfs.FS) ([]trace.Event, []history.Entry) {
 	opts := &pebble.Options{
-		FS:           wrappedFS,
-		Logger:       recovery.PanicLogger{},
-		MemTableSize: 64 * 1024,
+		FS:                          wrappedFS,
+		Logger:                      recovery.PanicLogger{},
+		MemTableSize:                64 * 1024,
+		DisableAutomaticCompactions: true,
 	}
 
 	db, err := pebble.Open("db", opts)

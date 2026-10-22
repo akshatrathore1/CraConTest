@@ -251,3 +251,51 @@ func TestValidatePermutationRejects(test *testing.T) {
 		test.Fatal(err)
 	}
 }
+
+
+func TestExplainScoreAudit(t *testing.T) {
+	view, universe := referenceView()
+	w := strategy.DefaultWeights
+
+	// Combined rank
+	comb, err := strategy.NewCombined(w)
+	if err != nil {
+		t.Fatalf("NewCombined: %v", err)
+	}
+	ranked := comb.Rank(view, universe)
+
+	// Explain
+	records, err := strategy.Explain(view, universe, w)
+	if err != nil {
+		t.Fatalf("Explain: %v", err)
+	}
+
+	if len(records) != len(ranked) {
+		t.Fatalf("records len %d != ranked len %d", len(records), len(ranked))
+	}
+
+	for i := range ranked {
+		rec := records[i]
+		if rec.Candidate != ranked[i] {
+			t.Errorf("at rank %d: candidate mismatch: %+v vs %+v", i, rec.Candidate, ranked[i])
+		}
+		if rec.Rank != i {
+			t.Errorf("at rank %d: Rank field %d != %d", i, rec.Rank, i)
+		}
+		expectedScore := w.Alpha*float64(rec.Desc) + w.Beta*float64(rec.CrossFile) + w.Gamma*float64(rec.Semantic) + w.Delta*float64(rec.Novelty)
+		if rec.Score != expectedScore {
+			t.Errorf("at rank %d: score %.2f != expected %.2f", i, rec.Score, expectedScore)
+		}
+	}
+
+	// Invalid weights should fail Explain
+	if _, err := strategy.Explain(view, universe, strategy.Weights{Alpha: -1}); err == nil {
+		t.Error("expected error with negative weight in Explain, got nil")
+	}
+
+	// Missing view features should fail Explain
+	badView := syntheticView(map[uint64]graph.Features{1: {}})
+	if _, err := strategy.Explain(badView, universe, w); err == nil {
+		t.Error("expected error with missing features in Explain, got nil")
+	}
+}
