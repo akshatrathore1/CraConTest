@@ -4,9 +4,9 @@ package vfsrec
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"os"
-	"path"
 	"strings"
 	"sync"
 
@@ -86,23 +86,36 @@ func (fs *FS) appendEventLocked(event trace.Event) {
 	}
 }
 
-func canonical(name string) string {
-	if name == "" {
-		return ""
+// ErrUnrepresentablePath is returned, without calling the wrapped filesystem,
+// for a name whose trace spelling would not name the same file.
+var ErrUnrepresentablePath = errors.New("vfsrec: path cannot be recorded faithfully")
+
+// canonical returns the trace spelling of a filesystem name. The recorded
+// profile uses Pebble's in-memory filesystem, whose only separator is "/",
+// which ignores leading separators and collapses repeated ones, and which
+// does not resolve "." or ".." components. Only those equivalences are
+// applied, so the trace path always names the file the call touched. Any
+// other spelling (a "." or ".." component, a backslash, a drive letter or a
+// trailing separator) has no faithful trace representation, and the call is
+// refused with ErrUnrepresentablePath instead of being recorded under a
+// different name. The whole name "." means the root, as it does in MemFS.
+func canonical(name string) (string, error) {
+	p := strings.TrimLeft(name, "/")
+	if p == "" || p == "." {
+		return "", nil
 	}
-	p := strings.ReplaceAll(name, "\\", "/")
-	if len(p) >= 2 && p[1] == ':' && ((p[0] >= 'a' && p[0] <= 'z') || (p[0] >= 'A' && p[0] <= 'Z')) {
-		p = p[2:]
+	parts := strings.Split(p, "/")
+	kept := parts[:0]
+	for index, part := range parts {
+		switch {
+		case part == "" && index < len(parts)-1:
+			continue // repeated separator
+		case part == "", part == ".", part == "..", strings.ContainsAny(part, "\\:"):
+			return "", fmt.Errorf("%w: %q", ErrUnrepresentablePath, name)
+		}
+		kept = append(kept, part)
 	}
-	p = path.Clean(p)
-	p = strings.TrimPrefix(p, "/")
-	for strings.HasPrefix(p, "../") {
-		p = strings.TrimPrefix(p, "../")
-	}
-	if p == "." || p == "/" || p == ".." {
-		return ""
-	}
-	return p
+	return strings.Join(kept, "/"), nil
 }
 
 // Create creates the named file for reading and writing.
@@ -110,7 +123,10 @@ func (fs *FS) Create(name string, category vfs.DiskWriteCategory) (vfs.File, err
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
-	canon := canonical(name)
+	canon, err := canonical(name)
+	if err != nil {
+		return nil, err
+	}
 	innerFile, err := fs.inner.Create(name, category)
 	event := trace.Event{
 		Kind: trace.KindCreate,
@@ -140,9 +156,15 @@ func (fs *FS) Link(oldname, newname string) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
-	canonOld := canonical(oldname)
-	canonNew := canonical(newname)
-	err := fs.inner.Link(oldname, newname)
+	canonOld, err := canonical(oldname)
+	if err != nil {
+		return err
+	}
+	canonNew, err := canonical(newname)
+	if err != nil {
+		return err
+	}
+	err = fs.inner.Link(oldname, newname)
 	event := trace.Event{
 		Kind:  trace.KindLink,
 		File:  canonOld,
@@ -160,7 +182,10 @@ func (fs *FS) Open(name string, opts ...vfs.OpenOption) (vfs.File, error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
-	canon := canonical(name)
+	canon, err := canonical(name)
+	if err != nil {
+		return nil, err
+	}
 	innerFile, err := fs.inner.Open(name, opts...)
 	event := trace.Event{
 		Kind: trace.KindOpen,
@@ -189,7 +214,10 @@ func (fs *FS) OpenReadWrite(name string, category vfs.DiskWriteCategory, opts ..
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
-	canon := canonical(name)
+	canon, err := canonical(name)
+	if err != nil {
+		return nil, err
+	}
 	_, statErr := fs.inner.Stat(name)
 	wasAbsent := errors.Is(statErr, os.ErrNotExist) || os.IsNotExist(statErr)
 
@@ -225,7 +253,10 @@ func (fs *FS) OpenDir(name string) (vfs.File, error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
-	canon := canonical(name)
+	canon, err := canonical(name)
+	if err != nil {
+		return nil, err
+	}
 	innerFile, err := fs.inner.OpenDir(name)
 	event := trace.Event{
 		Kind: trace.KindOpenDir,
@@ -255,8 +286,11 @@ func (fs *FS) Remove(name string) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
-	canon := canonical(name)
-	err := fs.inner.Remove(name)
+	canon, err := canonical(name)
+	if err != nil {
+		return err
+	}
+	err = fs.inner.Remove(name)
 	event := trace.Event{
 		Kind: trace.KindRemove,
 		File: canon,
@@ -273,8 +307,11 @@ func (fs *FS) RemoveAll(name string) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
-	canon := canonical(name)
-	err := fs.inner.RemoveAll(name)
+	canon, err := canonical(name)
+	if err != nil {
+		return err
+	}
+	err = fs.inner.RemoveAll(name)
 	event := trace.Event{
 		Kind: trace.KindRemoveAll,
 		File: canon,
@@ -291,9 +328,15 @@ func (fs *FS) Rename(oldname, newname string) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
-	canonOld := canonical(oldname)
-	canonNew := canonical(newname)
-	err := fs.inner.Rename(oldname, newname)
+	canonOld, err := canonical(oldname)
+	if err != nil {
+		return err
+	}
+	canonNew, err := canonical(newname)
+	if err != nil {
+		return err
+	}
+	err = fs.inner.Rename(oldname, newname)
 	event := trace.Event{
 		Kind:  trace.KindRename,
 		File:  canonOld,
@@ -311,8 +354,14 @@ func (fs *FS) ReuseForWrite(oldname, newname string, category vfs.DiskWriteCateg
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
-	canonOld := canonical(oldname)
-	canonNew := canonical(newname)
+	canonOld, err := canonical(oldname)
+	if err != nil {
+		return nil, err
+	}
+	canonNew, err := canonical(newname)
+	if err != nil {
+		return nil, err
+	}
 	innerFile, err := fs.inner.ReuseForWrite(oldname, newname, category)
 	event := trace.Event{
 		Kind:  trace.KindReuseForWrite,
@@ -343,8 +392,11 @@ func (fs *FS) MkdirAll(dir string, perm os.FileMode) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
-	canon := canonical(dir)
-	err := fs.inner.MkdirAll(dir, perm)
+	canon, err := canonical(dir)
+	if err != nil {
+		return err
+	}
+	err = fs.inner.MkdirAll(dir, perm)
 	event := trace.Event{
 		Kind: trace.KindMkdirAll,
 		File: canon,
@@ -362,7 +414,10 @@ func (fs *FS) Lock(name string) (io.Closer, error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
-	canon := canonical(name)
+	canon, err := canonical(name)
+	if err != nil {
+		return nil, err
+	}
 	closer, err := fs.inner.Lock(name)
 	event := trace.Event{
 		Kind: trace.KindLock,

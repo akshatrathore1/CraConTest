@@ -23,8 +23,9 @@ func pathSlice(name string) []string {
 	if name == "" {
 		return nil
 	}
-	c := canonical(name)
-	if c == "" {
+	c, err := canonical(name)
+	if err != nil || c == "" {
+		// Leave out a path the trace cannot name faithfully.
 		return nil
 	}
 	return []string{c}

@@ -113,6 +113,17 @@ IDs are consecutive and one-based. Cutoff `k` includes events `1..k`, or
 `events[:k]`; zero is the pretrace cutoff. Paths are cleaned, slash-separated
 and relative to the VFS root. An empty directory path names the root.
 
+The recorder rewrites a name only in ways that do not change the file it
+names on the in-memory filesystem used for recording: it drops leading
+separators and collapses repeated ones, both of which that filesystem ignores
+itself. That filesystem does not resolve `.` or `..` and treats a backslash as
+an ordinary byte, so a name containing a `.` or `..` component, a backslash, a
+drive prefix or a trailing separator has no faithful trace spelling. The
+recorder refuses such a call with `ErrUnrepresentablePath` before it reaches
+the wrapped filesystem, rather than recording it under a different name.
+Engine annotations omit such paths. Pebble builds every name with the
+filesystem's own `PathJoin`, so these spellings do not occur in recorded runs.
+
 Successful opens and locks allocate consecutive nonzero handles. Separate
 opens of one path have separate cursors. File events retain the opening label
 after rename, link or unlink; replay acts on the resource handle, not by
@@ -302,3 +313,4 @@ strategies.
 | Date | Section | Correction |
 |---|---|---|
 | 2026-10-20 | Schema, ordering and format | Version-one handles, call results, cursor semantics and JSON envelope replace the path-only sketch and unversioned event stream. |
+| 2026-10-22 | Paths | The recorder applies only spelling changes that name the same in-memory file and refuses names without a faithful trace spelling, instead of resolving `..`, drive prefixes and backslashes. |
