@@ -293,6 +293,16 @@ func TestExplainScoreAudit(t *testing.T) {
 		t.Error("expected error with negative weight in Explain, got nil")
 	}
 
+
+	// Empty universe should return empty records without error
+	emptyRecords, err := strategy.Explain(view, nil, w)
+	if err != nil {
+		t.Errorf("Explain on empty universe returned error: %v", err)
+	}
+	if len(emptyRecords) != 0 {
+		t.Errorf("Explain on empty universe returned %d records, want 0", len(emptyRecords))
+	}
+
 	// Missing view features should fail Explain
 	badView := syntheticView(map[uint64]graph.Features{1: {}})
 	if _, err := strategy.Explain(badView, universe, w); err == nil {

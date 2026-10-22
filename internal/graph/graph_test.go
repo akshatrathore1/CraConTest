@@ -270,3 +270,68 @@ func TestWriteDOT(t *testing.T) {
 		t.Error("expected error on nil view WriteDOT, got nil")
 	}
 }
+
+func TestDeferredEngineEdgesAndUnknownPaths(t *testing.T) {
+	events := []trace.Event{
+		{ID: 1, Kind: trace.KindMkdirAll, File: "db", Mode: 0755},
+		{ID: 2, Kind: trace.KindCreate, File: "db/a", Handle: 1, Cat: "pebble-wal"},
+		{ID: 3, Kind: trace.KindCreate, File: "db/b", Handle: 2, Cat: "pebble-memtable-flush"},
+		{ID: 4, Kind: trace.KindWrite, File: "db/a", Handle: 1, Data: []byte("val"), Len: 3},
+		{ID: 5, Kind: trace.KindSyncData, File: "db/a", Handle: 1},
+		// EngineEvent where output "db/b" has no later vertex than producer (event 5).
+		// Also includes unknown paths in Inputs and Outputs to verify safe omission.
+		{ID: 6, Kind: trace.KindEngineEvent, Note: "FlushEnd", Inputs: []string{"db/a", "nonexistent/in"}, Outputs: []string{"db/b", "nonexistent/out"}},
+		// Subsequent write and sync on "db/b" must resolve the deferred edge from event 5 to event 7.
+		{ID: 7, Kind: trace.KindWrite, File: "db/b", Handle: 2, Data: []byte("out"), Len: 3},
+		{ID: 8, Kind: trace.KindSyncData, File: "db/b", Handle: 2},
+	}
+
+	view, err := graph.Build(events)
+	if err != nil {
+		t.Fatalf("graph.Build: %v", err)
+	}
+
+	// Verify deferred edge: producer 5 -> consumer 7
+	successors5 := view.Successors(5)
+	found := false
+	for _, succ := range successors5 {
+		if succ == 7 {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected deferred edge 5 -> 7, got successors of 5: %v", successors5)
+	}
+
+	// Reachability from vertex 5 (SyncData on a) should reach 7 and 8 on resource b (CrossFile=2)
+	cut5 := view.Cuts[5]
+	if cut5.Desc != 2 || cut5.CrossFile != 2 {
+		t.Errorf("at cut 5: Desc=%d (want 2), CrossFile=%d (want 2)", cut5.Desc, cut5.CrossFile)
+	}
+
+	// At cut 6 (EngineEvent), anchor is 5, and named <= cut is true for resource a and b
+	cut6 := view.Cuts[6]
+	if cut6.Semantic != 1 {
+		t.Errorf("at cut 6: Semantic=%d, want 1", cut6.Semantic)
+	}
+}
+
+func TestRemoveAllPendingLifecycle(t *testing.T) {
+	events := []trace.Event{
+		{ID: 1, Kind: trace.KindMkdirAll, File: "dir/sub", Mode: 0755},
+		{ID: 2, Kind: trace.KindCreate, File: "dir/sub/f1", Handle: 1},
+		{ID: 3, Kind: trace.KindCreate, File: "dir/sub/f2", Handle: 2},
+		{ID: 4, Kind: trace.KindRemoveAll, File: "dir/sub"},
+	}
+
+	view, err := graph.Build(events)
+	if err != nil {
+		t.Fatalf("graph.Build: %v", err)
+	}
+
+	cut4 := view.Cuts[4]
+	if cut4.StateKey == "" {
+		t.Fatal("cut 4 has empty StateKey")
+	}
+}
