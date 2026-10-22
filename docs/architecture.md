@@ -169,18 +169,18 @@ is too expensive, all strategies use the same fixed stratified universe.
 CraConTest/
 ├── cmd/cracontest/       # CLI binary
 ├── internal/
-│   ├── trace/            # Event schema, (de)serialization    [shared]
-│   ├── vfsrec/           # Recording vfs.FS wrapper           [role a]
-│   ├── replay/           # Trace replay into CrashableMem     [role a]
-│   ├── recovery/         # Panic-safe Open, timeout, checks   [role a]
-│   ├── faults/           # Seeded-bug VFS decorators          [role a]
-│   ├── graph/            # Persistence DAG and state view     [role b]
-│   ├── candidate/        # Candidate type and universe        [role b]
-│   ├── strategy/         # Ranking strategies                 [role b]
-│   ├── workload/         # Seeded workload generators         [role c]
-│   ├── history/          # Client-visible operation ledger    [role c]
-│   ├── oracle/           # Consistency rules and outcomes     [role c]
-│   └── exp/              # Run specs, journal, evaluator      [role c]
+│   ├── trace/            # Event schema, (de)serialization
+│   ├── vfsrec/           # Recording vfs.FS wrapper
+│   ├── replay/           # Trace replay into CrashableMem
+│   ├── recovery/         # Panic-safe Open, timeout, checks
+│   ├── faults/           # Seeded-bug VFS decorators
+│   ├── graph/            # Persistence DAG and state view
+│   ├── candidate/        # Candidate type and universe
+│   ├── strategy/         # Ranking strategies
+│   ├── workload/         # Seeded workload generators
+│   ├── history/          # Client-visible operation ledger
+│   ├── oracle/           # Consistency rules and outcomes
+│   └── exp/              # Run specs, journal, evaluator
 ├── analysis/             # Python scripts for statistics
 ├── experiments/configs/  # Workload specifications
 ├── results/              # Experiment outputs
