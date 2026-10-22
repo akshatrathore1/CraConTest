@@ -377,6 +377,8 @@ func runEvaluate(args []string) error {
 	fs := flag.NewFlagSet("evaluate", flag.ExitOnError)
 	runDir := fs.String("run", "", "path to run directory")
 	budgetsFlag := fs.String("budgets", "", "comma-separated budgets (e.g. 0,1,5,10,25,50,100)")
+	discoveryOut := fs.String("discovery", "", "optional path for the discovery-curve CSV (B0 averaged over fixed seeds)")
+	plotOut := fs.String("plot", "", "optional path for the discovery-curve SVG plot")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -484,6 +486,16 @@ func runEvaluate(args []string) error {
 	}
 
 	fmt.Printf("\nSaved discovery curves to %s\n", filepath.Join(*runDir, "curves.csv"))
+
+	if (*discoveryOut == "") != (*plotOut == "") {
+		return errors.New("evaluate: -discovery and -plot must be given together")
+	}
+	if *discoveryOut != "" {
+		if _, err := exp.GenerateG4Artifacts(*runDir, *discoveryOut, *plotOut); err != nil {
+			return fmt.Errorf("generate discovery artifacts: %w", err)
+		}
+		fmt.Printf("Saved discovery CSV to %s and plot to %s\n", *discoveryOut, *plotOut)
+	}
 	return nil
 }
 

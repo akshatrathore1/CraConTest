@@ -1,6 +1,7 @@
 package exp_test
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"testing"
@@ -8,12 +9,14 @@ import (
 	"github.com/akshatrathore1/CraConTest/internal/exp"
 )
 
-// TestGateG4 verifies Milestone M11.5 (Gate G4 Acceptance):
-// - B0 (mean and min/max over fixed ranking seeds), B4, B5 and B6 discovery curves
-//   computed from the stored MUT-0 and MUT-1 outcome tables.
-// - Generated and saved as CSV (results/discovery_mut0.csv, results/discovery_mut1.csv).
-// - Generated and saved as SVG plots (results/plot_mut0.svg, results/plot_mut1.svg).
-// - Zero candidate re-execution.
+// TestGateG4 checks the Gate G4 acceptance criteria:
+//   - B0 (mean and min/max over fixed ranking seeds), B4, B5 and B6 discovery curves
+//     computed from the stored MUT-0 and MUT-1 outcome tables.
+//   - Generated into a temporary directory as CSV and SVG, and the CSV compared
+//     with the committed results/discovery_mut0.csv and results/discovery_mut1.csv,
+//     so the test never rewrites tracked files. Regenerate the committed
+//     artifacts with "cracontest evaluate -discovery ... -plot ...".
+//   - Zero candidate re-execution.
 func TestGateG4(t *testing.T) {
 	// Root paths for stored results
 	mut0Dir := filepath.Join("..", "..", "results", "smoke_mut0")
@@ -28,16 +31,33 @@ func TestGateG4(t *testing.T) {
 	}
 
 	resultsDir := filepath.Join("..", "..", "results")
+	outDir := t.TempDir()
+	matchesCommitted := func(generated, committed string) {
+		t.Helper()
+		got, err := os.ReadFile(generated)
+		if err != nil {
+			t.Fatalf("read generated %s: %v", generated, err)
+		}
+		want, err := os.ReadFile(committed)
+		if err != nil {
+			t.Fatalf("read committed %s: %v", committed, err)
+		}
+		normalize := func(b []byte) []byte { return bytes.ReplaceAll(b, []byte("\r\n"), []byte("\n")) }
+		if !bytes.Equal(normalize(got), normalize(want)) {
+			t.Errorf("%s is stale: regenerate it from the stored outcome table", committed)
+		}
+	}
 
 	// 1. Process MUT-0
 	t.Log("Evaluating Gate G4 discovery curves for MUT-0...")
-	csvMUT0 := filepath.Join(resultsDir, "discovery_mut0.csv")
-	svgMUT0 := filepath.Join(resultsDir, "plot_mut0.svg")
+	csvMUT0 := filepath.Join(outDir, "discovery_mut0.csv")
+	svgMUT0 := filepath.Join(outDir, "plot_mut0.svg")
 
 	report0, err := exp.GenerateG4Artifacts(mut0Dir, csvMUT0, svgMUT0)
 	if err != nil {
 		t.Fatalf("GenerateG4Artifacts MUT-0: %v", err)
 	}
+	matchesCommitted(csvMUT0, filepath.Join(resultsDir, "discovery_mut0.csv"))
 
 	// Verify MUT-0 has 0 failures and 0 bugs across all strategies and budgets
 	for _, b0 := range report0.B0Summary {
@@ -57,13 +77,14 @@ func TestGateG4(t *testing.T) {
 
 	// 2. Process MUT-1
 	t.Log("Evaluating Gate G4 discovery curves for MUT-1...")
-	csvMUT1 := filepath.Join(resultsDir, "discovery_mut1.csv")
-	svgMUT1 := filepath.Join(resultsDir, "plot_mut1.svg")
+	csvMUT1 := filepath.Join(outDir, "discovery_mut1.csv")
+	svgMUT1 := filepath.Join(outDir, "plot_mut1.svg")
 
 	report1, err := exp.GenerateG4Artifacts(mut1Dir, csvMUT1, svgMUT1)
 	if err != nil {
 		t.Fatalf("GenerateG4Artifacts MUT-1: %v", err)
 	}
+	matchesCommitted(csvMUT1, filepath.Join(resultsDir, "discovery_mut1.csv"))
 
 	// Verify MUT-1 reveals failures
 	terminalB0 := report1.B0Summary[len(report1.B0Summary)-1]
