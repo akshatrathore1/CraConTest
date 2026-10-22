@@ -6,7 +6,6 @@ import (
 	"errors"
 	"io"
 	"os"
-	"path/filepath"
 	"testing"
 
 	"github.com/akshatrathore1/CraConTest/internal/trace"
@@ -470,9 +469,13 @@ func TestCanonicalPathHandling(t *testing.T) {
 	mem := vfs.NewMem()
 	rec := vfsrec.New(mem)
 
-	// Create with backslashes and redundant components.
-	path := filepath.Join("subdir", "nested", "..", "file.log")
-	f, err := rec.Create(path, vfs.WriteCategoryUnspecified)
+	// MemFS uses "/" as its only separator, ignores a leading "/" and
+	// collapses repeated separators, so these spellings name the same file.
+	// (It does not resolve "." or "..", so those are not equivalent names.)
+	if err := rec.MkdirAll("/subdir", 0755); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+	f, err := rec.Create("/subdir//file.log", vfs.WriteCategoryUnspecified)
 	if err != nil {
 		t.Fatalf("Create failed: %v", err)
 	}
@@ -487,11 +490,17 @@ func TestCanonicalPathHandling(t *testing.T) {
 	if err := trace.Validate(events); err != nil {
 		t.Fatalf("trace validation failed: %v", err)
 	}
-
-	for _, ev := range events {
+	if len(events) == 0 || events[0].Kind != trace.KindMkdirAll || events[0].File != "subdir" {
+		t.Fatalf("expected canonical MkdirAll of 'subdir', got %+v", events)
+	}
+	for _, ev := range events[1:] {
 		if ev.File != "subdir/file.log" {
 			t.Fatalf("expected canonical path 'subdir/file.log', got %q", ev.File)
 		}
+	}
+	// The canonical trace path must name the file the inner FS really created.
+	if _, err := mem.Stat("subdir/file.log"); err != nil {
+		t.Fatalf("canonical path does not exist in the inner FS: %v", err)
 	}
 }
 

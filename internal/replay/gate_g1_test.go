@@ -222,9 +222,9 @@ func TestGateG1(t *testing.T) {
 
 		// Verify recovery via recovery.SafeOpen.
 		res := recovery.SafeOpen(replayedClone, "db", 10*time.Second)
-		if res.Panic != "" || res.Timeout {
-			t.Fatalf("Gate G1: SafeOpen unexpected panic/timeout at cut %d: panic=%s, timeout=%v",
-				cut, res.Panic, res.Timeout)
+		if res.Err != nil || res.Panic != "" || res.Timeout {
+			t.Fatalf("Gate G1: SafeOpen did not recover at cut %d: err=%v, panic=%s, timeout=%v",
+				cut, res.Err, res.Panic, res.Timeout)
 		}
 		if res.DB != nil {
 			_ = res.DB.Close()

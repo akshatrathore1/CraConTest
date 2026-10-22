@@ -23,8 +23,10 @@ func TestReplayBasicBuildAndClone(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
+	// Pebble's MemFS overwrites the caller's buffer after a write in race
+	// builds, so keep the expected bytes separate from the written buffer.
 	payload := []byte("hello world")
-	if _, err := f.Write(payload); err != nil {
+	if _, err := f.Write(bytes.Clone(payload)); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
 	if err := f.Sync(); err != nil {
