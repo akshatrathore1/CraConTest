@@ -252,7 +252,6 @@ func TestValidatePermutationRejects(test *testing.T) {
 	}
 }
 
-
 func TestExplainScoreAudit(t *testing.T) {
 	view, universe := referenceView()
 	w := strategy.DefaultWeights
@@ -292,7 +291,6 @@ func TestExplainScoreAudit(t *testing.T) {
 	if _, err := strategy.Explain(view, universe, strategy.Weights{Alpha: -1}); err == nil {
 		t.Error("expected error with negative weight in Explain, got nil")
 	}
-
 
 	// Empty universe should return empty records without error
 	emptyRecords, err := strategy.Explain(view, nil, w)

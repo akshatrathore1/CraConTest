@@ -19,18 +19,18 @@ type mockFile struct {
 	syncDataCalls int
 }
 
-func (m *mockFile) Close() error                              { return nil }
-func (m *mockFile) Read(p []byte) (int, error)                { return len(p), nil }
-func (m *mockFile) ReadAt(p []byte, off int64) (int, error)   { return len(p), nil }
-func (m *mockFile) Write(p []byte) (int, error)               { return len(p), nil }
-func (m *mockFile) WriteAt(p []byte, off int64) (int, error)  { return len(p), nil }
-func (m *mockFile) Stat() (any, error)                        { return nil, nil }
-func (m *mockFile) Sync() error                               { m.syncCalls++; return nil }
-func (m *mockFile) SyncData() error                           { m.syncDataCalls++; return nil }
-func (m *mockFile) SyncTo(int64) (bool, error)                { return false, nil }
-func (m *mockFile) Preallocate(int64, int64) error            { return nil }
-func (m *mockFile) Prefetch(int64, int64) error               { return nil }
-func (m *mockFile) Fd() uintptr                               { return 0 }
+func (m *mockFile) Close() error                             { return nil }
+func (m *mockFile) Read(p []byte) (int, error)               { return len(p), nil }
+func (m *mockFile) ReadAt(p []byte, off int64) (int, error)  { return len(p), nil }
+func (m *mockFile) Write(p []byte) (int, error)              { return len(p), nil }
+func (m *mockFile) WriteAt(p []byte, off int64) (int, error) { return len(p), nil }
+func (m *mockFile) Stat() (any, error)                       { return nil, nil }
+func (m *mockFile) Sync() error                              { m.syncCalls++; return nil }
+func (m *mockFile) SyncData() error                          { m.syncDataCalls++; return nil }
+func (m *mockFile) SyncTo(int64) (bool, error)               { return false, nil }
+func (m *mockFile) Preallocate(int64, int64) error           { return nil }
+func (m *mockFile) Prefetch(int64, int64) error              { return nil }
+func (m *mockFile) Fd() uintptr                              { return 0 }
 
 func TestFaultIDsAndValidation(t *testing.T) {
 	ids := faults.IDs()

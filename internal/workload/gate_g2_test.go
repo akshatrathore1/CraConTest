@@ -18,12 +18,12 @@ import (
 )
 
 // TestGateG2 checks the Gate G2 acceptance criteria:
-// 1. Hand-built oracle reference cases are all classified correctly.
-// 2. Real 1,000-op workload trace passes trace.Validate and exhibits WAL,
-//    manifest, table, file sync, and directory sync events.
-// 3. MUT-0 null control over the whole endpoint universe has zero violations,
-//    open errors, panics, hangs, or oracle errors.
-// 4. Exact counts (universe size, cutoffs, events, latency) are recorded.
+//  1. Hand-built oracle reference cases are all classified correctly.
+//  2. Real 1,000-op workload trace passes trace.Validate and exhibits WAL,
+//     manifest, table, file sync, and directory sync events.
+//  3. MUT-0 null control over the whole endpoint universe has zero violations,
+//     open errors, panics, hangs, or oracle errors.
+//  4. Exact counts (universe size, cutoffs, events, latency) are recorded.
 func TestGateG2(t *testing.T) {
 	// Part 1: Hand-built oracle cases classification check.
 	t.Run("HandBuiltOracleCases", func(t *testing.T) {

@@ -231,7 +231,6 @@ func TestContractTraceBuilds(test *testing.T) {
 	}
 }
 
-
 func TestWriteDOT(t *testing.T) {
 	events := walTrace()
 	view, err := graph.Build(events)

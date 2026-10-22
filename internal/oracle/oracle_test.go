@@ -33,12 +33,12 @@ func TestOracleReferenceCases(t *testing.T) {
 	failed.Err = "write failed"
 
 	cases := []struct {
-		name        string
-		entries     []history.Entry
-		cut         uint64
-		state       oracle.State
-		class       oracle.Class
-		rule        string
+		name    string
+		entries []history.Entry
+		cut     uint64
+		state   oracle.State
+		class   oracle.Class
+		rule    string
 	}{
 		{"pretrace", nil, 0, oracle.State{}, oracle.ClassValid, ""},
 		{"ack at cutoff", []history.Entry{first}, 2, oracle.State{"a": "A"}, oracle.ClassValid, ""},

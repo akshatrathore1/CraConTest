@@ -16,9 +16,9 @@ package graph
 
 import (
 	"crypto/sha256"
-	"errors"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/bits"
@@ -121,7 +121,6 @@ func (view *View) WriteDOT(w io.Writer) error {
 	fmt.Fprintln(w, "}")
 	return nil
 }
-
 
 type interval struct{ start, end int64 }
 

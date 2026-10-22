@@ -38,7 +38,7 @@ func TestEvaluatorHandBuiltSixTupleCurves(t *testing.T) {
 		{Candidate: c1, Class: oracle.ClassViolation, Rule: "durably_committed", Signature: sigA},
 		{Candidate: c2, Class: oracle.ClassOpenError, Detail: "corrupt MANIFEST"},
 		{Candidate: c3, Class: oracle.ClassViolation, Rule: "atomic_batch", Signature: sigA}, // repeated signature
-		{Candidate: c4, Class: oracle.ClassViolation, Rule: "prefix", Signature: sigB},        // distinct bug
+		{Candidate: c4, Class: oracle.ClassViolation, Rule: "prefix", Signature: sigB},       // distinct bug
 		{Candidate: c5, Class: oracle.ClassValid},
 	}
 

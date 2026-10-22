@@ -44,7 +44,7 @@ func TestOneCandidateCrashPipeline(t *testing.T) {
 		opID := uint64(i + 1)
 		k := fmt.Sprintf("pipeline-k%03d", i)
 		v := fmt.Sprintf("pipeline-v%03d", i)
-		sync := (i % 5 == 0)
+		sync := (i%5 == 0)
 
 		rec.Begin(opID, "set")
 		wo := pebble.NoSync

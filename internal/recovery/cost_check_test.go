@@ -63,12 +63,12 @@ func TestCostCheck1000Ops(t *testing.T) {
 	seeds := []uint64{1, 2, 3, 4}
 
 	var (
-		totalClone    time.Duration
-		totalRecover  time.Duration
-		totalCheck    time.Duration
-		candidates    int
-		openErrors    int
-		openPanics    int
+		totalClone   time.Duration
+		totalRecover time.Duration
+		totalCheck   time.Duration
+		candidates   int
+		openErrors   int
+		openPanics   int
 	)
 
 	for _, ret := range retentions {
