@@ -20,6 +20,7 @@ import (
 	"github.com/akshatrathore1/CraConTest/internal/faults"
 	"github.com/akshatrathore1/CraConTest/internal/graph"
 	"github.com/akshatrathore1/CraConTest/internal/history"
+	"github.com/akshatrathore1/CraConTest/internal/oracle"
 	"github.com/akshatrathore1/CraConTest/internal/recovery"
 	"github.com/akshatrathore1/CraConTest/internal/strategy"
 	"github.com/akshatrathore1/CraConTest/internal/trace"
@@ -98,7 +99,7 @@ func runRecord(args []string) error {
 	specPath := fs.String("spec", "", "path to workload config JSON (e.g. experiments/configs/smoke.json)")
 	outDir := fs.String("out", "", "output run directory")
 	runDir := fs.String("run", "", "output run directory (alias for -out)")
-	faultID := fs.String("fault", faults.MUT0, "seeded fault ID (MUT-0 or MUT-1)")
+	faultID := fs.String("fault", faults.MUT0, "seeded fault ID: "+strings.Join(faults.IDs(), ", "))
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -487,6 +488,10 @@ func runEvaluate(args []string) error {
 
 	fmt.Printf("\nSaved discovery curves to %s\n", filepath.Join(*runDir, "curves.csv"))
 
+	if err := writePositions(*runDir, universe, outcomes, matches); err != nil {
+		return err
+	}
+
 	if (*discoveryOut == "") != (*plotOut == "") {
 		return errors.New("evaluate: -discovery and -plot must be given together")
 	}
@@ -541,4 +546,55 @@ func loadRunData(dir string, loadHistory bool) (*RunMetadata, []trace.Event, []h
 	}
 
 	return &meta, events, hist, nil
+}
+
+// writePositions records, for every stored ranking and for random order over
+// fixed seeds, the position of the first failure and the position at which
+// every failure kind has appeared.
+func writePositions(runDir string, universe []candidate.Candidate, outcomes []oracle.Outcome, rankingPaths []string) error {
+	path := filepath.Join(runDir, "positions.csv")
+	file, err := os.Create(path)
+	if err != nil {
+		return fmt.Errorf("create positions.csv: %w", err)
+	}
+	defer file.Close()
+	w := csv.NewWriter(file)
+	if err := w.Write([]string{"strategy", "first_failure", "first_failure_p10", "first_failure_p90",
+		"all_kinds", "all_kinds_p10", "all_kinds_p90", "failure_kinds"}); err != nil {
+		return err
+	}
+	itoa := strconv.Itoa
+	for _, rPath := range rankingPaths {
+		rFile, err := os.Open(rPath)
+		if err != nil {
+			return err
+		}
+		doc, err := exp.DecodeRanking(rFile)
+		_ = rFile.Close()
+		if err != nil {
+			return fmt.Errorf("decode %s: %w", rPath, err)
+		}
+		p, err := exp.DiscoveryPositions(universe, doc.Candidates, outcomes)
+		if err != nil {
+			return fmt.Errorf("positions %s: %w", doc.Strategy, err)
+		}
+		if err := w.Write([]string{doc.Strategy, itoa(p.FirstFailure), itoa(p.FirstFailure), itoa(p.FirstFailure),
+			itoa(p.AllKinds), itoa(p.AllKinds), itoa(p.AllKinds), itoa(p.Kinds)}); err != nil {
+			return err
+		}
+	}
+	r, err := exp.RandomPositions(universe, outcomes, exp.RandomSeeds())
+	if err != nil {
+		return fmt.Errorf("random positions: %w", err)
+	}
+	if err := w.Write([]string{fmt.Sprintf("random_x%d", r.Seeds), itoa(r.FirstMedian), itoa(r.FirstP10), itoa(r.FirstP90),
+		itoa(r.AllKindsMedian), itoa(r.AllKindsP10), itoa(r.AllKindsP90), itoa(r.Kinds)}); err != nil {
+		return err
+	}
+	w.Flush()
+	if err := w.Error(); err != nil {
+		return err
+	}
+	fmt.Printf("Saved discovery positions to %s\n", path)
+	return nil
 }
