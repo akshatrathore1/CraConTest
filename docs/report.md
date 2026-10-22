@@ -76,8 +76,8 @@ Operation mix for both: 50% set, 20% get, 10% delete, 10% two-key batch, 5% rang
 ### 2.4 Candidate universe
 
 Cutoffs are selected from the trace (the pretrace state, every namespace mutation, every
-write with a positive length, every successful barrier and the event just before it, and
-the end of every mutating client operation), each combined with the 0% and 100% retention
+write with a positive length, every successful barrier, the event just before each
+successful barrier or rename, and the end of every mutating client operation), each combined with the 0% and 100% retention
 policies and one derived seed. Every candidate is executed exactly once; strategies are
 compared offline against the stored outcome table and never see outcomes.
 
@@ -88,7 +88,8 @@ compared offline against the stored outcome table and never see outcomes.
    seeds.
 2. **B4 combined:** greedy order by `Desc + CrossFile + Semantic + Novelty` (all weights 1),
    where `Desc` and `CrossFile` count later persistence events reachable in the dependency
-   graph, `Semantic` marks events inside client writes or with a write category, and
+   graph, `Semantic` marks events inside client writes, with a write category, or named by an
+   engine event, and
    `Novelty` rewards a not-yet-selected persistence state.
 3. **B5 representative:** the first candidate of each distinct (persistence state,
    retention) group, then the rest, both in trace order.
@@ -163,8 +164,8 @@ cost grows with trace length because each crash state replays a longer prefix.
 
 ## 5. Discussion
 
-1. **The fault is dense.** Every crash after the first acknowledged synchronous write
-   (event 57 of 2,427) can lose acknowledged data under MUT-1, and 44% of all candidates do.
+1. **The fault is dense.** Violations begin at the first acknowledged synchronous write
+   (event 57 of 2,427), and from there on 44% of all candidates lose acknowledged data.
    A uniformly random order then finds a violation within a few draws. This makes the
    experiment a weak test of prioritization: no ordering can do much better than random,
    and several do worse.

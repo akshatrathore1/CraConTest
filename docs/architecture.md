@@ -141,7 +141,7 @@ counts against seeded faults.
 - Time to first bug per strategy and budget.
 - Overhead breakdown: ranking time, replay+clone time, recovery+check time.
 - Recall (fraction of seeded faults detected) and false-positive count.
-- Figures and tables (produced by Python analysis scripts).
+- Discovery CSVs and SVG plots, written by `cracontest evaluate -discovery <csv> -plot <svg>`.
 
 ## Cost Model
 
@@ -153,15 +153,15 @@ The cost per candidate breaks down into three components:
 | **Clone** | Filesystem size (tree walk + data copy) | Wall time for `CrashClone()` |
 | **Recovery** | WAL replay length + manifest complexity | Wall time for `pebble.Open()` + `CheckLevels()` |
 
-**Cost estimation approach**: run a 1,000-operation workload specification,
-measure each component at 20 evenly spaced event indices, extrapolate to
-estimate the affordable universe size for the full experiment. This cost check
-is a Week 2–3 milestone.
-
-Trace size, selected cutoffs and total execution cost require measurement
-with the recorder and replay active. Historical close-first clone timings
-exclude replay and do not establish an experiment budget. If the full pass
-is too expensive, all strategies use the same fixed stratified universe.
+**Measured cost** (Linux, amd64, 1,000-operation workload, see
+`docs/reproduce.md`): the stored trace has about 2,500 events and 390 KB.
+Replay plus clone at a single cutoff takes about 0.5 ms. A complete
+exploration of the endpoint universe (2,150 candidates) takes about 14 s,
+or about 6.5 ms per candidate including recovery, structural checks and the
+oracle. Cost per candidate grows with trace length, because each crash state
+replays a longer prefix. At this workload size every candidate is explored
+once; for much larger workloads all strategies would share one fixed
+stratified sample instead.
 
 ## Package Structure
 
@@ -181,9 +181,8 @@ CraConTest/
 │   ├── history/          # Client-visible operation ledger
 │   ├── oracle/           # Consistency rules and outcomes
 │   └── exp/              # Run specs, journal, evaluator
-├── analysis/             # Python scripts for statistics
-├── experiments/configs/  # Workload specifications
-├── results/              # Experiment outputs
+├── experiments/configs/  # Workload specifications (main.json, smoke.json)
+├── results/              # Stored run directories, discovery CSVs and plots
 ├── docs/                 # This document and others
 └── paper/                # Publication materials
 ```
@@ -249,17 +248,16 @@ history    trace          strategies ──► rankings           outcome table
 | `cracontest record` | RECORD | Run workload, produce trace and history |
 | `cracontest plan` | PLAN | Build graph, enumerate candidates, rank |
 | `cracontest explore` | EXPLORE | Execute candidates, fill outcome table |
-| `cracontest evaluate` | EVALUATE | Join rankings with outcomes, compute metrics |
-| `cracontest report` | — | Generate figures from evaluation results |
+| `cracontest evaluate` | EVALUATE | Join rankings with outcomes, compute metrics; optionally write the discovery CSV and plot |
 
 ## Stored Artifacts
 
 | Artifact | Location | Git-tracked |
 |----------|----------|-------------|
 | Workload specifications | `experiments/configs/` | Yes |
-| Trace, history, outcomes | `results/raw/<run-id>/` | No (git-ignored) |
-| Evaluation results | `results/processed/` | Yes |
-| Figures | `results/plots/`, `paper/` | Yes |
+| Run directory: `run.json`, `trace.json`, `history.json`, `universe.json`, `ranking_*.json`, `journal.ndjson`, `outcomes.json`, `curves.csv` | `results/<run-id>/` | Yes, for the runs the report uses |
+| Discovery CSVs and plots | `results/discovery_*.csv`, `results/plot_*.svg` | Yes |
+| Technical report | `docs/report.md` (copy in `paper/report.md`) | Yes |
 
 Trace, history, universe, ranking and outcome documents use schema_version=1
 and ordered non-null arrays. Outcomes persist the complete candidate tuple.
@@ -267,22 +265,20 @@ Each run records its configuration, seeds, weights, fault identity, Pebble
 version, Go version and platform. Run directories are explicit identifiers;
 canonical run-ID hashing remains a separate design task.
 
-## Risks and Early Measurements
+## Validation and Open Risks
 
-1. **Replay fidelity** (Gate G1, Week 3): at random event indices, the
-   replayed 100%-retention state must exactly equal the live run's state
-   (same files, same bytes).
-
-2. **Cost per candidate** (Week 2–3): clone time + recovery time + check time
-   on a 1,000-operation run determines the affordable universe size.
-
-3. **Trace volume**: payloads are copied, so trace size grows with total bytes
-   written. Measure before choosing workload sizes.
-
-4. **Concurrency**: with concurrent writers, the commit order is determined by
-   Pebble, not the harness. Start with single-writer workloads. Concurrent
-   workloads require recovering commit order from WAL events before the prefix
-   rule applies.
+1. **Replay fidelity.** At 20 seeded cutoffs of a 1,000-operation recording, the
+   replayed 100%-retention state equals the live state byte for byte, and every
+   replayed state reopens (`TestGateG1`).
+2. **Oracle soundness.** On unfaulted recordings every endpoint candidate is
+   valid, so the oracle and recovery path raise no false alarms (`TestGateG2`).
+3. **Trace volume.** Payloads are copied, so trace size grows with the bytes
+   written: about 390 KB for the 1,000-operation workload. Larger workloads
+   will need this measured again before choosing sizes.
+4. **Concurrency.** With concurrent writers the commit order is decided by
+   Pebble, not the harness. Current workloads use a single writer; concurrent
+   workloads need the commit order recovered from WAL events before the
+   prefix rule applies.
 
 ## Dependencies
 
@@ -299,6 +295,4 @@ canonical run-ID hashing remains a separate design task.
 | Date | Section | Correction |
 |---|---|---|
 | 2026-10-20 | Pipeline and artifacts | Defined event-ID cutoffs, endpoint retention, full mutation history and full-tuple outcomes; removed uncertified cost and run-hash claims. |
-
-- **Python**: for `analysis/` scripts (statistics, plotting). Not required for
-  the Go pipeline.
+| 2026-10-22 | Cost, artifacts, validation | Replaced planned measurements with measured cost and validation results; artifact locations and CLI match the implementation. |
