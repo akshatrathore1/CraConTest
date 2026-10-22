@@ -133,7 +133,7 @@ func runWorkloadWithFS(t *testing.T, wrappedFS vfs.FS) ([]trace.Event, []history
 	return nil, rawHist
 }
 
-// TestFaultAcceptanceWithRecorder verifies Milestone M9.2:
+// TestFaultAcceptanceWithRecorder checks the seeded faults through the recorder:
 // - Decorator order is faults(vfsrec(memFS)).
 // - MUT-1 trace lacks WAL syncs but keeps manifest and table syncs.
 // - MUT-0 trace equals the undecorated recorder trace.

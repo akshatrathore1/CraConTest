@@ -17,7 +17,7 @@ import (
 	"github.com/cockroachdb/pebble/v2/vfs"
 )
 
-// TestGateG2 verifies Milestone M6.2 (Gate G2 Acceptance):
+// TestGateG2 checks the Gate G2 acceptance criteria:
 // 1. Hand-built oracle reference cases are all classified correctly.
 // 2. Real 1,000-op workload trace passes trace.Validate and exhibits WAL,
 //    manifest, table, file sync, and directory sync events.

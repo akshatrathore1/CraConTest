@@ -16,7 +16,7 @@ import (
 	"github.com/cockroachdb/pebble/v2/vfs"
 )
 
-// TestOneCandidateCrashPipeline verifies Milestone M4.1:
+// TestOneCandidateCrashPipeline checks the single-candidate crash pipeline:
 // An end-to-end crash-recovery pipeline test executing:
 // replay -> clone -> SafeOpen -> CheckIntegrity -> dump -> oracle
 // on endpoint candidates and obtaining verified outcome classes.

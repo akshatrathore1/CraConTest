@@ -15,7 +15,7 @@ import (
 	"github.com/cockroachdb/pebble/v2/vfs"
 )
 
-// TestGateG3 verifies Milestone M8.1 (Gate G3 Acceptance):
+// TestGateG3 checks the Gate G3 acceptance criteria:
 // 1. graph.Build succeeds on the real 1,000-operation fixed-workload trace.
 // 2. Every universe candidate has an OpKind and non-nil Categories.
 // 3. Vertex/edge counts and build time are recorded.
