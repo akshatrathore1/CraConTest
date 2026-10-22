@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "run_id": "main_mut3",
+  "timestamp": "2026-10-22T14:33:40Z",
+  "fault_id": "MUT-3",
+  "base_seed": 42,
+  "policies": [
+    0,
+    100
+  ],
+  "workload": {
+    "seed": 42,
+    "operations": 1000,
+    "key_count": 64,
+    "value_bytes": 128,
+    "sync_every": 10,
+    "flush_every": 100
+  },
+  "pebble_version": "v2.1.7",
+  "go_version": "go1.27.3",
+  "goos": "linux",
+  "goarch": "amd64"
+}

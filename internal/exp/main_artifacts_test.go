@@ -10,7 +10,7 @@ import (
 )
 
 // TestMainRunArtifactsMatchStoredTables recomputes the discovery curves of the
-// main 1,000-operation runs from their stored outcome tables and checks them
+// main 1,000-operation runs (MUT-0 to MUT-4) from their stored outcome tables and checks them
 // against the committed CSVs and the reported totals. No candidate is executed.
 func TestMainRunArtifactsMatchStoredTables(t *testing.T) {
 	results := filepath.Join("..", "..", "results")
@@ -20,6 +20,9 @@ func TestMainRunArtifactsMatchStoredTables(t *testing.T) {
 	}{
 		{"mut0", 0, 0},
 		{"mut1", 865, 15},
+		{"mut2", 1047, 0}, // open errors only: no violation signatures
+		{"mut3", 999, 3},
+		{"mut4", 594, 0}, // open errors only
 	} {
 		runDir := filepath.Join(results, "main_"+run.name)
 		if _, err := os.Stat(filepath.Join(runDir, "outcomes.json")); err != nil {

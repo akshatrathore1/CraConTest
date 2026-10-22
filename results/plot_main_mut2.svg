@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 500" width="800" height="500">
+  <style>
+    .title { font: bold 16px sans-serif; fill: #1f2937; }
+    .label { font: 12px sans-serif; fill: #4b5563; }
+    .legend { font: 11px sans-serif; fill: #374151; }
+    .grid { stroke: #e5e7eb; stroke-width: 1; }
+    .axis { stroke: #9ca3af; stroke-width: 1.5; }
+    .b0-line { stroke: #6b7280; stroke-width: 2.5; stroke-dasharray: 4,3; fill: none; }
+    .b4-line { stroke: #2563eb; stroke-width: 2.5; fill: none; }
+    .b5-line { stroke: #10b981; stroke-width: 2.5; fill: none; }
+    .b6-line { stroke: #f59e0b; stroke-width: 2.5; fill: none; }
+  </style>
+  <rect width="100%" height="100%" fill="#ffffff" />
+  <text x="400" y="35" class="title" text-anchor="middle">Discovery Curves: main_mut2 (MUT-2)</text>
+  <line x1="70" y1="430.0" x2="730" y2="430.0" class="grid" />
+  <text x="60" y="430.0" class="label" text-anchor="end" alignment-baseline="middle">0</text>
+  <line x1="70" y1="358.0" x2="730" y2="358.0" class="grid" />
+  <text x="60" y="358.0" class="label" text-anchor="end" alignment-baseline="middle">209</text>
+  <line x1="70" y1="286.0" x2="730" y2="286.0" class="grid" />
+  <text x="60" y="286.0" class="label" text-anchor="end" alignment-baseline="middle">419</text>
+  <line x1="70" y1="214.0" x2="730" y2="214.0" class="grid" />
+  <text x="60" y="214.0" class="label" text-anchor="end" alignment-baseline="middle">628</text>
+  <line x1="70" y1="142.0" x2="730" y2="142.0" class="grid" />
+  <text x="60" y="142.0" class="label" text-anchor="end" alignment-baseline="middle">838</text>
+  <line x1="70" y1="70.0" x2="730" y2="70.0" class="grid" />
+  <text x="60" y="70.0" class="label" text-anchor="end" alignment-baseline="middle">1047</text>
+  <line x1="70.0" y1="70" x2="70.0" y2="430" class="grid" />
+  <text x="70.0" y="450" class="label" text-anchor="middle">0</text>
+  <line x1="202.0" y1="70" x2="202.0" y2="430" class="grid" />
+  <text x="202.0" y="450" class="label" text-anchor="middle">422</text>
+  <line x1="334.0" y1="70" x2="334.0" y2="430" class="grid" />
+  <text x="334.0" y="450" class="label" text-anchor="middle">845</text>
+  <line x1="466.0" y1="70" x2="466.0" y2="430" class="grid" />
+  <text x="466.0" y="450" class="label" text-anchor="middle">1267</text>
+  <line x1="598.0" y1="70" x2="598.0" y2="430" class="grid" />
+  <text x="598.0" y="450" class="label" text-anchor="middle">1690</text>
+  <line x1="730.0" y1="70" x2="730.0" y2="430" class="grid" />
+  <text x="730.0" y="450" class="label" text-anchor="middle">2112</text>
+  <line x1="70" y1="430" x2="730" y2="430" class="axis" />
+  <line x1="70" y1="70" x2="70" y2="430" class="axis" />
+  <text x="400" y="485" class="label" text-anchor="middle">Test Budget</text>
+  <text x="20" y="250" class="label" text-anchor="middle" transform="rotate(-90, 20, 250)">Failures Discovered</text>
+  <path class="b0-line" d="M70.0,430.0 L70.3,429.8 L71.6,429.1 L73.1,428.0 L77.8,425.5 L85.6,421.0 L101.2,413.1 L132.5,395.8 L730.0,70.0 " />
+  <path class="b4-line" d="M70.0,430.0 L70.3,430.0 L71.6,430.0 L73.1,430.0 L77.8,427.6 L85.6,423.5 L101.2,414.9 L132.5,397.7 L730.0,70.0 " />
+  <path class="b5-line" d="M70.0,430.0 L70.3,430.0 L71.6,430.0 L73.1,430.0 L77.8,427.6 L85.6,423.5 L101.2,414.9 L132.5,397.7 L730.0,70.0 " />
+  <path class="b6-line" d="M70.0,430.0 L70.3,430.0 L71.6,429.7 L73.1,429.0 L77.8,426.2 L85.6,422.1 L101.2,413.5 L132.5,396.3 L730.0,70.0 " />
+  <rect x="550" y="85" width="175" height="95" fill="#f9fafb" stroke="#d1d5db" rx="4" />
+  <line x1="560" y1="105" x2="585" y2="105" class="b0-line" />
+  <text x="592" y="109" class="legend">B0 Random (mean)</text>
+  <line x1="560" y1="125" x2="585" y2="125" class="b4-line" />
+  <text x="592" y="129" class="legend">B4 Combined</text>
+  <line x1="560" y1="145" x2="585" y2="145" class="b5-line" />
+  <text x="592" y="149" class="legend">B5 Representative</text>
+  <line x1="560" y1="165" x2="585" y2="165" class="b6-line" />
+  <text x="592" y="169" class="legend">B6 Sync-Boundary</text>
+</svg>

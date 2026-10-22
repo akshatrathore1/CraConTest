@@ -1,0 +1,6 @@
+strategy,first_failure,first_failure_p10,first_failure_p90,all_kinds,all_kinds_p10,all_kinds_p90,failure_kinds
+random,1,1,1,35,35,35,2
+combined,61,61,61,65,65,65,2
+representative,51,51,51,81,81,81,2
+sync-boundary,39,39,39,63,63,63,2
+random_x1000,3,1,7,17,5,60,2
