@@ -27,7 +27,7 @@ The CLI has four subcommands. Flags use a single dash:
 
 | Command | Flags |
 |---|---|
-| `record` | `-spec <config.json> -out <run-dir> -fault <MUT-0\|MUT-1>` |
+| `record` | `-spec <config.json> -out <run-dir> -fault <MUT-0 … MUT-4>` |
 | `plan` | `-run <run-dir> [-seed <ranking seed>]` |
 | `explore` | `-run <run-dir> [-timeout <duration>]` |
 | `evaluate` | `-run <run-dir> [-budgets 0,1,5,...] [-discovery <csv> -plot <svg>]` |
@@ -42,27 +42,34 @@ Operation mix: 50% set, 20% get, 10% delete, 10% two-key batch, 5% range delete,
 Retention policies 0% and 100%.
 
 ```bash
-for f in mut0:MUT-0 mut1:MUT-1; do
-  d=results/main_${f%%:*}
-  ./cracontest record   -spec experiments/configs/main.json -out $d -fault ${f#*:}
+for m in 0 1 2 3 4; do
+  d=results/main_mut$m
+  ./cracontest record   -spec experiments/configs/main.json -out $d -fault MUT-$m
   ./cracontest plan     -run $d
   ./cracontest explore  -run $d
-  ./cracontest evaluate -run $d -discovery results/discovery_main_${f%%:*}.csv \
-                                -plot      results/plot_main_${f%%:*}.svg
+  ./cracontest evaluate -run $d -discovery results/discovery_main_mut$m.csv \
+                                -plot      results/plot_main_mut$m.svg
 done
 ```
 
-| Run | Trace events | Cutoffs | Candidates | Outcomes | Distinct signatures | Explore time |
-|---|---|---|---|---|---|---|
-| `main_mut0` | 2,510 | 1,075 | 2,150 | 2,150 valid | 0 | 14.1 s |
-| `main_mut1` | 2,427 | 989 | 1,978 | 1,113 valid, 865 violations | 3 | 12.1 s |
+| Run | Fault | Trace events | Candidates | Outcomes | Failure kinds |
+|---|---|---|---|---|---|
+| `main_mut0` | none | 2,510 | 2,150 | 2,150 valid | 0 |
+| `main_mut1` | WAL sync dropped | 2,427 | 1,978 | 865 violations (`durably_committed`) | 15 |
+| `main_mut2` | manifest sync dropped | 2,494 | 2,112 | 1,047 open errors (malformed manifest) | 1 |
+| `main_mut3` | directory sync dropped | 2,480 | 2,048 | 999 violations (`durably_committed`) | 3 |
+| `main_mut4` | flushed-table sync dropped | 2,500 | 2,124 | 594 open errors (table size mismatch) | 2 |
 
-`record`, `plan` and `evaluate` each take about 0.2 s. In `main_mut1` the trace contains no
-WAL sync events (84 in `main_mut0`), while its 16 manifest syncs and 30 directory syncs are
-unchanged.
+`record`, `plan` and `evaluate` each take well under a second; `explore` takes 5–15 s per
+run. `evaluate` writes `curves.csv` and `positions.csv` into the run directory:
+`positions.csv` gives, for each ranking and for random order over 1,000 fixed seeds, the
+position of the first failure and the position at which every failure kind has appeared.
+To recompute curves and positions from a stored run without re-exploring, run only
+`evaluate`. If a run directory already holds a `journal.ndjson`, `explore` reuses its
+finished outcomes; delete the journal, `outcomes.json` and `curves.csv` to explore again.
 
-Figures: `results/plot_main_mut0.svg`, `results/plot_main_mut1.svg`.
-Tables: `results/discovery_main_mut0.csv`, `results/discovery_main_mut1.csv`.
+Figures: `results/plot_main_mut*.svg`. Tables: `results/discovery_main_mut*.csv` and
+`results/main_mut*/positions.csv`.
 
 ## 3. Smoke Experiment (100-operation workload)
 
@@ -83,7 +90,7 @@ done
 | Run | Trace events | Candidates | Outcomes | Distinct signatures | Total time |
 |---|---|---|---|---|---|
 | `smoke_mut0` | 316 | 302 | 302 valid | 0 | ≈0.6 s |
-| `smoke_mut1` | 305 | 280 | 192 valid, 88 violations | 2 | ≈0.5 s |
+| `smoke_mut1` | 305 | 280 | 192 valid, 88 violations | 6 | ≈0.5 s |
 
 ## 4. Acceptance Tests
 
@@ -92,7 +99,7 @@ done
 | G1 replay fidelity | `go test -v -run 'TestGateG1$' ./internal/replay` | 2,322 events, 20/20 seeded cutoffs byte-identical to the live 100% clone; every replayed state recovers | 0.1 s |
 | G2 null control | `go test -v -run 'TestGateG2$' ./internal/workload` | every endpoint candidate of a fresh 1,000-op MUT-0 recording (≈2,140) valid; 0 violations, open errors, panics, hangs or oracle errors | 7 s |
 | G3 graph labels | `go test -v -run 'TestGateG3$' ./internal/graph` | ≈2,510 events, ≈1,073 cutoffs, ≈173 distinct state keys, Semantic=1 on 96% of cutoffs, build time ≈12 ms | 0.05 s |
-| G4 discovery curves | `go test -v -run 'TestGateG4$' ./internal/exp` | curves recomputed from the stored smoke tables match the committed `results/discovery_mut*.csv`; nothing re-executed | 0.1 s |
+| G4 discovery curves | `go test -v -run 'TestGateG4$\|TestMainRunArtifacts' ./internal/exp` | curves recomputed from the stored smoke and main tables match the committed `results/discovery_*.csv`; nothing re-executed | 0.5 s |
 | Real-disk recovery | `go test -v -run TestRealDisk ./internal/recovery` | 200 synced keys survive a clean close and an abrupt child-process exit on `vfs.Default` | 1.6 s |
 
 G1, G2 and G3 record a fresh trace, so their counts vary by a few events between runs

@@ -71,7 +71,7 @@ See [docs/architecture.md](docs/architecture.md) for full architectural details.
 ├── internal/
 │   ├── candidate/           # Crash candidate universe and serialization
 │   ├── exp/                 # Exploration runner, offline evaluator, and plotting
-│   ├── faults/              # Fault injection harness (MUT-0, MUT-1)
+│   ├── faults/              # Seeded durability faults (MUT-0 to MUT-4)
 │   ├── graph/               # Persistence DAG, reachability, and DOT export
 │   ├── history/             # Mutation history tracking
 │   ├── oracle/              # Crash consistency validation oracle
@@ -125,27 +125,29 @@ experiment uses `experiments/configs/main.json`; see [docs/reproduce.md](docs/re
 
 ## Experimental Findings
 
-Pebble v2.1.7, seed 42, endpoint retention policies 0% and 100%. Full analysis in
-[docs/report.md](docs/report.md); the data is under `results/`.
+Pebble v2.1.7, seed 42, endpoint retention policies 0% and 100%, main 1,000-operation
+workload. Full analysis in [docs/report.md](docs/report.md); the data is under `results/`.
 
-- **No false positives (MUT-0).** In the main 1,000-operation run, all 2,150 crash candidates
-  recovered and matched a legal state: zero violations, open errors, panics, hangs or oracle
-  errors. The 100-operation smoke run agrees (302 of 302 valid).
-- **The seeded fault is detected (MUT-1, dropped WAL syncs).** 865 of 1,978 candidates
-  (44%) lose acknowledged synchronous writes, forming 3 distinct signatures, all of the
-  `durably_committed` kind. The smoke run shows 88 violations and 2 signatures.
-- **Ranking does not beat random on this fault.** Because violations are dense, a random
-  order finds the first one almost immediately (median position 2 over 1,000 random orders)
-  and all three signatures by a median of 14 candidates. The sync-boundary order (B6) needs
-  17 and 47, the representative order (B5) 25 and 101, and the combined graph score (B4)
-  55 and 481. B4 favours the earliest cutoffs, which reach the most later events: its first
-  50 candidates all lie before the first acknowledged synchronous write (event 57 of 2,427),
-  where no acknowledged data can be lost. This is a negative result for the guided
-  strategies under a dense fault; sparser faults are the next experiment.
+- **No false positives.** Without a fault (MUT-0) all 2,150 crash candidates recover to a
+  legal state; the 100-operation smoke run agrees (302 of 302).
+- **Every seeded fault is detected.** Dropping WAL syncs (MUT-1) or directory syncs (MUT-3)
+  loses acknowledged writes in 44% and 49% of candidates; dropping manifest syncs (MUT-2)
+  or flushed-table syncs (MUT-4) makes recovery refuse to open in 50% and 28% of
+  candidates.
+- **Random order reaches the first failure fastest.** Because these faults are dense, a
+  random order hits a failure within a median of 1–3 crashes under every fault, while the
+  sync-boundary (B6), representative (B5) and combined graph-score (B4) orders need 5–61.
+- **State-aware orders cover more distinct violations.** Under MUT-1, B6 has found 13 of the
+  15 violation signatures after 100 crashes (random: 7–11 over ten seeds), and B5 finds all
+  15 after 189 crashes (random: median 853). Signatures and B5's groups both describe the
+  pending state, so this advantage is partly by construction, and it does not appear for
+  the faults with one to three failure kinds. B4 is the slowest order throughout.
 - **Cost.** Replay, crash, recovery and oracle check take about 6.5 ms per candidate on the
-  main workload (about 150 candidates per second) and about 1 ms on the smoke workload.
+  main workload and about 1 ms on the smoke workload.
 
-For commands, expected outputs and runtimes, see [docs/reproduce.md](docs/reproduce.md).
+The next experiments target faults that affect only a few crash points, where ranking can
+matter most. For commands, expected outputs and runtimes, see
+[docs/reproduce.md](docs/reproduce.md).
 
 ---
 
