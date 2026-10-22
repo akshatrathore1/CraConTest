@@ -19,7 +19,7 @@ func TestMainRunArtifactsMatchStoredTables(t *testing.T) {
 		failures, distinct int
 	}{
 		{"mut0", 0, 0},
-		{"mut1", 865, 3},
+		{"mut1", 865, 15},
 	} {
 		runDir := filepath.Join(results, "main_"+run.name)
 		if _, err := os.Stat(filepath.Join(runDir, "outcomes.json")); err != nil {

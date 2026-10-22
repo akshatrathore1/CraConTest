@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/akshatrathore1/CraConTest/internal/candidate"
+	"github.com/akshatrathore1/CraConTest/internal/graph"
 	"github.com/akshatrathore1/CraConTest/internal/history"
 	"github.com/akshatrathore1/CraConTest/internal/oracle"
 	"github.com/akshatrathore1/CraConTest/internal/recovery"
@@ -53,6 +54,11 @@ type RunnerConfig struct {
 	Timeout     time.Duration // SafeOpen timeout, defaults to 5s
 	JournalPath string        // optional file path for append-only execution journal
 	Journal     io.Writer     // optional writer for journal records
+	// Categories gives, for every cutoff, the write categories of the files
+	// and directory entries pending at that cutoff (graph.Features.Categories).
+	// Violation signatures include them. When nil, they are computed from
+	// Events with graph.Build.
+	Categories map[uint64][]string
 }
 
 // RunSummary summarizes overall explore execution statistics.
@@ -149,6 +155,17 @@ func RunExplore(cfg RunnerConfig) (*ExploreResult, error) {
 	if err := history.Validate(cfg.History); err != nil {
 		return nil, fmt.Errorf("runner: %w", err)
 	}
+	categories := cfg.Categories
+	if categories == nil {
+		view, err := graph.Build(cfg.Events)
+		if err != nil {
+			return nil, fmt.Errorf("runner: categories for signatures: %w", err)
+		}
+		categories = make(map[uint64][]string, len(view.Cuts))
+		for cut, features := range view.Cuts {
+			categories[cut] = features.Categories
+		}
+	}
 
 	// Setup journal writer.
 	var jw *journalWriter
@@ -208,6 +225,18 @@ func RunExplore(cfg RunnerConfig) (*ExploreResult, error) {
 
 		candStart := time.Now()
 		var stageTimings StageTimings
+
+		cutCategories, haveCategories := categories[cand.Event]
+		if !haveCategories {
+			terminalOutcome := oracle.Outcome{
+				Candidate: cand,
+				Class:     oracle.ClassOracleError,
+				Rule:      "missing_features",
+				Detail:    fmt.Sprintf("no write categories for cutoff %d", cand.Event),
+			}
+			finishCandidate(jw, cand, &terminalOutcome, &stageTimings, candStart, &outcomes, timingsMap, &summary)
+			continue
+		}
 
 		// Stage 1: Replay advance.
 		startReplay := time.Now()
@@ -288,7 +317,7 @@ func RunExplore(cfg RunnerConfig) (*ExploreResult, error) {
 				Candidate: cand,
 				Class:     oracle.ClassViolation,
 				Rule:      "structural",
-				Signature: oracle.FormatSignature("structural", "unknown", nil),
+				Signature: oracle.FormatSignature("structural", "unknown", cutCategories),
 				Detail:    err.Error(),
 			}
 			finishCandidate(jw, cand, &terminalOutcome, &stageTimings, candStart, &outcomes, timingsMap, &summary)
@@ -311,10 +340,11 @@ func RunExplore(cfg RunnerConfig) (*ExploreResult, error) {
 		// Stage 5: Oracle consistency check.
 		startOracle := time.Now()
 		terminalOutcome := oracle.Check(oracle.Context{
-			Candidate: cand,
-			Events:    cfg.Events,
-			History:   cfg.History,
-			Recovered: dump,
+			Candidate:  cand,
+			Events:     cfg.Events,
+			History:    cfg.History,
+			Recovered:  dump,
+			Categories: cutCategories,
 		})
 		stageTimings.Oracle = time.Since(startOracle)
 
