@@ -6,7 +6,7 @@
 
 ## Overview
 
-Testing storage engines for crash consistency typically requires exploring huge state spaces. Every file system mutation, flush, or write-ahead log (WAL) entry represents a potential crash cutoff, compounded by partial retention of unsynced dirty data across files. Exhaustive exploration is intractable on realistic workloads, while uniform random testing often wastes budget evaluating non-critical or redundant crash states.
+Testing storage engines for crash consistency typically requires exploring huge state spaces. Every file system mutation, flush, or write-ahead log (WAL) entry represents a potential crash cutoff, compounded by partial retention of unsynced dirty data across files. Exhaustive exploration grows quickly with workload size, and uniform random selection may spend its budget on redundant crash states. CraConTest measures whether a ranking informed by persistence dependencies does better than random under the same budget.
 
 CraConTest treats crash-consistency testing as an explicit resource-bounded search problem. By capturing low-level Virtual File System (VFS) operations alongside storage engine semantic markers, CraConTest constructs a **persistence dependency graph**. It prioritizes candidate crash points based on structural downstream reachability, cross-file impact, semantic criticality, and state novelty.
 
@@ -25,7 +25,7 @@ CraConTest treats crash-consistency testing as an explicit resource-bounded sear
    - **B0 (Random Baseline):** Uniform random candidate selection across fixed seeds.
    - **B4 (Combined Heuristic):** Multi-objective scoring balancing downstream persistence reachability (`Desc`), affected file count (`CrossFile`), semantic criticality (`Semantic`), and novel state diversity (`NovelState`).
    - **B5 (Representative):** Partitioning crash states by equivalence classes (`StateKey`).
-   - **B6 (Sync-Boundary):** Testing crash states immediately preceding or following durability barriers.
+   - **B6 (Sync-Boundary):** Moving crash points immediately before a successful sync or rename to the front of the order (no candidate is removed).
 
 4. **Strict Ground-Truth Crash Oracle (`oracle`):**
    - Evaluates recovered database states against an append-only mutation history ledger (`history`).
@@ -67,7 +67,7 @@ See [docs/architecture.md](docs/architecture.md) for full architectural details.
 │   ├── vfs-design.md        # VFS interception and recording specification
 │   ├── reproduce.md         # Step-by-step reproduction runbook
 │   └── report.md            # Technical report and experimental evaluation
-├── experiments/configs/     # Experiment configurations (e.g., smoke.json)
+├── experiments/configs/     # Experiment configurations (main.json, smoke.json)
 ├── internal/
 │   ├── candidate/           # Crash candidate universe and serialization
 │   ├── exp/                 # Exploration runner, offline evaluator, and plotting
@@ -102,38 +102,50 @@ go build -o cracontest ./cmd/cracontest
 
 ### Running the End-to-End Smoke Test
 
-Run the full testing lifecycle on a seeded 1,000-operation workload:
+Run the full lifecycle on the seeded 100-operation smoke workload (about half a second):
 
 ```bash
-# Record workload with injected WAL sync suppression (MUT-1)
-./cracontest record --config experiments/configs/smoke.json --out results/smoke_mut1 --fault MUT-1
+# Record the workload with injected WAL sync suppression (MUT-1)
+./cracontest record -spec experiments/configs/smoke.json -out /tmp/smoke_mut1 -fault MUT-1
 
-# Construct dependency graph and plan candidate ranking orders
-./cracontest plan --run results/smoke_mut1
+# Build the dependency graph, the candidate universe and one ranking per strategy
+./cracontest plan -run /tmp/smoke_mut1
 
-# Execute candidate replay and recovery exploration
-./cracontest explore --run results/smoke_mut1
+# Replay, crash, recover and check every candidate once
+./cracontest explore -run /tmp/smoke_mut1
 
-# Evaluate discovery curves across strategies
-./cracontest evaluate --run results/smoke_mut1
+# Evaluate discovery curves from the stored outcome table
+./cracontest evaluate -run /tmp/smoke_mut1
 ```
 
-Explore completed results in `results/smoke_mut1/curves.csv`.
+The curves are written to `/tmp/smoke_mut1/curves.csv`. The main 1,000-operation
+experiment uses `experiments/configs/main.json`; see [docs/reproduce.md](docs/reproduce.md).
 
 ---
 
 ## Experimental Findings
 
-Evaluations on Pebble v2.1.7 across 280 candidate crash states for seeded WAL persistence faults (MUT-1) demonstrate:
+Pebble v2.1.7, seed 42, endpoint retention policies 0% and 100%. Full analysis in
+[docs/report.md](docs/report.md); the data is under `results/`.
 
-- **Null Control Soundness (MUT-0):** Across 2,142 crash candidates (1,071 cutoffs × {0, 100}% retention), CraConTest reported **zero false positives**, zero recovery panics, and zero oracle errors (Gate G2).
-- **Bug Discovery Speed (MUT-1):** Under the `MUT-1` fault (dropped WAL syncs), CraConTest discovered 88 consistency violations across 2 distinct bug signatures:
-  - **B6 (Sync-Boundary)** discovered **both distinct bug signatures within budget 25** (5 failures found).
-  - **B5 (Representative)** discovered bug 1 by budget 25 and bug 2 by budget 50.
-  - **B0 (Random Baseline)** required a budget of 50+ to reliably encounter both signatures across random seeds.
-- **Throughput:** Replay and oracle verification achieve **>1,000 crash candidate evaluations per second** in-memory.
+- **No false positives (MUT-0).** In the main 1,000-operation run, all 2,150 crash candidates
+  recovered and matched a legal state: zero violations, open errors, panics, hangs or oracle
+  errors. The 100-operation smoke run agrees (302 of 302 valid).
+- **The seeded fault is detected (MUT-1, dropped WAL syncs).** 865 of 1,978 candidates
+  (44%) lose acknowledged synchronous writes, forming 3 distinct signatures, all of the
+  `durably_committed` kind. The smoke run shows 88 violations and 2 signatures.
+- **Ranking does not beat random on this fault.** Because violations are dense, a random
+  order finds the first one almost immediately (median position 2 over 1,000 random orders)
+  and all three signatures by a median of 14 candidates. The sync-boundary order (B6) needs
+  17 and 47, the representative order (B5) 25 and 101, and the combined graph score (B4)
+  55 and 481. B4 favours the earliest cutoffs, which reach the most later events: its first
+  50 candidates all lie before the first acknowledged synchronous write (event 57 of 2,427),
+  where no acknowledged data can be lost. This is a negative result for the guided
+  strategies under a dense fault; sparser faults are the next experiment.
+- **Cost.** Replay, crash, recovery and oracle check take about 6.5 ms per candidate on the
+  main workload (about 150 candidates per second) and about 1 ms on the smoke workload.
 
-For complete replication instructions and timing benchmarks, see [docs/reproduce.md](docs/reproduce.md).
+For commands, expected outputs and runtimes, see [docs/reproduce.md](docs/reproduce.md).
 
 ---
 

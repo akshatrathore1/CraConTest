@@ -1,164 +1,109 @@
 # Reproduction Runbook
 
-This document details the exact commands, execution steps, expected outputs, and measured runtimes to reproduce all benchmark tables, figures, and verification gates in CraConTest.
+This runbook lists the commands that regenerate every table, figure and acceptance check
+in CraConTest, with the outputs and runtimes measured on Linux (go1.27.3, amd64).
 
-All experiments are deterministic under fixed random seeds.
+**Determinism.** Exploring, ranking and evaluating a *stored* run directory is fully
+deterministic: the same `trace.json` and `universe.json` always give the same outcomes,
+rankings and curves. Recording is not bit-for-bit repeatable. Pebble schedules background
+flushes and compactions itself, so two recordings of the same workload can differ by a few
+events and therefore by a few candidates (for example 2,142, 2,144 and 2,150 candidates in
+three MUT-0 recordings of the main workload). This is why crash states are always rebuilt
+from a stored trace and never by re-running the engine. The committed run directories
+under `results/` are the reference data for every figure and table.
 
 ---
 
-## 1. System Requirements & Build Setup
+## 1. Build
 
-### Prerequisites
-- Go 1.27+ (`go version` matching repository `go.mod`)
-- OS: Linux (Ubuntu/ext4) or Windows (NTFS). On Windows, set `CGO_ENABLED=0`.
+Prerequisites: Go as pinned in `go.mod`. On Windows set `CGO_ENABLED=0`; run the race
+detector on Linux or WSL2.
 
-### Build
-To build the `cracontest` CLI tool:
 ```bash
 go build -o cracontest ./cmd/cracontest
 ```
-Expected runtime: ~1.5s.
+
+The CLI has four subcommands. Flags use a single dash:
+
+| Command | Flags |
+|---|---|
+| `record` | `-spec <config.json> -out <run-dir> -fault <MUT-0\|MUT-1>` |
+| `plan` | `-run <run-dir> [-seed <ranking seed>]` |
+| `explore` | `-run <run-dir> [-timeout <duration>]` |
+| `evaluate` | `-run <run-dir> [-budgets 0,1,5,...] [-discovery <csv> -plot <svg>]` |
 
 ---
 
-## 2. End-to-End Pipeline Reproduction
+## 2. Main Experiment (1,000-operation workload)
 
-The complete testing lifecycle consists of four decoupled phases: `record`, `plan`, `explore`, and `evaluate`.
-
-### Experiment 1: MUT-0 Null Control (Baseline Soundness)
-
-Executes the fixed workload (1000 ops, seed 42) with MUT-0 (unfaulted baseline) to establish that CraConTest produces zero false positives.
+Configuration `experiments/configs/main.json`: seed 42, 1,000 operations, 64 keys, 128-byte
+values, a synchronous write every 10th mutation, an explicit flush every 100 operations.
+Operation mix: 50% set, 20% get, 10% delete, 10% two-key batch, 5% range delete, 5% scan.
+Retention policies 0% and 100%.
 
 ```bash
-# 1. Record workload trace and mutation ledger
-./cracontest record --config experiments/configs/smoke.json --out results/smoke_mut0 --fault MUT-0
-
-# 2. Build graph and generate candidate ranking orders
-./cracontest plan --run results/smoke_mut0
-
-# 3. Explore candidate crash states via replay and in-process recovery
-./cracontest explore --run results/smoke_mut0
-
-# 4. Evaluate outcomes across budgets and ranking strategies
-./cracontest evaluate --run results/smoke_mut0
+for f in mut0:MUT-0 mut1:MUT-1; do
+  d=results/main_${f%%:*}
+  ./cracontest record   -spec experiments/configs/main.json -out $d -fault ${f#*:}
+  ./cracontest plan     -run $d
+  ./cracontest explore  -run $d
+  ./cracontest evaluate -run $d -discovery results/discovery_main_${f%%:*}.csv \
+                                -plot      results/plot_main_${f%%:*}.svg
+done
 ```
 
-| Phase | Expected Output | Measured Runtime |
-|---|---|---|
-| `record` | `trace.json` (721 events), `history.json` (1000 ops) | ~350 ms |
-| `plan` | `universe.json` (302 candidates), `ranking_b0/b4/b5/b6.json` | ~20 ms |
-| `explore` | `journal.ndjson` (302 runs), `outcomes.json` (0 violations) | ~300 ms |
-| `evaluate` | `curves.csv` (all strategies 0 failures at all budgets) | ~10 ms |
-| **Total** | | **~680 ms** |
+| Run | Trace events | Cutoffs | Candidates | Outcomes | Distinct signatures | Explore time |
+|---|---|---|---|---|---|---|
+| `main_mut0` | 2,510 | 1,075 | 2,150 | 2,150 valid | 0 | 14.1 s |
+| `main_mut1` | 2,427 | 989 | 1,978 | 1,113 valid, 865 violations | 3 | 12.1 s |
 
----
+`record`, `plan` and `evaluate` each take about 0.2 s. In `main_mut1` the trace contains no
+WAL sync events (84 in `main_mut0`), while its 16 manifest syncs and 30 directory syncs are
+unchanged.
 
-### Experiment 2: MUT-1 Injected Fault (Dropped WAL Sync)
+Figures: `results/plot_main_mut0.svg`, `results/plot_main_mut1.svg`.
+Tables: `results/discovery_main_mut0.csv`, `results/discovery_main_mut1.csv`.
 
-Executes the identical workload with fault `MUT-1` (which silently suppresses WAL `Sync`/`SyncData` calls) to test failure detection efficiency across ranking strategies.
+## 3. Smoke Experiment (100-operation workload)
+
+Configuration `experiments/configs/smoke.json`: seed 42, 100 operations, 16 keys, 64-byte
+values, sync every 10th mutation, flush every 50 operations. Use it for a quick end-to-end check.
 
 ```bash
-# 1. Record trace under MUT-1 fault injection
-./cracontest record --config experiments/configs/smoke.json --out results/smoke_mut1 --fault MUT-1
-
-# 2. Generate candidate crash universe and rankings
-./cracontest plan --run results/smoke_mut1
-
-# 3. Explore crash candidates
-./cracontest explore --run results/smoke_mut1
-
-# 4. Evaluate discovery curves
-./cracontest evaluate --run results/smoke_mut1
+for f in mut0:MUT-0 mut1:MUT-1; do
+  d=results/smoke_${f%%:*}
+  ./cracontest record   -spec experiments/configs/smoke.json -out $d -fault ${f#*:}
+  ./cracontest plan     -run $d
+  ./cracontest explore  -run $d
+  ./cracontest evaluate -run $d -discovery results/discovery_${f%%:*}.csv \
+                                -plot      results/plot_${f%%:*}.svg
+done
 ```
 
-| Phase | Expected Output | Measured Runtime |
-|---|---|---|
-| `record` | `trace.json` (670 events, 0 WAL syncs), `history.json` | ~340 ms |
-| `plan` | `universe.json` (280 candidates), `ranking_b0/b4/b5/b6.json` | ~18 ms |
-| `explore` | `journal.ndjson` (280 runs), `outcomes.json` (88 violations, 2 distinct bugs) | ~280 ms |
-| `evaluate` | `curves.csv` | ~10 ms |
-| **Total** | | **~650 ms** |
+| Run | Trace events | Candidates | Outcomes | Distinct signatures | Total time |
+|---|---|---|---|---|---|
+| `smoke_mut0` | 316 | 302 | 302 valid | 0 | ≈0.6 s |
+| `smoke_mut1` | 305 | 280 | 192 valid, 88 violations | 2 | ≈0.5 s |
 
----
+## 4. Acceptance Tests
 
-## 3. Generating Gate Artifacts, Discovery Curves, and Plots
+| Check | Command | Measured result | Runtime |
+|---|---|---|---|
+| G1 replay fidelity | `go test -v -run 'TestGateG1$' ./internal/replay` | 2,322 events, 20/20 seeded cutoffs byte-identical to the live 100% clone; every replayed state recovers | 0.1 s |
+| G2 null control | `go test -v -run 'TestGateG2$' ./internal/workload` | every endpoint candidate of a fresh 1,000-op MUT-0 recording (≈2,140) valid; 0 violations, open errors, panics, hangs or oracle errors | 7 s |
+| G3 graph labels | `go test -v -run 'TestGateG3$' ./internal/graph` | ≈2,510 events, ≈1,073 cutoffs, ≈173 distinct state keys, Semantic=1 on 96% of cutoffs, build time ≈12 ms | 0.05 s |
+| G4 discovery curves | `go test -v -run 'TestGateG4$' ./internal/exp` | curves recomputed from the stored smoke tables match the committed `results/discovery_mut*.csv`; nothing re-executed | 0.1 s |
+| Real-disk recovery | `go test -v -run TestRealDisk ./internal/recovery` | 200 synced keys survive a clean close and an abrupt child-process exit on `vfs.Default` | 1.6 s |
 
-### Gate G4 Discovery Curves and SVG Plots
+G1, G2 and G3 record a fresh trace, so their counts vary by a few events between runs
+(see Determinism above).
 
-To compute discovery curves across B0 (mean/min/max over 10 ranking seeds), B4 (combined), B5 (representative), and B6 (sync-boundary) and output standalone SVG charts and CSVs:
-
-```bash
-go test -v -run TestGenerateG4Artifacts ./internal/exp
-```
-Measured runtime: **~0.15s**.
-
-Generated Artifacts:
-- `results/discovery_mut0.csv`
-- `results/discovery_mut1.csv`
-- `results/plot_mut0.svg`
-- `results/plot_mut1.svg`
-
-### Gate G3 Dependency Graph Metrics
-
-To construct the persistence dependency graph over the 1,000-operation workload trace and inspect vertex/edge counts, topological ordering, and semantic features:
+## 5. Full Suite
 
 ```bash
-go test -v -run TestGateG3 ./internal/graph
-```
-Measured runtime: **~0.01s** graph build time.
-Expected metrics:
-- Trace events: 2,512
-- Candidate cutoffs: 1,074
-- Graph build time: <10 ms
-- Distinct StateKeys: 174
-- Semantic category share: 96.28%
-
-### Gate G2 Comprehensive Null Control (2,142 Candidates)
-
-To verify the oracle on the full universe of 2,142 crash candidates (1,071 cutoffs × {0, 100}% retention) against MUT-0:
-
-```bash
-go test -v -run TestGateG2 ./internal/workload
-```
-Measured runtime: **~7.4s**.
-Expected metrics:
-- Candidates evaluated: 2,142
-- Violations: 0
-- Open errors: 0
-- Panics: 0
-- Hangs / Timeouts: 0
-- Oracle errors: 0
-
----
-
-## 4. Real-Disk Recovery Smoke Verification
-
-To verify that clean database shutdown and abrupt child-process kill (without calling `Close()`) recover cleanly and pass structural integrity checks on real disk filesystems (`vfs.Default`):
-
-```bash
-go test -v -run TestRealDisk ./internal/recovery
-```
-Measured runtime: **~1.8s**.
-Checks:
-1. `TestRealDiskCleanClose`: 200 synced keys with mid-run flush survive clean close.
-2. `TestRealDiskChildProcessKill`: Child process exits with code 3 during active synced writes; parent recovers and verifies all 200 keys and values match via `recovery.SafeOpen` + `recovery.CheckIntegrity`.
-
----
-
-## 5. Full Test Suite & Race Detection
-
-```bash
-# Vet codebase
 go vet ./...
-
-# Run all package unit and integration tests
 go test -count=1 ./...
-
-# Run race detector (Linux)
-go test -race -count=1 ./...
+go test -race -count=1 ./...      # Linux or WSL2
 ```
-Expected runtime:
-- `go vet ./...`: ~0.5s
-- `go test -count=1 ./...`: ~12s
-- `go test -race -count=1 ./...`: ~20s
-All tests should pass with 0 errors across all 13 packages.
+
+All 13 packages pass. `go test` takes about 12 s and `go test -race` about 50 s on Linux.
