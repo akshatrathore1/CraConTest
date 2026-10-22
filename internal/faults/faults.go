@@ -14,15 +14,34 @@ import (
 	"github.com/cockroachdb/pebble/v2/vfs"
 )
 
-// Seeded fault IDs.
+// Seeded fault IDs. Each fault makes one class of durability barrier
+// return success without syncing:
+//
+//   - MUT-0: none (null control).
+//   - MUT-1: Sync and SyncData on write-ahead log files (category pebble-wal,
+//     opened by Create, OpenReadWrite or ReuseForWrite).
+//   - MUT-2: Sync and SyncData on manifest files (category pebble-manifest).
+//   - MUT-3: Sync on directory handles returned by OpenDir.
+//   - MUT-4: Sync and SyncData on tables written by memtable flushes
+//     (category pebble-memtable-flush).
 const (
 	MUT0 = "MUT-0"
 	MUT1 = "MUT-1"
+	MUT2 = "MUT-2"
+	MUT3 = "MUT-3"
+	MUT4 = "MUT-4"
 )
+
+// fileCategory maps each file-based fault to the write category it targets.
+var fileCategory = map[string]vfs.DiskWriteCategory{
+	MUT1: "pebble-wal",
+	MUT2: "pebble-manifest",
+	MUT4: "pebble-memtable-flush",
+}
 
 // IDs returns the list of all supported fault identifiers.
 func IDs() []string {
-	return []string{MUT0, MUT1}
+	return []string{MUT0, MUT1, MUT2, MUT3, MUT4}
 }
 
 // FS wraps an inner vfs.FS and injects faults based on its configuration.
@@ -35,12 +54,16 @@ type FS struct {
 var _ vfs.FS = (*FS)(nil)
 
 // New constructs a fault-injected filesystem wrapper around inner.
-// id must be "MUT-0" (null control, pass-through) or "MUT-1" (drops pebble-wal syncs).
+// id must be one of IDs().
 func New(id string, inner vfs.FS) (vfs.FS, error) {
 	if inner == nil {
 		return nil, errors.New("faults: inner FS cannot be nil")
 	}
-	if id != MUT0 && id != MUT1 {
+	known := false
+	for _, candidate := range IDs() {
+		known = known || id == candidate
+	}
+	if !known {
 		return nil, fmt.Errorf("faults: unknown fault id %q (supported: %v)", id, IDs())
 	}
 	return &FS{
@@ -60,7 +83,8 @@ func (fs *FS) Unwrap() vfs.FS {
 }
 
 func (fs *FS) shouldDropSync(category vfs.DiskWriteCategory) bool {
-	return fs.id == MUT1 && string(category) == "pebble-wal"
+	target, ok := fileCategory[fs.id]
+	return ok && category == target
 }
 
 // Create implements vfs.FS.
@@ -101,7 +125,7 @@ func (fs *FS) OpenDir(name string) (vfs.File, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &file{inner: f, dropSync: false}, nil
+	return &file{inner: f, dropSync: fs.id == MUT3}, nil
 }
 
 // Remove implements vfs.FS.

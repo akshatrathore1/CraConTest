@@ -34,13 +34,13 @@ func (m *mockFile) Fd() uintptr                              { return 0 }
 
 func TestFaultIDsAndValidation(t *testing.T) {
 	ids := faults.IDs()
-	if len(ids) != 2 || ids[0] != "MUT-0" || ids[1] != "MUT-1" {
+	if strings.Join(ids, ",") != "MUT-0,MUT-1,MUT-2,MUT-3,MUT-4" {
 		t.Fatalf("unexpected IDs: %v", ids)
 	}
 
 	mem := vfs.NewCrashableMem()
-	if _, err := faults.New("MUT-2", mem); err == nil {
-		t.Error("expected error for unknown fault ID MUT-2, got nil")
+	if _, err := faults.New("MUT-5", mem); err == nil {
+		t.Error("expected error for unknown fault ID MUT-5, got nil")
 	}
 	if _, err := faults.New("MUT-0", nil); err == nil {
 		t.Error("expected error for nil inner FS, got nil")
@@ -220,4 +220,61 @@ func countManifestSyncs(events []trace.Event) int {
 		}
 	}
 	return count
+}
+
+// Each fault drops exactly its own class of barrier and nothing else.
+func TestEachFaultDropsOnlyItsBarrier(t *testing.T) {
+	type barrier struct {
+		name string
+		open func(fs vfs.FS) (vfs.File, error)
+	}
+	barriers := []barrier{
+		{"wal", func(fs vfs.FS) (vfs.File, error) { return fs.Create("db/000002.log", "pebble-wal") }},
+		{"manifest", func(fs vfs.FS) (vfs.File, error) { return fs.Create("db/MANIFEST-000001", "pebble-manifest") }},
+		{"dir", func(fs vfs.FS) (vfs.File, error) { return fs.OpenDir("db") }},
+		{"flush", func(fs vfs.FS) (vfs.File, error) { return fs.Create("db/000004.sst", "pebble-memtable-flush") }},
+		{"compaction", func(fs vfs.FS) (vfs.File, error) { return fs.Create("db/000005.sst", "pebble-compaction") }},
+	}
+	drops := map[string]string{"MUT-0": "", "MUT-1": "wal", "MUT-2": "manifest", "MUT-3": "dir", "MUT-4": "flush"}
+	for _, id := range faults.IDs() {
+		for _, b := range barriers {
+			mem := vfs.NewMem()
+			if err := mem.MkdirAll("db", 0755); err != nil {
+				t.Fatal(err)
+			}
+			rec := vfsrec.New(mem)
+			fs, err := faults.New(id, rec)
+			if err != nil {
+				t.Fatal(err)
+			}
+			f, err := b.open(fs)
+			if err != nil {
+				t.Fatalf("%s/%s: open: %v", id, b.name, err)
+			}
+			if err := f.Sync(); err != nil {
+				t.Fatal(err)
+			}
+			if b.name != "dir" {
+				if err := f.SyncData(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			barriers := 0
+			for _, e := range rec.Events() {
+				if e.IsBarrier() {
+					barriers++
+				}
+			}
+			want := 2
+			if b.name == "dir" {
+				want = 1
+			}
+			if drops[id] == b.name {
+				want = 0
+			}
+			if barriers != want {
+				t.Errorf("%s on %s: %d barrier events recorded, want %d", id, b.name, barriers, want)
+			}
+		}
+	}
 }
