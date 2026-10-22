@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "run_id": "smoke_mut1",
+  "timestamp": "2026-10-22T06:54:39Z",
+  "fault_id": "MUT-1",
+  "base_seed": 42,
+  "policies": [
+    0,
+    100
+  ],
+  "workload": {
+    "seed": 42,
+    "operations": 100,
+    "key_count": 16,
+    "value_bytes": 64,
+    "sync_every": 10,
+    "flush_every": 50
+  },
+  "pebble_version": "v2.1.7",
+  "go_version": "go1.27.1",
+  "goos": "windows",
+  "goarch": "amd64"
+}
