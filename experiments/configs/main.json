@@ -1,0 +1,8 @@
+{
+  "seed": 42,
+  "operations": 1000,
+  "key_count": 64,
+  "value_bytes": 128,
+  "sync_every": 10,
+  "flush_every": 100
+}
