@@ -53,6 +53,26 @@ type Features struct {
 	Categories []string
 	// BeforeBoundary reports trace.BeforeBoundary at this cutoff.
 	BeforeBoundary bool
+
+	// Reverse Risk Horizon:
+	// DirtyBytes is the total unpersisted dirty byte volume across all resources.
+	DirtyBytes uint64
+	// UncommittedSyncOps is the count of uncommitted synchronous operations.
+	UncommittedSyncOps uint64
+	// RiskScore is the composite uncommitted risk exposure at this cutoff.
+	RiskScore float64
+
+	// Barrier Proximity:
+	// BarrierProximity is 1 / (1 + delta) to the nearest subsequent barrier (1.0 if immediately preceding).
+	BarrierProximity float64
+	// NextBarrier is the event ID of the nearest subsequent barrier (0 if none).
+	NextBarrier uint64
+
+	// 5-Tier Discriminative Semantics:
+	// SemanticTier is 0..4 (4: Manifest, 3: WAL commit, 2: Directory, 1: Memtable flush, 0: Routine data).
+	SemanticTier int
+	// SemanticWeight is the corresponding weight (10.0, 8.0, 6.0, 2.0, 0.0).
+	SemanticWeight float64
 }
 
 // View is the read-only result of Build. It owns copies of its inputs.
@@ -169,16 +189,26 @@ func Build(input []trace.Event) (*View, error) {
 	events := trace.Clone(input)
 	b := newBuilder()
 	type partial struct {
-		stateKey   string
-		categories []string
-		opKind     string
-		anchor     uint64
+		stateKey       string
+		categories     []string
+		opKind         string
+		anchor         uint64
+		dirtyBytes     uint64
+		uncommittedOps uint64
+		riskScore      float64
 	}
 	parts := make([]partial, len(events)+1)
 	emptyKey, emptyCats := b.stateKey()
 	parts[0] = partial{stateKey: emptyKey, categories: emptyCats, opKind: Background}
 	var anchor uint64
+	var uncommittedSyncOps uint64
 	for _, event := range events {
+		if event.Kind == trace.KindOpEnd && trace.MutatingOperation(event.OpKind) && event.Err == "" {
+			uncommittedSyncOps++
+		}
+		if event.IsBarrier() {
+			uncommittedSyncOps = 0
+		}
 		opKind, err := b.apply(event)
 		if err != nil {
 			return nil, err
@@ -187,9 +217,19 @@ func Build(input []trace.Event) (*View, error) {
 			anchor = event.ID
 		}
 		key, categories := b.stateKey()
-		parts[event.ID] = partial{stateKey: key, categories: categories, opKind: opKind, anchor: anchor}
+		dirtyBytes, riskScore := computeRiskHorizon(b.resources, b.pending, uncommittedSyncOps)
+		parts[event.ID] = partial{
+			stateKey:       key,
+			categories:     categories,
+			opKind:         opKind,
+			anchor:         anchor,
+			dirtyBytes:     dirtyBytes,
+			uncommittedOps: uncommittedSyncOps,
+			riskScore:      riskScore,
+		}
 	}
 
+	barriers := extractBarriers(events)
 	desc, cross := b.reachability()
 	view := &View{
 		Events:     events,
@@ -208,11 +248,26 @@ func Build(input []trace.Event) (*View, error) {
 	}
 	for cut := uint64(0); cut <= uint64(len(events)); cut++ {
 		part := parts[cut]
+		prox, nextBarrier := computeBarrierProximity(cut, barriers)
+		var anchorRes *resource
+		if part.anchor != 0 {
+			if resID := b.vertexRes[part.anchor]; resID != 0 {
+				anchorRes = b.resources[resID]
+			}
+		}
+		tier, semWeight := CutoffTier(events, cut, part.anchor, nextBarrier, anchorRes)
 		features := Features{
-			StateKey:       part.stateKey,
-			OpKind:         part.opKind,
-			Categories:     part.categories,
-			BeforeBoundary: trace.BeforeBoundary(events, cut),
+			StateKey:           part.stateKey,
+			OpKind:             part.opKind,
+			Categories:         part.categories,
+			BeforeBoundary:     trace.BeforeBoundary(events, cut),
+			DirtyBytes:         part.dirtyBytes,
+			UncommittedSyncOps: part.uncommittedOps,
+			RiskScore:          part.riskScore,
+			BarrierProximity:   prox,
+			NextBarrier:        nextBarrier,
+			SemanticTier:       tier,
+			SemanticWeight:     semWeight,
 		}
 		if part.anchor != 0 {
 			features.Desc = desc[part.anchor]

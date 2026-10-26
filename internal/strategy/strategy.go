@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand/v2"
+	"sort"
 
 	"github.com/akshatrathore1/CraConTest/internal/candidate"
 	"github.com/akshatrathore1/CraConTest/internal/graph"
@@ -102,6 +103,99 @@ func (strategy random) Rank(_ *graph.View, universe []candidate.Candidate) []can
 	result := canonical(universe)
 	generator := rand.New(rand.NewPCG(0, strategy.seed))
 	generator.Shuffle(len(result), func(left, right int) { result[left], result[right] = result[right], result[left] })
+	return result
+}
+
+// --- B1: fifo / chronological -------------------------------------------
+
+type fifo struct{}
+
+// NewFIFO returns the FIFO / chronological baseline: orders candidates
+// by event cutoff in ascending chronological order (canonical).
+func NewFIFO() Strategy { return fifo{} }
+
+func (fifo) Name() string { return "fifo" }
+
+func (fifo) Rank(view *graph.View, universe []candidate.Candidate) []candidate.Candidate {
+	ordered := canonical(universe)
+	if _, ok := features(view, ordered); !ok {
+		return nil
+	}
+	return ordered
+}
+
+// --- B2: lifo / reverse chronological -----------------------------------
+
+type lifo struct{}
+
+// NewLIFO returns the LIFO / reverse chronological baseline: orders candidates
+// in reverse chronological order (latest cutoffs first).
+func NewLIFO() Strategy { return lifo{} }
+
+func (lifo) Name() string { return "lifo" }
+
+func (lifo) Rank(view *graph.View, universe []candidate.Candidate) []candidate.Candidate {
+	ordered := canonical(universe)
+	if _, ok := features(view, ordered); !ok {
+		return nil
+	}
+	result := make([]candidate.Candidate, len(ordered))
+	copy(result, ordered)
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].Event != result[j].Event {
+			return result[i].Event > result[j].Event
+		}
+		if result[i].Percent != result[j].Percent {
+			return result[i].Percent < result[j].Percent
+		}
+		return result[i].Seed < result[j].Seed
+	})
+	return result
+}
+
+// --- B3: stride / even interval -----------------------------------------
+
+type stride struct {
+	customStride int
+}
+
+// NewStride returns the Stride / even interval baseline: systematically
+// strides across the candidate timeline in interleaved passes.
+// If customStride is omitted or <= 0, stride is dynamically set to ceil(sqrt(N)).
+func NewStride(customStride ...int) Strategy {
+	s := 0
+	if len(customStride) > 0 && customStride[0] > 0 {
+		s = customStride[0]
+	}
+	return stride{customStride: s}
+}
+
+func (stride) Name() string { return "stride" }
+
+func (s stride) Rank(view *graph.View, universe []candidate.Candidate) []candidate.Candidate {
+	ordered := canonical(universe)
+	if _, ok := features(view, ordered); !ok {
+		return nil
+	}
+	n := len(ordered)
+	if n <= 1 {
+		return ordered
+	}
+
+	step := s.customStride
+	if step <= 0 {
+		step = int(math.Ceil(math.Sqrt(float64(n))))
+	}
+	if step < 1 {
+		step = 1
+	}
+
+	result := make([]candidate.Candidate, 0, n)
+	for offset := 0; offset < step; offset++ {
+		for i := offset; i < n; i += step {
+			result = append(result, ordered[i])
+		}
+	}
 	return result
 }
 
@@ -309,18 +403,49 @@ func Explain(view *graph.View, universe []candidate.Candidate, w Weights) ([]Sco
 // ErrUnknownStrategy is returned by ByName for an unrecognized name.
 var ErrUnknownStrategy = errors.New("strategy: unknown strategy name")
 
-// ByName constructs one of the four initial strategies by its fixed name.
-// The seed is used only by random; weights only by combined.
+// ByName constructs a ranking strategy by its name or canonical baseline code.
+// The seed is used only by random; weights only by combined or custom RHG.
 func ByName(name string, seed uint64, weights Weights) (Strategy, error) {
 	switch name {
-	case "random":
+	case "random", "b0":
 		return NewRandom(seed), nil
-	case "representative":
-		return NewRepresentative(), nil
-	case "sync-boundary":
-		return NewSyncBoundary(), nil
-	case "combined":
+	case "fifo", "b1", "chronological":
+		return NewFIFO(), nil
+	case "lifo", "b2", "reverse_chronological", "reverse-chronological":
+		return NewLIFO(), nil
+	case "stride", "b3", "even_interval", "even-interval":
+		return NewStride(), nil
+	case "combined", "b4":
 		return NewCombined(weights)
+	case "representative", "b5":
+		return NewRepresentative(), nil
+	case "sync-boundary", "b6", "sync_boundary":
+		return NewSyncBoundary(), nil
+	case "rhg", "b7", "risk_horizon", "risk-horizon":
+		if weights != (Weights{}) && weights != DefaultWeights {
+			w := RHGWeights{Risk: weights.Alpha, Barrier: weights.Beta, Semantic: weights.Gamma, Novelty: weights.Delta}
+			if err := validateRHGWeights(w); err != nil {
+				return nil, err
+			}
+			return NewRiskHorizon(w), nil
+		}
+		return NewRiskHorizon(DefaultRHGWeights), nil
+	case "r1", "r1-random", "r1_random", "r1_zero_retention_first", "r0_retention_first_random":
+		return NewR1(seed), nil
+	case "r2", "r2-representative", "r2_representative", "r2_state_representative", "state_representative_r1":
+		return NewR2(seed), nil
+	case "dcg", "b8", "durability_contract", "durability-contract":
+		if weights != (Weights{}) && weights != DefaultWeights {
+			w := DCGWeights{
+				WALWeight:      weights.Alpha,
+				ManifestWeight: weights.Beta,
+				RenameWeight:   weights.Gamma,
+			}
+			return NewDCG(w), nil
+		}
+		return NewDCG(), nil
+	case "dcg-flag-only", "dcg_flag_only", "dcg-flagonly":
+		return NewDCGFlagOnly(seed), nil
 	}
 	return nil, fmt.Errorf("%w: %q", ErrUnknownStrategy, name)
 }

@@ -2,6 +2,7 @@ package graph_test
 
 import (
 	"bytes"
+	"math"
 	"reflect"
 	"strings"
 	"testing"
@@ -332,5 +333,186 @@ func TestRemoveAllPendingLifecycle(t *testing.T) {
 	cut4 := view.Cuts[4]
 	if cut4.StateKey == "" {
 		t.Fatal("cut 4 has empty StateKey")
+	}
+}
+
+func TestBarrierProximityCalculation(t *testing.T) {
+	events := []trace.Event{
+		{ID: 1, Kind: trace.KindCreate, File: "db/a", Handle: 1},
+		{ID: 2, Kind: trace.KindWrite, File: "db/a", Handle: 1, Len: 10, Data: []byte("0123456789")},
+		{ID: 3, Kind: trace.KindWrite, File: "db/a", Handle: 1, Off: 10, Len: 10, Data: []byte("0123456789")},
+		{ID: 4, Kind: trace.KindSyncData, File: "db/a", Handle: 1},
+		{ID: 5, Kind: trace.KindWrite, File: "db/a", Handle: 1, Off: 20, Len: 5, Data: []byte("hello")},
+		{ID: 6, Kind: trace.KindSync, File: "db/a", Handle: 1},
+	}
+
+	view, err := graph.Build(events)
+	if err != nil {
+		t.Fatalf("graph.Build: %v", err)
+	}
+
+	// At cut 3 (immediately before barrier event 4):
+	// delta = (4 - 1) - 3 = 0 -> proximity = 1.0, nextBarrier = 4
+	c3 := view.Cuts[3]
+	if c3.NextBarrier != 4 {
+		t.Errorf("cut 3: NextBarrier=%d, want 4", c3.NextBarrier)
+	}
+	if math.Abs(c3.BarrierProximity-1.0) > 1e-9 {
+		t.Errorf("cut 3: BarrierProximity=%.4f, want 1.0", c3.BarrierProximity)
+	}
+
+	// At cut 2 (1 event before cut 3):
+	// delta = (4 - 1) - 2 = 1 -> proximity = 1 / (1 + 1) = 0.5, nextBarrier = 4
+	c2 := view.Cuts[2]
+	if c2.NextBarrier != 4 {
+		t.Errorf("cut 2: NextBarrier=%d, want 4", c2.NextBarrier)
+	}
+	if math.Abs(c2.BarrierProximity-0.5) > 1e-9 {
+		t.Errorf("cut 2: BarrierProximity=%.4f, want 0.5", c2.BarrierProximity)
+	}
+
+	// At cut 5 (immediately before barrier event 6):
+	// delta = (6 - 1) - 5 = 0 -> proximity = 1.0, nextBarrier = 6
+	c5 := view.Cuts[5]
+	if c5.NextBarrier != 6 {
+		t.Errorf("cut 5: NextBarrier=%d, want 6", c5.NextBarrier)
+	}
+	if math.Abs(c5.BarrierProximity-1.0) > 1e-9 {
+		t.Errorf("cut 5: BarrierProximity=%.4f, want 1.0", c5.BarrierProximity)
+	}
+
+	// At cut 6 (barrier already happened, no more barriers in trace):
+	// proximity = 0.0, nextBarrier = 0
+	c6 := view.Cuts[6]
+	if c6.NextBarrier != 0 {
+		t.Errorf("cut 6: NextBarrier=%d, want 0", c6.NextBarrier)
+	}
+	if c6.BarrierProximity != 0.0 {
+		t.Errorf("cut 6: BarrierProximity=%.4f, want 0.0", c6.BarrierProximity)
+	}
+}
+
+func TestFiveTierSemanticClassification(t *testing.T) {
+	// Verify raw tier weights
+	if graph.TierWeight(graph.TierManifest) != 10.0 {
+		t.Errorf("TierManifest weight != 10.0")
+	}
+	if graph.TierWeight(graph.TierWAL) != 8.0 {
+		t.Errorf("TierWAL weight != 8.0")
+	}
+	if graph.TierWeight(graph.TierDir) != 6.0 {
+		t.Errorf("TierDir weight != 6.0")
+	}
+	if graph.TierWeight(graph.TierFlush) != 2.0 {
+		t.Errorf("TierFlush weight != 2.0")
+	}
+	if graph.TierWeight(graph.TierData) != 0.0 {
+		t.Errorf("TierData weight != 0.0")
+	}
+
+	events := []trace.Event{
+		{ID: 1, Kind: trace.KindCreate, File: "db/MANIFEST-000001", Cat: "pebble-manifest", Handle: 1},
+		{ID: 2, Kind: trace.KindWrite, File: "db/MANIFEST-000001", Handle: 1, Len: 10, Data: []byte("0123456789")},
+		{ID: 3, Kind: trace.KindSync, File: "db/MANIFEST-000001", Handle: 1},
+		{ID: 4, Kind: trace.KindCreate, File: "db/000002.log", Cat: "pebble-wal", Handle: 2},
+		{ID: 5, Kind: trace.KindWrite, File: "db/000002.log", Handle: 2, Len: 10, Data: []byte("0123456789")},
+		{ID: 6, Kind: trace.KindSyncData, File: "db/000002.log", Handle: 2},
+		{ID: 7, Kind: trace.KindMkdirAll, File: "db/dir", Mode: 0755},
+		{ID: 8, Kind: trace.KindCreate, File: "db/000003.sst", Cat: "pebble-memtable-flush", Handle: 3},
+		{ID: 9, Kind: trace.KindWrite, File: "db/000003.sst", Handle: 3, Len: 10, Data: []byte("0123456789")},
+		{ID: 10, Kind: trace.KindSyncData, File: "db/000003.sst", Handle: 3},
+		{ID: 11, Kind: trace.KindCreate, File: "db/000004.sst", Cat: "pebble-compaction", Handle: 4},
+		{ID: 12, Kind: trace.KindWrite, File: "db/000004.sst", Handle: 4, Len: 10, Data: []byte("0123456789")},
+	}
+
+	view, err := graph.Build(events)
+	if err != nil {
+		t.Fatalf("graph.Build: %v", err)
+	}
+
+	// Cut 2: Manifest write -> Tier 4 (10.0)
+	c2 := view.Cuts[2]
+	if c2.SemanticTier != graph.TierManifest || c2.SemanticWeight != 10.0 {
+		t.Errorf("cut 2 (manifest): got tier %d (weight %.1f), want Tier 4 (10.0)", c2.SemanticTier, c2.SemanticWeight)
+	}
+
+	// Cut 5: WAL write -> Tier 3 (8.0)
+	c5 := view.Cuts[5]
+	if c5.SemanticTier != graph.TierWAL || c5.SemanticWeight != 8.0 {
+		t.Errorf("cut 5 (WAL): got tier %d (weight %.1f), want Tier 3 (8.0)", c5.SemanticTier, c5.SemanticWeight)
+	}
+
+	// Cut 7: MkdirAll -> Tier 2 (6.0)
+	c7 := view.Cuts[7]
+	if c7.SemanticTier != graph.TierDir || c7.SemanticWeight != 6.0 {
+		t.Errorf("cut 7 (dir): got tier %d (weight %.1f), want Tier 2 (6.0)", c7.SemanticTier, c7.SemanticWeight)
+	}
+
+	// Cut 9: Memtable flush -> Tier 1 (2.0)
+	c9 := view.Cuts[9]
+	if c9.SemanticTier != graph.TierFlush || c9.SemanticWeight != 2.0 {
+		t.Errorf("cut 9 (flush): got tier %d (weight %.1f), want Tier 1 (2.0)", c9.SemanticTier, c9.SemanticWeight)
+	}
+
+	// Cut 12: Compaction write -> Tier 0 (0.0)
+	c12 := view.Cuts[12]
+	if c12.SemanticTier != graph.TierData || c12.SemanticWeight != 0.0 {
+		t.Errorf("cut 12 (compaction): got tier %d (weight %.1f), want Tier 0 (0.0)", c12.SemanticTier, c12.SemanticWeight)
+	}
+}
+
+func TestReverseRiskHorizonComputation(t *testing.T) {
+	events := []trace.Event{
+		{ID: 1, Kind: trace.KindCreate, File: "db/000001.log", Cat: "pebble-wal", Handle: 1},
+		{ID: 2, Kind: trace.KindOpBegin, Op: 1, OpKind: "set"},
+		{ID: 3, Kind: trace.KindWrite, File: "db/000001.log", Handle: 1, Len: 100, Data: make([]byte, 100)},
+		{ID: 4, Kind: trace.KindOpEnd, Op: 1, OpKind: "set"},
+		{ID: 5, Kind: trace.KindOpBegin, Op: 2, OpKind: "set"},
+		{ID: 6, Kind: trace.KindWrite, File: "db/000001.log", Handle: 1, Off: 100, Len: 200, Data: make([]byte, 200)},
+		{ID: 7, Kind: trace.KindOpEnd, Op: 2, OpKind: "set"},
+		{ID: 8, Kind: trace.KindSyncData, File: "db/000001.log", Handle: 1},
+	}
+
+	view, err := graph.Build(events)
+	if err != nil {
+		t.Fatalf("graph.Build: %v", err)
+	}
+
+	// At cut 0: dirty bytes = 0, risk = 0
+	if view.Cuts[0].DirtyBytes != 0 || view.Cuts[0].RiskScore != 0.0 {
+		t.Errorf("cut 0: dirty=%d, risk=%.2f, want 0, 0.0", view.Cuts[0].DirtyBytes, view.Cuts[0].RiskScore)
+	}
+
+	// At cut 3: 100 bytes written to WAL, in-flight set operation
+	c3 := view.Cuts[3]
+	if c3.DirtyBytes != 100 {
+		t.Errorf("cut 3: DirtyBytes=%d, want 100", c3.DirtyBytes)
+	}
+	if c3.RiskScore <= 0 {
+		t.Errorf("cut 3: RiskScore=%.2f, want > 0", c3.RiskScore)
+	}
+
+	// At cut 7: 300 bytes total dirty in WAL, 2 completed client sync ops uncommitted
+	c7 := view.Cuts[7]
+	if c7.DirtyBytes != 300 {
+		t.Errorf("cut 7: DirtyBytes=%d, want 300", c7.DirtyBytes)
+	}
+	if c7.UncommittedSyncOps != 2 {
+		t.Errorf("cut 7: UncommittedSyncOps=%d, want 2", c7.UncommittedSyncOps)
+	}
+	if c7.RiskScore <= c3.RiskScore {
+		t.Errorf("cut 7 RiskScore (%.2f) should exceed cut 3 RiskScore (%.2f)", c7.RiskScore, c3.RiskScore)
+	}
+
+	// At cut 8: SyncData executed -> DirtyBytes drops to 0, UncommittedSyncOps drops to 0
+	c8 := view.Cuts[8]
+	if c8.DirtyBytes != 0 {
+		t.Errorf("cut 8: DirtyBytes=%d after sync, want 0", c8.DirtyBytes)
+	}
+	if c8.UncommittedSyncOps != 0 {
+		t.Errorf("cut 8: UncommittedSyncOps=%d after sync, want 0", c8.UncommittedSyncOps)
+	}
+	if c8.RiskScore >= c7.RiskScore {
+		t.Errorf("cut 8 RiskScore (%.2f) should be lower than pre-sync cut 7 RiskScore (%.2f)", c8.RiskScore, c7.RiskScore)
 	}
 }
