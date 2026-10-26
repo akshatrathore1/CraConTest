@@ -235,3 +235,33 @@ Understanding how Pebble dispatches sync calls is critical for the VFS wrapper:
 The VFS recording layer and the fault injection layer must intercept both
 `Sync()` and `SyncData()` on all files to correctly capture and manipulate
 persistence boundaries.
+
+## Seeded Fault Models and Structural Durability Invariants
+
+To thoroughly evaluate crash-consistency ranking strategies across diverse failure densities and lifecycle triggers, CraConTest defines 10 fault models (`MUT-0` through `MUT-9`):
+
+| Fault Model | Target Barrier | Scope | Expected Recovery Symptom |
+|---|---|---|---|
+| `MUT-0` | None (null control) | Null pass-through | Clean recovery; 0 false alarms across all seeds |
+| `MUT-1` | WAL `SyncData` / `Sync` | Dense (all WAL syncs dropped) | Durability violation: lost acknowledged writes (`v1:violation:durably_committed:lost_writes`) |
+| `MUT-2` | Manifest `Sync` | Dense (all manifest syncs dropped) | Open error: corrupted or unparseable manifest (`v1:open_error:manifest_corrupt`) |
+| `MUT-3` | Directory `Sync` (`OpenDir`) | Dense (all directory syncs dropped) | Durability violation: lost acknowledged files / unlinked SSTs (`v1:violation:durably_committed:lost_files`) |
+| `MUT-4` | Memtable flush SST `SyncData` | Dense (all flush SST syncs dropped) | Open error: table size mismatch or corrupted SST (`v1:open_error:table_corrupt`) |
+| `MUT-5` | WAL `SyncData` | Sparse (single $k$-th WAL sync dropped, $k=1$) | Durability violation: lost acknowledged writes from targeted sync (`v1:violation:durably_committed:lost_writes`) |
+| `MUT-6` | Second manifest `Sync` (first post-open manifest sync) | Sparse (~0.8% density) | Open error or violation: second manifest sync drop causes manifest rotation inconsistency (`v1:open_error:manifest_rotation`) |
+| `MUT-7` | Directory `Sync` after `CURRENT`/`OPTIONS` rename | No-op control on Pebble v2.1.7 (0.0% density; Pebble v2 creates `CURRENT` once during `Open` and recovers cleanly if `OPTIONS` is lost) | None (clean recovery on Pebble v2.1.7) |
+| `MUT-8` | Compaction/flush SST `SyncData` after `CompactionBegin` | Windowed (~15.2% density; RocksDB #10460 compaction sync drop) | Open error: compaction state / missing table referenced by manifest (`v1:open_error:compaction_state`) |
+| `MUT-9` | Directory `Sync` (`OpenDir`) | Dense ($k=1$, ~41.4% density) / Sparse ($k \in \{7,9,10,12\}$, 0.8%–12.4% density; flush/compaction directory syncs). Directory-entry tracking was added after inspecting MUT-9, so MUT-9 evaluates parameterized $k$-generalization within the directory-sync family. | Durability violation: lost unpersisted directory entry (`v1:violation:durably_committed:lost_files`) |
+
+### Structural Tracking of POSIX Durability Contracts
+
+Storage engine crash-consistency contracts require coordinated persistence across three distinct filesystem boundaries. In `internal/graph/features.go`, CraConTest causally tracks each invariant in a single forward pass over recorded `trace.Event` records without inspecting recovery outcomes:
+
+1. **WAL Write Persistence Before Client Acknowledgment (`AckSyncMissing`):**
+   Under POSIX durability semantics, a synchronous client write operation is only durably committed once all dirty byte spans written to the active write-ahead log (`.log`) have been flushed to stable media via `SyncData()`. In `internal/graph/features.go`, the tracker records dirty byte spans (`dirtySpans`) per WAL handle and file. When client acknowledgment occurs (`trace.KindOpEnd` where `trace.MutatingOperation(op)` holds), any acknowledged operation whose WAL writes have not been covered by a subsequent `SyncData` increments `UnpersistedAckOps` and sets `AckSyncMissing = true`. A crash occurring while `AckSyncMissing` is true guarantees that durably acknowledged operations will be lost upon recovery.
+
+2. **SSTable Data and Directory Entry Durability Prior to Manifest Commitment (`committedInManifest` / `DanglingTableCount`):**
+   When Pebble flushes a memtable or executes a compaction, newly written SSTable files must be durably persisted before the version edit referencing them is committed in the `MANIFEST`. Durability of an SSTable requires both conditions: (a) all dirty byte spans of the table file are synced via `SyncData()` (`dirtyBytes == 0`), and (b) the directory entry referencing the table filename in its parent directory is synced via `File.Sync()` on the directory handle (`dirEntrySynced == true`). If a manifest version edit commits (`stagedInManifest` transitions to `committedInManifest`) while any referenced SSTable has unsynced data or an unsynced parent directory entry, `DanglingTableCount` is incremented. A crash cutoff at this point leaves the manifest pointing to a missing or truncated table, causing recovery open errors (`manifest_corrupt` or `table_corrupt`).
+
+3. **Parent Directory Durability Across Namespace Lineage (`UnsyncedDirectoryRename`):**
+   Under POSIX semantics, filesystem metadata operations—including `Create`, `ReuseForWrite`, `Rename`, `Link`, and `MkdirAll`—modify the containing directory. The file's directory entry remains volatile until `File.Sync()` is explicitly invoked on the parent directory handle (`OpenDir`). In `internal/graph/features.go`, file nodes track `parentDir` and `dirEntrySynced`, while directory creations populate `unsyncedDirs`. Directory sync events (`trace.KindSync` with `Dir: true`) clear pending records strictly for matching directory paths. If critical namespace renames (targeting `CURRENT` or `MANIFEST`) or active files written post-acknowledgment remain uncommitted in the directory namespace, `UnsyncedDirectoryRename` is asserted.

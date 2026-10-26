@@ -65,6 +65,10 @@ crash candidates, and rank them by strategy.
 - A **persistence-state view**: for each event index *k*, which files hold
   unsynced data, which directory entries are pending, and how many persistence
   events are downstream.
+- **Durability-contract features (`ContractFeatures`)**: per-cutoff indicators
+  (`AckSyncMissing`, `DanglingTableCount`, `UnsyncedDirectoryRename`, `ContractScore`)
+  computed causally from trace prefixes (`internal/graph/features.go`) without
+  inspecting recovery outcomes.
 - A **candidate universe** *U*: each candidate is a tuple
   *(event cutoff k, retention percentage, seed)*.
   - *k*: after one-based events `1..k`; zero is before the trace.
@@ -81,9 +85,12 @@ intermediate policies require a separately validated sampler or saved image.
 The complete tuple, not a truncated hash, identifies a candidate and outcome.
 
 **Strategies** rank *U* using only trace-derived features. They cannot observe
-outcomes, history, or recovery results. This constraint is enforced by Go
-import rules: `internal/strategy` must not import `internal/oracle`,
-`internal/exp`, `internal/recovery`, or `internal/replay`.
+outcomes, history, or recovery results. The `internal/strategy` package implements
+both topological/heuristic orderings (`B0`–`B6`), retention and equivalence-class
+baselines (`R1`, `R2`), reachability-hazard ranking (`RHG / B7`), and
+durability-contract guided ranking (`DCG / B8` and `DCG-FlagOnly`). This constraint
+is enforced by Go import rules: `internal/strategy` must not import
+`internal/oracle`, `internal/exp`, `internal/recovery`, or `internal/replay`.
 
 ### Phase 3: EXPLORE (expensive, cached)
 
@@ -173,14 +180,14 @@ CraConTest/
 │   ├── vfsrec/           # Recording vfs.FS wrapper
 │   ├── replay/           # Trace replay into CrashableMem
 │   ├── recovery/         # Panic-safe Open, timeout, checks
-│   ├── faults/           # Seeded-bug VFS decorators
-│   ├── graph/            # Persistence DAG and state view
+│   ├── faults/           # Seeded durability fault decorators (MUT-0 to MUT-9)
+│   ├── graph/            # Persistence DAG, state view, and durability-contract features
 │   ├── candidate/        # Candidate type and universe
-│   ├── strategy/         # Ranking strategies
+│   ├── strategy/         # Ranking strategies (B0–B6, R1, R2, RHG, DCG, DCG-FlagOnly)
 │   ├── workload/         # Seeded workload generators
 │   ├── history/          # Client-visible operation ledger
 │   ├── oracle/           # Consistency rules and outcomes
-│   └── exp/              # Run specs, journal, evaluator
+│   └── exp/              # Run specs, journal, evaluator, and multi-seed benchmark runner
 ├── experiments/configs/  # Workload specifications (main.json, smoke.json)
 ├── results/              # Stored run directories, discovery CSVs and plots
 ├── docs/                 # This document and others
@@ -249,6 +256,7 @@ history    trace          strategies ──► rankings           outcome table
 | `cracontest plan` | PLAN | Build graph, enumerate candidates, rank |
 | `cracontest explore` | EXPLORE | Execute candidates, fill outcome table |
 | `cracontest evaluate` | EVALUATE | Join rankings with outcomes, compute metrics; optionally write the discovery CSV and plot |
+| `cracontest benchmark` | ALL | Run multi-seed evaluation across fault models (MUT-0..MUT-9) and write summary CSV and report |
 
 ## Stored Artifacts
 
@@ -257,7 +265,8 @@ history    trace          strategies ──► rankings           outcome table
 | Workload specifications | `experiments/configs/` | Yes |
 | Run directory: `run.json`, `trace.json`, `history.json`, `universe.json`, `ranking_*.json`, `journal.ndjson`, `outcomes.json`, `curves.csv` | `results/<run-id>/` | Yes, for the runs the report uses |
 | Discovery CSVs and plots | `results/discovery_*.csv`, `results/plot_*.svg` | Yes |
-| Technical report | `docs/report.md` (copy in `paper/report.md`) | Yes |
+| Technical report | `docs/report.md` | Yes |
+| Multi-seed benchmark summary and report | `results/benchmark_summary.csv`, `docs/benchmark-report.md` | Yes |
 
 Trace, history, universe, ranking and outcome documents use schema_version=1
 and ordered non-null arrays. Outcomes persist the complete candidate tuple.

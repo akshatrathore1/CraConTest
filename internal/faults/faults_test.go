@@ -988,7 +988,7 @@ func TestFaultConcurrencySafety(t *testing.T) {
 	}
 }
 
-func TestFaultAcceptanceWithRecorderPhase2(t *testing.T) {
+func TestFaultAcceptanceWithRecorderExtended(t *testing.T) {
 	// Baseline undecorated recorder
 	memBase := vfs.NewCrashableMem()
 	recBase := vfsrec.New(memBase)

@@ -25,6 +25,24 @@ type Point struct {
 	DistinctBugs int `json:"distinct_bugs"`
 }
 
+// Summary captures the discovery evaluation summary for a candidate ranking permutation.
+type Summary struct {
+	TotalTested    int `json:"total_tested"`
+	FirstFailure   int `json:"first_failure"`   // 1-based index of first non-valid state (0 if none)
+	FirstViolation int `json:"first_violation"` // 1-based index of first consistency violation (0 if none)
+	Failures       int `json:"failures"`
+	Violations     int `json:"violations"`
+	OpenErrors     int `json:"open_errors"`
+	Panics         int `json:"panics"`
+	Hangs          int `json:"hangs"`
+	DistinctBugs   int `json:"distinct_bugs"`
+}
+
+func (s Summary) String() string {
+	return fmt.Sprintf("Tested: %d, FirstFailure: %d, FirstViolation: %d, Failures: %d (Violations: %d, OpenErrors: %d, Panics: %d, Hangs: %d), DistinctBugs: %d",
+		s.TotalTested, s.FirstFailure, s.FirstViolation, s.Failures, s.Violations, s.OpenErrors, s.Panics, s.Hangs, s.DistinctBugs)
+}
+
 // OutcomeDocument is the strict version-one serialization format for outcome tables.
 type OutcomeDocument struct {
 	SchemaVersion int              `json:"schema_version"`
@@ -82,7 +100,13 @@ func ValidateTable(universe []candidate.Candidate, outcomes []oracle.Outcome) er
 				return fmt.Errorf("exp: violation outcome signature %q missing v1: prefix", o.Signature)
 			}
 
-		case oracle.ClassOpenError, oracle.ClassPanic, oracle.ClassHang:
+		case oracle.ClassOpenError:
+			// If a signature is provided for an open_error, it must have a valid prefix (v1: or v1:open_error:).
+			if o.Signature != "" && !strings.HasPrefix(o.Signature, "v1:") {
+				return fmt.Errorf("exp: open_error outcome for candidate %+v signature %q missing v1: prefix", o.Candidate, o.Signature)
+			}
+
+		case oracle.ClassPanic, oracle.ClassHang:
 			// Non-violation recovery failures.
 
 		case oracle.ClassOracleError:
@@ -101,7 +125,7 @@ func ValidateTable(universe []candidate.Candidate, outcomes []oracle.Outcome) er
 // - Budgets must be unique, nonnegative, <= len(universe), and strictly increasing.
 // - ranking must be a valid permutation of universe without duplicates or foreign candidates.
 // - Failures counts violations, open_errors, panics, and hangs.
-// - DistinctBugs counts unique nonempty signatures of violation outcomes only.
+// - DistinctBugs counts unique nonempty signatures of violation and open_error outcomes.
 func Evaluate(universe, ranking []candidate.Candidate, outcomes []oracle.Outcome, budgets []int) ([]Point, error) {
 	if err := ValidateTable(universe, outcomes); err != nil {
 		return nil, fmt.Errorf("evaluate: %w", err)
@@ -159,7 +183,12 @@ func Evaluate(universe, ranking []candidate.Candidate, outcomes []oracle.Outcome
 				if o.Signature != "" && !seenBugs[o.Signature] {
 					seenBugs[o.Signature] = true
 				}
-			case oracle.ClassOpenError, oracle.ClassPanic, oracle.ClassHang:
+			case oracle.ClassOpenError:
+				failures++
+				if o.Signature != "" && !seenBugs[o.Signature] {
+					seenBugs[o.Signature] = true
+				}
+			case oracle.ClassPanic, oracle.ClassHang:
 				failures++
 			case oracle.ClassValid:
 				// no failure
@@ -175,6 +204,185 @@ func Evaluate(universe, ranking []candidate.Candidate, outcomes []oracle.Outcome
 	}
 
 	return points, nil
+}
+
+// NormalizeOpenErrorReason maps an error message or detail string to a stable normalized reason tag.
+func NormalizeOpenErrorReason(detail string) string {
+	s := strings.TrimSpace(detail)
+	if strings.HasPrefix(s, "v1:open_error:") {
+		s = strings.TrimPrefix(s, "v1:open_error:")
+	}
+	lower := strings.ToLower(s)
+	switch {
+	case strings.Contains(lower, "not exist") || strings.Contains(lower, "no such file"):
+		return "not_exist"
+	case strings.Contains(lower, "checksum"):
+		return "checksum_mismatch"
+	case strings.Contains(lower, "manifest"):
+		return "manifest_corrupt"
+	case strings.Contains(lower, "eof"):
+		return "unexpected_eof"
+	case strings.Contains(lower, "nil db"):
+		return "nil_db"
+	case strings.Contains(lower, "table") || strings.Contains(lower, "sst"):
+		return "table_corrupt"
+	case strings.Contains(lower, "timeout") || strings.Contains(lower, "timed out"):
+		return "timeout"
+	case strings.Contains(lower, "corrupt"):
+		return "corrupt"
+	default:
+		// Clean any arbitrary string to lower snake_case alphanumeric.
+		var b strings.Builder
+		lastUnderscore := false
+		for _, r := range lower {
+			if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+				b.WriteRune(r)
+				lastUnderscore = false
+			} else if !lastUnderscore && b.Len() > 0 {
+				b.WriteByte('_')
+				lastUnderscore = true
+			}
+		}
+		res := strings.Trim(b.String(), "_")
+		if res == "" {
+			return "unknown"
+		}
+		if len(res) > 32 {
+			res = res[:32]
+		}
+		return res
+	}
+}
+
+// FormatOpenErrorSignature constructs a deterministic, normalized signature v1:open_error:<reason>.
+func FormatOpenErrorSignature(reason string) string {
+	if strings.HasPrefix(reason, "v1:open_error:") {
+		return reason
+	}
+	norm := NormalizeOpenErrorReason(reason)
+	return fmt.Sprintf("v1:open_error:%s", norm)
+}
+
+// NormalizeOutcome ensures that an outcome with ClassOpenError has a deterministic,
+// normalized signature v1:open_error:<reason>.
+func NormalizeOutcome(o oracle.Outcome) oracle.Outcome {
+	if o.Class == oracle.ClassOpenError {
+		if o.Signature == "" {
+			reason := o.Detail
+			if reason == "" {
+				reason = "unknown"
+			}
+			o.Signature = FormatOpenErrorSignature(reason)
+		} else if !strings.HasPrefix(o.Signature, "v1:") {
+			o.Signature = FormatOpenErrorSignature(o.Signature)
+		}
+	}
+	return o
+}
+
+// NormalizeTable returns a copy of outcomes with all ClassOpenError outcomes normalized.
+func NormalizeTable(outcomes []oracle.Outcome) []oracle.Outcome {
+	res := make([]oracle.Outcome, len(outcomes))
+	for i, o := range outcomes {
+		res[i] = NormalizeOutcome(o)
+	}
+	return res
+}
+
+// TabulateSummary evaluates a ranking against outcomes and computes the summary metrics,
+// including FirstFailure (1-based index of first non-valid candidate) and
+// FirstViolation (1-based index of first ClassViolation candidate).
+func TabulateSummary(universe, ranking []candidate.Candidate, outcomes []oracle.Outcome) (Summary, error) {
+	if err := ValidateTable(universe, outcomes); err != nil {
+		return Summary{}, fmt.Errorf("tabulate summary: %w", err)
+	}
+
+	if len(ranking) != len(universe) {
+		return Summary{}, fmt.Errorf("tabulate summary: ranking length %d != universe length %d", len(ranking), len(universe))
+	}
+
+	universeSet := make(map[candidate.Candidate]bool, len(universe))
+	for _, c := range universe {
+		universeSet[c] = true
+	}
+	rankingSeen := make(map[candidate.Candidate]bool, len(ranking))
+	for _, c := range ranking {
+		if !universeSet[c] {
+			return Summary{}, fmt.Errorf("tabulate summary: ranking contains foreign candidate %+v", c)
+		}
+		if rankingSeen[c] {
+			return Summary{}, fmt.Errorf("tabulate summary: ranking contains duplicate candidate %+v", c)
+		}
+		rankingSeen[c] = true
+	}
+
+	outcomeMap := make(map[candidate.Candidate]oracle.Outcome, len(outcomes))
+	for _, o := range outcomes {
+		outcomeMap[o.Candidate] = o
+	}
+
+	var s Summary
+	s.TotalTested = len(ranking)
+	seenBugs := make(map[string]bool)
+
+	for i, c := range ranking {
+		pos := i + 1
+		o := outcomeMap[c]
+
+		switch o.Class {
+		case oracle.ClassValid:
+			// no failure
+
+		case oracle.ClassViolation:
+			if s.FirstFailure == 0 {
+				s.FirstFailure = pos
+			}
+			if s.FirstViolation == 0 {
+				s.FirstViolation = pos
+			}
+			s.Failures++
+			s.Violations++
+			if o.Signature != "" && !seenBugs[o.Signature] {
+				seenBugs[o.Signature] = true
+			}
+
+		case oracle.ClassOpenError:
+			if s.FirstFailure == 0 {
+				s.FirstFailure = pos
+			}
+			s.Failures++
+			s.OpenErrors++
+			sig := o.Signature
+			if sig == "" && o.Detail != "" {
+				sig = FormatOpenErrorSignature(o.Detail)
+			}
+			if sig != "" && !seenBugs[sig] {
+				seenBugs[sig] = true
+			}
+
+		case oracle.ClassPanic:
+			if s.FirstFailure == 0 {
+				s.FirstFailure = pos
+			}
+			s.Failures++
+			s.Panics++
+
+		case oracle.ClassHang:
+			if s.FirstFailure == 0 {
+				s.FirstFailure = pos
+			}
+			s.Failures++
+			s.Hangs++
+		}
+	}
+
+	s.DistinctBugs = len(seenBugs)
+	return s, nil
+}
+
+// Tabulate is an alias for TabulateSummary.
+func Tabulate(universe, ranking []candidate.Candidate, outcomes []oracle.Outcome) (Summary, error) {
+	return TabulateSummary(universe, ranking, outcomes)
 }
 
 // EncodeOutcomes serializes outcomes as a strict version-one JSON outcome document.
@@ -247,7 +455,11 @@ func DecodeOutcomes(reader io.Reader) ([]oracle.Outcome, error) {
 			if !strings.HasPrefix(o.Signature, "v1:") {
 				return nil, fmt.Errorf("decode outcomes: violation signature missing v1: prefix: %s", o.Signature)
 			}
-		case oracle.ClassOpenError, oracle.ClassPanic, oracle.ClassHang:
+		case oracle.ClassOpenError:
+			if o.Signature != "" && !strings.HasPrefix(o.Signature, "v1:") {
+				return nil, fmt.Errorf("decode outcomes: open_error signature missing v1: prefix: %s", o.Signature)
+			}
+		case oracle.ClassPanic, oracle.ClassHang:
 		case oracle.ClassOracleError:
 			return nil, fmt.Errorf("decode outcomes: oracle_error encountered: %s", o.Detail)
 		default:

@@ -23,14 +23,15 @@ detector on Linux or WSL2.
 go build -o cracontest ./cmd/cracontest
 ```
 
-The CLI has four subcommands. Flags use a single dash:
+The CLI has five subcommands. Flags use a single dash:
 
 | Command | Flags |
 |---|---|
-| `record` | `-spec <config.json> -out <run-dir> -fault <MUT-0 … MUT-4>` |
+| `record` | `-spec <config.json> -out <run-dir> -fault <MUT-0 … MUT-9>` |
 | `plan` | `-run <run-dir> [-seed <ranking seed>]` |
 | `explore` | `-run <run-dir> [-timeout <duration>]` |
 | `evaluate` | `-run <run-dir> [-budgets 0,1,5,...] [-discovery <csv> -plot <svg>]` |
+| `benchmark` | `[-seeds 42,100,...] [-faults MUT-1,...] [-ops 120] [-report <md>] [-csv <csv>]` |
 
 ---
 
@@ -92,7 +93,34 @@ done
 | `smoke_mut0` | 316 | 302 | 302 valid | 0 | ≈0.6 s |
 | `smoke_mut1` | 305 | 280 | 192 valid, 88 violations | 6 | ≈0.5 s |
 
-## 4. Acceptance Tests
+## 4. Multi-Seed Benchmark (32 Seeds, MUT-0 to MUT-9)
+
+To evaluate ranking strategies across both dense and sparse failure distributions with statistical confidence intervals, the multi-seed benchmark evaluates 32 deterministic workload seeds across all 10 fault models:
+
+```bash
+./cracontest benchmark -report docs/benchmark-report.md -csv results/benchmark_summary.csv
+```
+
+The multi-seed benchmark runs 32 deterministic workload seeds (`42, 100..900, 1001..1022`; 120 operations, `SyncEvery = 8`, `FlushEvery = 40`) across `MUT-0` through `MUT-9` with automatic background compactions and table stats disabled (`DisableAutomaticCompactions: true`, `DisableTableStats: true`, and deterministic mid-workload compaction `CompactAt = 80` for `MUT-8`) so traces and candidate counts are 100% repeatable across runs and platforms.
+
+### Benchmark Results Summary (32 Seeds)
+
+#### Cost-to-First-Failure ($k_1$ Mean) & Distinct Failing States ($S_{25}$ / $S_{100}$ Mean)
+
+| Fault Model | Fault Description | Failure Density | DCG $k_1$ | R2 $k_1$ | B0 $k_1$ | DCG $S_{25}$ / $S_{100}$ | R2 $S_{25}$ / $S_{100}$ | B0 $S_{25}$ / $S_{100}$ |
+|---|---|---|---|---|---|---|---|---|
+| **MUT-0** | Null Control (No Fault) | 0.0% | 0.00 | 0.00 | 0.00 | 0.00 / 0.00 | 0.00 / 0.00 | 0.00 / 0.00 |
+| **MUT-1** | All WAL Syncs Dropped | 36.4% | **1.00** | 1.44 | 2.00 | **23.97** / **24.00** | 17.13 / **24.00** | 6.12 / 14.61 |
+| **MUT-2** | MANIFEST Syncs Dropped | 47.3% | **1.00** | 1.17 | 1.58 | **25.00** / **33.03** | 21.15 / **33.03** | 5.64 / 13.75 |
+| **MUT-3** | Directory Syncs Dropped | 42.5% | **1.00** | 1.44 | 2.00 | 24.00 / **27.00** | 17.26 / **27.00** | 5.00 / 11.22 |
+| **MUT-4** | SST Flush Syncs Dropped | 29.8% | **1.00** | 1.95 | 2.39 | **21.69** / **21.69** | 12.57 / **21.69** | 3.53 / 8.59 |
+| **MUT-5** | Sparse $k$-th WAL Sync Dropped ($k=1$) | 2.7% | **1.00** | 13.01 | 25.97 | **2.00** / **2.00** | 1.30 / **2.00** | 0.48 / 1.00 |
+| **MUT-6** | Second Manifest Sync Dropped | 0.8% | **1.00** | 7.72 | 31.12 | **1.62** / **1.62** | 1.07 / **1.62** | 0.00 / 0.81 |
+| **MUT-7** | Options Dir Sync (No-op Control) | 0.0% | 0.00 | 0.00 | 0.00 | 0.00 / 0.00 | 0.00 / 0.00 | 0.00 / 0.00 |
+| **MUT-8** | Compaction SST Sync Drop | 15.2% | **1.00** | 3.58 | 4.41 | **12.88** / **12.88** | 6.74 / 12.82 | 2.00 / 5.08 |
+| **MUT-9** | Single $k$-th Directory Sync Drop | 41.4% | **1.00** | 1.40 | 1.95 | **25.00** / **27.00** | 17.78 / **27.00** | 3.03 / 9.83 |
+
+## 5. Acceptance Tests
 
 | Check | Command | Measured result | Runtime |
 |---|---|---|---|
@@ -105,7 +133,7 @@ done
 G1, G2 and G3 record a fresh trace, so their counts vary by a few events between runs
 (see Determinism above).
 
-## 5. Full Suite
+## 6. Full Suite
 
 ```bash
 go vet ./...

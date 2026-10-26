@@ -64,6 +64,8 @@ func main() {
 		err = runExploreCmd(args)
 	case "evaluate":
 		err = runEvaluate(args)
+	case "benchmark":
+		err = runBenchmarkCmd(args)
 	case "help", "-h", "--help":
 		printUsage()
 		return
@@ -87,6 +89,7 @@ Commands:
   plan      Build candidate universe and compute strategy rankings
   explore   Execute crash states and produce outcome table with journal
   evaluate  Evaluate discovery curves and generate CSV summary
+  benchmark Execute multi-seed empirical benchmark across fault models and strategies
 `)
 }
 
@@ -134,12 +137,17 @@ func runRecord(args []string) error {
 		return fmt.Errorf("init fault %q: %w", *faultID, err)
 	}
 
+	if *faultID == faults.MUT8 {
+		cfg.CompactAt = 80
+	}
+
 	listener := rec.EventListener()
 	opts := &pebble.Options{
-		FS:            faultFS,
-		Logger:        recovery.PanicLogger{},
-		MemTableSize:  64 * 1024,
-		EventListener: &listener,
+		FS:                          faultFS,
+		Logger:                      recovery.PanicLogger{},
+		MemTableSize:                64 * 1024,
+		EventListener:               &listener,
+		DisableAutomaticCompactions: true,
 	}
 
 	db, err := pebble.Open("db", opts)
@@ -275,9 +283,17 @@ func runPlan(args []string) error {
 		code  string
 	}{
 		{strategy.NewRandom(*rankingSeed), *rankingSeed, "b0"},
+		{strategy.NewFIFO(), 0, "b1"},
+		{strategy.NewLIFO(), 0, "b2"},
+		{strategy.NewStride(), 0, "b3"},
 		{combinedStrat, 0, "b4"},
 		{strategy.NewRepresentative(), 0, "b5"},
 		{strategy.NewSyncBoundary(), 0, "b6"},
+		{strategy.NewRiskHorizon(strategy.DefaultRHGWeights), 0, "b7"},
+		{strategy.NewR1(*rankingSeed), *rankingSeed, "r1"},
+		{strategy.NewR2(*rankingSeed), *rankingSeed, "r2"},
+		{exp.NewDCGStrategy(), 0, "dcg"},
+		{strategy.NewDCGFlagOnly(*rankingSeed), *rankingSeed, "dcg-flag-only"},
 	}
 
 	for _, s := range strategies {
@@ -305,8 +321,8 @@ func runPlan(args []string) error {
 		_ = rFile.Close()
 	}
 
-	fmt.Printf("Planned %d universe candidates with 4 strategies (b0, b4, b5, b6) -> %s\n",
-		len(universe), *runDir)
+	fmt.Printf("Planned %d universe candidates with %d strategies -> %s\n",
+		len(universe), len(strategies), *runDir)
 	return nil
 }
 
@@ -385,6 +401,9 @@ func runEvaluate(args []string) error {
 	}
 	if *runDir == "" {
 		return errors.New("evaluate: must specify -run directory")
+	}
+	if (*discoveryOut == "") != (*plotOut == "") {
+		return errors.New("evaluate: -discovery and -plot must be given together")
 	}
 
 	// Load universe.
@@ -492,9 +511,6 @@ func runEvaluate(args []string) error {
 		return err
 	}
 
-	if (*discoveryOut == "") != (*plotOut == "") {
-		return errors.New("evaluate: -discovery and -plot must be given together")
-	}
 	if *discoveryOut != "" {
 		if _, err := exp.GenerateG4Artifacts(*runDir, *discoveryOut, *plotOut); err != nil {
 			return fmt.Errorf("generate discovery artifacts: %w", err)
@@ -596,5 +612,93 @@ func writePositions(runDir string, universe []candidate.Candidate, outcomes []or
 		return err
 	}
 	fmt.Printf("Saved discovery positions to %s\n", path)
+	return nil
+}
+
+// ----------------------------------------------------------------------
+// benchmark
+// ----------------------------------------------------------------------
+
+func runBenchmarkCmd(args []string) error {
+	fs := flag.NewFlagSet("benchmark", flag.ExitOnError)
+	seedsFlag := fs.String("seeds", "", "comma-separated workload seeds")
+	faultsFlag := fs.String("faults", "", "comma-separated fault IDs")
+	opsFlag := fs.Int("ops", 120, "operations per workload run")
+	reportFlag := fs.String("report", "", "path to output empirical markdown report")
+	csvFlag := fs.String("csv", "", "optional path to output summary CSV")
+	controlFlag := fs.Bool("control", true, "run MUT-0 null control check")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	cfg := exp.DefaultMultiSeedBenchmarkConfig()
+
+	cfg.Workload.Operations = *opsFlag
+	cfg.TrackMUT0 = *controlFlag
+
+	if *seedsFlag != "" {
+		var seeds []uint64
+		for _, part := range strings.Split(*seedsFlag, ",") {
+			s, err := strconv.ParseUint(strings.TrimSpace(part), 10, 64)
+			if err != nil {
+				return fmt.Errorf("invalid seed %q: %w", part, err)
+			}
+			seeds = append(seeds, s)
+		}
+		cfg.WorkloadSeeds = seeds
+	}
+
+	if *faultsFlag != "" {
+		var fids []string
+		for _, part := range strings.Split(*faultsFlag, ",") {
+			fid := strings.TrimSpace(part)
+			if fid != "" {
+				fids = append(fids, fid)
+			}
+		}
+		cfg.FaultIDs = fids
+	}
+
+	targetReport := *reportFlag
+	if targetReport == "" {
+		targetReport = "docs/benchmark-report.md"
+	}
+
+	targetCSV := *csvFlag
+	if targetCSV == "" {
+		targetCSV = "results/benchmark_summary.csv"
+	}
+
+	fmt.Printf("Starting Multi-Seed Benchmark across %d seeds and %d faults (%d ops/run)...\n",
+		len(cfg.WorkloadSeeds), len(cfg.FaultIDs), cfg.Workload.Operations)
+
+	res, err := exp.RunBenchmark(cfg, func(msg string) {
+		fmt.Println(msg)
+	})
+	if err != nil {
+		return fmt.Errorf("run benchmark: %w", err)
+	}
+
+	if targetReport != "" {
+		if err := os.MkdirAll(filepath.Dir(targetReport), 0755); err != nil {
+			return fmt.Errorf("mkdir for report: %w", err)
+		}
+		if err := exp.WriteMultiSeedReportToFile(res, targetReport); err != nil {
+			return fmt.Errorf("write report: %w", err)
+		}
+		fmt.Printf("Generated empirical report -> %s\n", targetReport)
+	}
+
+	if targetCSV != "" {
+		if err := os.MkdirAll(filepath.Dir(targetCSV), 0755); err != nil {
+			return fmt.Errorf("mkdir for csv: %w", err)
+		}
+		if err := exp.WriteMultiSeedCSV(res, targetCSV); err != nil {
+			return fmt.Errorf("write csv: %w", err)
+		}
+		fmt.Printf("Generated summary CSV -> %s\n", targetCSV)
+	}
+
+	fmt.Printf("Benchmark completed successfully in %v.\n", res.TotalDuration)
 	return nil
 }

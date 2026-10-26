@@ -308,6 +308,14 @@ entries are pending (created but not directory-synced), and how many persistence
 events are downstream from *k*. This view is the primary input to ranking
 strategies.
 
+### Durability-Contract Feature Extraction
+
+In addition to topological reachability and state-equivalence partitioning, CraConTest computes explicit POSIX durability-contract indicators via `ComputeContractFeatures` (`internal/graph/features.go`). Operating in a single causal forward pass over the recorded `trace.Event` stream without inspecting recovery outcomes, this analysis maintains:
+- **Dirty Byte Spans (`dirtySpans` and `dirtyBytes`):** Tracked per file and per open handle across `trace.KindWrite` and `trace.KindWriteAt` events, reset upon successful `File.SyncData()` or `File.Sync()`.
+- **Parent Directory Synchronization (`dirEntrySynced` and `unsyncedDirs`):** Recorded across `Create`, `ReuseForWrite`, `Rename`, `Link`, and `MkdirAll` operations, and cleared only when a matching parent directory path is explicitly synced via `File.Sync()` on an open directory handle (`OpenDir`).
+- **Manifest Version Staging and Commitment (`stagedInManifest` and `committedInManifest`):** SSTable creations mark tables as staged; subsequent manifest writes and syncs transition them to committed, asserting dangling table indicators (`DanglingTableCount`) if unpersisted tables are referenced by a durable manifest.
+- **Client Write Acknowledgment (`ackOps` and `ackSyncOps`):** Correlating client transaction markers (`trace.KindOpBegin`, `trace.KindOpEnd`) with WAL sync barriers, detecting unpersisted WAL bytes for acknowledged client mutations (`AckSyncMissing`).
+
 ## Revision History
 
 | Date | Section | Correction |

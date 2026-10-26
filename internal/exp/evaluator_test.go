@@ -287,3 +287,220 @@ func TestRankingDocumentRoundTrip(t *testing.T) {
 		t.Error("expected error on trailing data, got nil")
 	}
 }
+
+func TestOpenErrorSignatureNormalization(t *testing.T) {
+	testCases := []struct {
+		detail   string
+		expected string
+	}{
+		{"corrupt MANIFEST", "v1:open_error:manifest_corrupt"},
+		{"MANIFEST-000001 corrupt", "v1:open_error:manifest_corrupt"},
+		{"pebble: file does not exist", "v1:open_error:not_exist"},
+		{"no such file or directory: db/CURRENT", "v1:open_error:not_exist"},
+		{"checksum mismatch on 000002.sst", "v1:open_error:checksum_mismatch"},
+		{"unexpected EOF reading version edit", "v1:open_error:unexpected_eof"},
+		{"SafeOpen returned nil DB", "v1:open_error:nil_db"},
+		{"corrupt sstable footer in 000004.sst", "v1:open_error:table_corrupt"},
+		{"operation timed out", "v1:open_error:timeout"},
+		{"corrupt record data", "v1:open_error:corrupt"},
+		{"v1:open_error:custom_manifest", "v1:open_error:custom_manifest"},
+		{"arbitrary unknown failure", "v1:open_error:arbitrary_unknown_failure"},
+	}
+
+	for _, tc := range testCases {
+		got := exp.FormatOpenErrorSignature(tc.detail)
+		if got != tc.expected {
+			t.Errorf("FormatOpenErrorSignature(%q): got %q, want %q", tc.detail, got, tc.expected)
+		}
+	}
+
+	// Test NormalizeOutcome
+	u := makeTestUniverse(1)[0]
+	o := oracle.Outcome{
+		Candidate: u,
+		Class:     oracle.ClassOpenError,
+		Detail:    "corrupt MANIFEST-000005",
+	}
+	norm := exp.NormalizeOutcome(o)
+	if norm.Signature != "v1:open_error:manifest_corrupt" {
+		t.Errorf("NormalizeOutcome signature: got %q, want v1:open_error:manifest_corrupt", norm.Signature)
+	}
+
+	// Test NormalizeTable
+	table := []oracle.Outcome{o, {Candidate: u, Class: oracle.ClassValid}}
+	normTable := exp.NormalizeTable(table)
+	if len(normTable) != 2 || normTable[0].Signature != "v1:open_error:manifest_corrupt" || normTable[1].Signature != "" {
+		t.Errorf("NormalizeTable unexpected result: %+v", normTable)
+	}
+}
+
+func TestTabulateSummary(t *testing.T) {
+	universe := makeTestUniverse(6)
+	c0, c1, c2, c3, c4, c5 := universe[0], universe[1], universe[2], universe[3], universe[4], universe[5]
+
+	sigA := "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	sigB := "v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+	outcomes := []oracle.Outcome{
+		{Candidate: c0, Class: oracle.ClassValid},
+		{Candidate: c1, Class: oracle.ClassOpenError, Detail: "corrupt MANIFEST"},
+		{Candidate: c2, Class: oracle.ClassValid},
+		{Candidate: c3, Class: oracle.ClassViolation, Rule: "durably_committed", Signature: sigA},
+		{Candidate: c4, Class: oracle.ClassViolation, Rule: "prefix", Signature: sigB},
+		{Candidate: c5, Class: oracle.ClassValid},
+	}
+
+	// Ranking 1: [c0, c1, c2, c3, c4, c5]
+	// c0: Valid (pos 1)
+	// c1: OpenError (pos 2) -> FirstFailure = 2
+	// c3: Violation (pos 4) -> FirstViolation = 4
+	ranking1 := []candidate.Candidate{c0, c1, c2, c3, c4, c5}
+	s1, err := exp.TabulateSummary(universe, ranking1, outcomes)
+	if err != nil {
+		t.Fatalf("TabulateSummary ranking1: %v", err)
+	}
+
+	if s1.TotalTested != 6 {
+		t.Errorf("TotalTested: got %d, want 6", s1.TotalTested)
+	}
+	if s1.FirstFailure != 2 {
+		t.Errorf("FirstFailure: got %d, want 2", s1.FirstFailure)
+	}
+	if s1.FirstViolation != 4 {
+		t.Errorf("FirstViolation: got %d, want 4", s1.FirstViolation)
+	}
+	if s1.Failures != 3 {
+		t.Errorf("Failures: got %d, want 3", s1.Failures)
+	}
+	if s1.OpenErrors != 1 {
+		t.Errorf("OpenErrors: got %d, want 1", s1.OpenErrors)
+	}
+	if s1.Violations != 2 {
+		t.Errorf("Violations: got %d, want 2", s1.Violations)
+	}
+	if s1.DistinctBugs != 3 {
+		t.Errorf("DistinctBugs: got %d, want 3", s1.DistinctBugs)
+	}
+
+	// Verify Tabulate alias produces identical output
+	s1Alias, err := exp.Tabulate(universe, ranking1, outcomes)
+	if err != nil {
+		t.Fatalf("Tabulate alias: %v", err)
+	}
+	if s1Alias != s1 {
+		t.Errorf("Tabulate alias mismatch: %+v vs %+v", s1Alias, s1)
+	}
+
+	// Ranking 2: Violation first at pos 1: [c3, c1, c0, c2, c4, c5]
+	ranking2 := []candidate.Candidate{c3, c1, c0, c2, c4, c5}
+	s2, err := exp.TabulateSummary(universe, ranking2, outcomes)
+	if err != nil {
+		t.Fatalf("TabulateSummary ranking2: %v", err)
+	}
+	if s2.FirstFailure != 1 {
+		t.Errorf("ranking2 FirstFailure: got %d, want 1", s2.FirstFailure)
+	}
+	if s2.FirstViolation != 1 {
+		t.Errorf("ranking2 FirstViolation: got %d, want 1", s2.FirstViolation)
+	}
+
+	// All-valid case
+	validUniverse := []candidate.Candidate{c0, c2, c5}
+	validOutcomes := []oracle.Outcome{
+		{Candidate: c0, Class: oracle.ClassValid},
+		{Candidate: c2, Class: oracle.ClassValid},
+		{Candidate: c5, Class: oracle.ClassValid},
+	}
+	sValid, err := exp.TabulateSummary(validUniverse, validUniverse, validOutcomes)
+	if err != nil {
+		t.Fatalf("TabulateSummary valid: %v", err)
+	}
+	if sValid.FirstFailure != 0 {
+		t.Errorf("valid FirstFailure: got %d, want 0", sValid.FirstFailure)
+	}
+	if sValid.FirstViolation != 0 {
+		t.Errorf("valid FirstViolation: got %d, want 0", sValid.FirstViolation)
+	}
+	if sValid.Failures != 0 {
+		t.Errorf("valid Failures: got %d, want 0", sValid.Failures)
+	}
+
+	// Error cases: length mismatch and duplicate candidate
+	if _, err := exp.TabulateSummary(universe, ranking1[:5], outcomes); err == nil {
+		t.Error("expected error on ranking length mismatch, got nil")
+	}
+	badRanking := []candidate.Candidate{c0, c0, c2, c3, c4, c5}
+	if _, err := exp.TabulateSummary(universe, badRanking, outcomes); err == nil {
+		t.Error("expected error on duplicate candidate in ranking, got nil")
+	}
+}
+
+func TestValidateTableOpenErrorSignatures(t *testing.T) {
+	universe := makeTestUniverse(2)
+	c0, c1 := universe[0], universe[1]
+
+	// 1. Valid open_error with normalized v1: signature
+	validTable := []oracle.Outcome{
+		{Candidate: c0, Class: oracle.ClassValid},
+		{Candidate: c1, Class: oracle.ClassOpenError, Signature: "v1:open_error:manifest_corrupt", Detail: "corrupt"},
+	}
+	if err := exp.ValidateTable(universe, validTable); err != nil {
+		t.Errorf("ValidateTable failed on valid open_error signature: %v", err)
+	}
+
+	// 2. Invalid open_error signature missing v1: prefix
+	invalidTable := []oracle.Outcome{
+		{Candidate: c0, Class: oracle.ClassValid},
+		{Candidate: c1, Class: oracle.ClassOpenError, Signature: "bad_signature_prefix", Detail: "corrupt"},
+	}
+	if err := exp.ValidateTable(universe, invalidTable); err == nil {
+		t.Error("expected error on open_error signature without v1: prefix, got nil")
+	}
+
+	// 3. Valid open_error with empty signature (backwards compatibility)
+	emptySigTable := []oracle.Outcome{
+		{Candidate: c0, Class: oracle.ClassValid},
+		{Candidate: c1, Class: oracle.ClassOpenError, Detail: "corrupt"},
+	}
+	if err := exp.ValidateTable(universe, emptySigTable); err != nil {
+		t.Errorf("ValidateTable failed on empty open_error signature: %v", err)
+	}
+}
+
+func TestEvaluateWithNormalizedOpenErrors(t *testing.T) {
+	universe := makeTestUniverse(4)
+	c0, c1, c2, c3 := universe[0], universe[1], universe[2], universe[3]
+
+	sigA := "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	sigOpen1 := "v1:open_error:manifest_corrupt"
+	sigOpen2 := "v1:open_error:not_exist"
+
+	outcomes := []oracle.Outcome{
+		{Candidate: c0, Class: oracle.ClassOpenError, Signature: sigOpen1, Detail: "corrupt MANIFEST"},
+		{Candidate: c1, Class: oracle.ClassOpenError, Signature: sigOpen2, Detail: "file not found"},
+		{Candidate: c2, Class: oracle.ClassViolation, Rule: "durably_committed", Signature: sigA},
+		{Candidate: c3, Class: oracle.ClassValid},
+	}
+
+	budgets := []int{0, 1, 2, 3, 4}
+	ranking := []candidate.Candidate{c0, c1, c2, c3}
+
+	points, err := exp.Evaluate(universe, ranking, outcomes, budgets)
+	if err != nil {
+		t.Fatalf("Evaluate: %v", err)
+	}
+
+	expected := []exp.Point{
+		{Budget: 0, Tested: 0, Failures: 0, DistinctBugs: 0},
+		{Budget: 1, Tested: 1, Failures: 1, DistinctBugs: 1}, // c0 (open_error 1)
+		{Budget: 2, Tested: 2, Failures: 2, DistinctBugs: 2}, // c0, c1 (open_error 2)
+		{Budget: 3, Tested: 3, Failures: 3, DistinctBugs: 3}, // c0, c1, c2 (viol sigA)
+		{Budget: 4, Tested: 4, Failures: 3, DistinctBugs: 3}, // c0, c1, c2, c3 (valid)
+	}
+
+	for i := range points {
+		if points[i] != expected[i] {
+			t.Errorf("point %d: got %+v, want %+v", i, points[i], expected[i])
+		}
+	}
+}

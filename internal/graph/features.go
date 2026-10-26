@@ -287,6 +287,14 @@ type ContractFeatures struct {
 	// Composite indicators:
 	ContractViolationMask uint8   `json:"contract_violation_mask"` // bitmask: 1=WAL, 2=SST, 4=Rename
 	ContractScore         float64 `json:"contract_score"`          // weighted composite contract violation score
+
+	// Closed-WAL lifecycle indicators:
+	// HasClosedDirtyLog reports whether any WAL file was closed while holding
+	// unpersisted dirty bytes (i.e., closedWhileDirty == true) at this cutoff.
+	HasClosedDirtyLog bool `json:"has_closed_dirty_log"`
+	// DirtyLogBytes is the total byte volume of dirty spans still present on
+	// WAL files that were closed before their data was synced.
+	DirtyLogBytes uint64 `json:"dirty_log_bytes"`
 }
 
 type writeSpan struct {
@@ -345,10 +353,33 @@ func ComputeContractFeaturesWithWeights(events []trace.Event, weights DCGWeights
 	var currentOp uint64
 	var currentOpHadSync bool
 	var manifestDirtyUncommitted bool
+	var fileRetiredWhileManifestDirty bool
+	var walSyncedWhileManifestDirty bool
 	var pendingRenames []renameRecord
 	var activeFlush bool
 	var activeCompaction bool
 	unsyncedDirs := make(map[string]string) // dirPath -> parentDir
+
+	// healClosedWALsIfFlushDurable clears durability-violation markers on closed
+	// WAL files when a complete memtable-flush sequence has made their records
+	// durable: the L0 SST has no dirty bytes or dirty spans and its directory
+	// entry is synced, and the MANIFEST has no dirty bytes or dirty spans (its
+	// data is synced), guaranteeing that every record in any previously closed
+	// WAL is persisted in the new L0 SST and referenced by the updated MANIFEST.
+	healClosedWALsIfFlushDurable := func() {
+		for _, f := range files {
+			if (f.isSST || f.isManifest) && (f.dirtyBytes > 0 || len(f.dirtySpans) > 0 || !f.dirEntrySynced) {
+				return
+			}
+		}
+		for _, f := range files {
+			if f.isWAL && f.closedWhileDirty {
+				f.dirtySpans = nil
+				f.dirtyBytes = 0
+				f.closedWhileDirty = false
+			}
+		}
+	}
 
 	for _, event := range events {
 		switch event.Kind {
@@ -385,6 +416,15 @@ func ComputeContractFeaturesWithWeights(events []trace.Event, weights DCGWeights
 			isFlushSST := event.Cat == "pebble-memtable-flush" || event.Note == "FlushBegin"
 			isSST := isCompactionSST || isFlushSST || strings.HasSuffix(event.File2, ".sst") || strings.Contains(event.File2, ".sst") || event.Note == "TableCreated"
 			isManifest := event.Cat == "pebble-manifest" || strings.Contains(event.File2, "MANIFEST") || strings.Contains(event.File2, "CURRENT") || event.Note == "ManifestCreated"
+			// Record if a .log or .sst file is recycled while any MANIFEST file is dirty.
+			if strings.HasSuffix(event.File, ".log") || strings.HasSuffix(event.File, ".sst") {
+				for _, mf := range files {
+					if mf.isManifest && (mf.dirtyBytes > 0 || !mf.dirEntrySynced) {
+						fileRetiredWhileManifestDirty = true
+						break
+					}
+				}
+			}
 			delete(files, event.File)
 			fi := &trackFileInfo{
 				path:            event.File2,
@@ -547,6 +587,18 @@ func ComputeContractFeaturesWithWeights(events []trace.Event, weights DCGWeights
 							fi.committedInManifest = false
 						}
 					}
+					if isMan && activeFlush {
+						healClosedWALsIfFlushDurable()
+					}
+					// Record if a WAL file is synced while any MANIFEST file has dirty bytes.
+					if fi != nil && fi.isWAL {
+						for _, mf := range files {
+							if mf.isManifest && mf.dirtyBytes > 0 {
+								walSyncedWhileManifestDirty = true
+								break
+							}
+						}
+					}
 				}
 			}
 		case trace.KindEngineEvent:
@@ -559,6 +611,7 @@ func ComputeContractFeaturesWithWeights(events []trace.Event, weights DCGWeights
 						sst.committedInManifest = true
 					}
 				}
+				healClosedWALsIfFlushDurable()
 			} else if event.Note == "CompactionBegin" {
 				activeCompaction = true
 			} else if event.Note == "CompactionEnd" {
@@ -637,6 +690,15 @@ func ComputeContractFeaturesWithWeights(events []trace.Event, weights DCGWeights
 				})
 			}
 		case trace.KindRemove, trace.KindRemoveAll:
+			// Record if a .log or .sst file is deleted while any MANIFEST file is dirty.
+			if strings.HasSuffix(event.File, ".log") || strings.HasSuffix(event.File, ".sst") {
+				for _, mf := range files {
+					if mf.isManifest && (mf.dirtyBytes > 0 || !mf.dirEntrySynced) {
+						fileRetiredWhileManifestDirty = true
+						break
+					}
+				}
+			}
 			delete(files, event.File)
 		case trace.KindClose:
 			fi := handles[event.Handle]
@@ -687,17 +749,42 @@ func ComputeContractFeaturesWithWeights(events []trace.Event, weights DCGWeights
 			}
 		}
 
-		// Track unpersisted manifest past lifecycle boundaries
-		if (event.Kind == trace.KindOpBegin && !activeFlush && !activeCompaction) || (event.Kind == trace.KindEngineEvent && (event.Note == "FlushEnd" || event.Note == "CompactionEnd")) {
-			for _, f := range files {
-				if f.isManifest && (f.dirtyBytes > 0 || !f.dirEntrySynced) {
+		// Track unpersisted manifest across initialization and lifecycle boundaries.
+		hasClosedDirtyWAL := false
+		for _, f := range files {
+			if f.isWAL && f.closedWhileDirty {
+				hasClosedDirtyWAL = true
+				break
+			}
+		}
+		isManifestBoundary := (event.Kind == trace.KindOpBegin && !activeFlush && !activeCompaction) ||
+			(event.Kind == trace.KindEngineEvent && (event.Note == "FlushEnd" || event.Note == "CompactionEnd"))
+		for _, f := range files {
+			if !f.isManifest || (f.dirtyBytes == 0 && f.dirEntrySynced) {
+				continue
+			}
+			// Case 1: Initial MANIFEST has 0 synced bytes on disk (uint64(f.size) == f.dirtyBytes, e.g. MUT-2).
+			// Once its directory entry is synced (exposing a 0-byte MANIFEST to Open) or a lifecycle boundary is crossed, it is corrupt.
+			if f.dirtyBytes > 0 && uint64(f.size) == f.dirtyBytes && (f.dirEntrySynced || isManifestBoundary) {
+				manifestDirtyUncommitted = true
+				break
+			}
+			// Case 2: Unsynced MANIFEST directory entry across a lifecycle boundary, only when no
+			// synced data prefix exists on disk yet (uint64(f.size) <= f.dirtyBytes).
+			if !f.dirEntrySynced && isManifestBoundary && uint64(f.size) <= f.dirtyBytes {
+				manifestDirtyUncommitted = true
+				break
+			}
+			// Case 3: Subsequent MANIFEST append where a valid synced prefix already exists on disk (uint64(f.size) > f.dirtyBytes, e.g. MUT-6).
+			// Reverting MANIFEST to its synced prefix is safe until an old WAL/SST is retired (ReuseForWrite/Remove),
+			// or a closed dirty WAL is followed by a subsequent WAL sync advancing the durability frontier, or MANIFEST is closed dirty.
+			if f.dirtyBytes > 0 && uint64(f.size) > f.dirtyBytes {
+				if fileRetiredWhileManifestDirty || (hasClosedDirtyWAL && walSyncedWhileManifestDirty) || f.closedWhileDirty {
 					manifestDirtyUncommitted = true
 					break
 				}
 			}
-		}
-		for _, f := range files {
-			if f.isManifest && (f.dirtyBytes > 0 || !f.dirEntrySynced) && f.closedWhileDirty {
+			if f.closedWhileDirty {
 				manifestDirtyUncommitted = true
 				break
 			}
@@ -711,6 +798,8 @@ func ComputeContractFeaturesWithWeights(events []trace.Event, weights DCGWeights
 		}
 		if !hasDirtyManifest {
 			manifestDirtyUncommitted = false
+			fileRetiredWhileManifestDirty = false
+			walSyncedWhileManifestDirty = false
 		}
 
 		// Calculate contract snapshot at event.ID:
@@ -825,6 +914,16 @@ func ComputeContractFeaturesWithWeights(events []trace.Event, weights DCGWeights
 			score += weights.WALWeight*float64(unpersistedOps) + 3.0*math.Log1p(float64(danglingWAL))
 		}
 
+		// Compute closed-WAL lifecycle indicators.
+		var hasClosedDirtyLog bool
+		var dirtyLogBytes uint64
+		for _, f := range files {
+			if f.isWAL && f.closedWhileDirty {
+				hasClosedDirtyLog = true
+				dirtyLogBytes += f.dirtyBytes
+			}
+		}
+
 		cuts[event.ID] = ContractFeatures{
 			AckSyncMissing:          ackMissing,
 			UnpersistedAckOps:       unpersistedOps,
@@ -836,6 +935,8 @@ func ComputeContractFeaturesWithWeights(events []trace.Event, weights DCGWeights
 			CriticalPendingRenames:  critCount,
 			ContractViolationMask:   mask,
 			ContractScore:           score,
+			HasClosedDirtyLog:       hasClosedDirtyLog,
+			DirtyLogBytes:           dirtyLogBytes,
 		}
 	}
 

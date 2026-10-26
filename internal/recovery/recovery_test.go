@@ -15,7 +15,7 @@ import (
 // TestCrashCycle exercises the full Open→Write→Read→Crash→Recover→Verify
 // cycle using Pebble's in-memory CrashableMem filesystem.
 //
-// This is the foundational test for M2: it proves that we can:
+// TestRecoveryEndToEnd verifies that the recovery harness can:
 //  1. Open a Pebble database on an in-memory VFS
 //  2. Write data with explicit sync
 //  3. Read it back

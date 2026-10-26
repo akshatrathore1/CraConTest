@@ -509,6 +509,73 @@ func TestContractScore_PinpointsVulnerabilities_MUT1ThroughMUT8(t *testing.T) {
 	}
 }
 
+// TestContractFeatures_FlushHealsClosedDirtyWAL verifies that when a WAL file is
+// written during an acknowledged operation without a subsequent Sync and then
+// closed (KindClose), the contract features correctly report AckSyncMissing and
+// HasClosedDirtyLog at cutoffs prior to flush completion; and that once a
+// complete flush sequence—FlushBegin, SST Create/Write/SyncData/Close, parent
+// directory Sync, MANIFEST Write/Sync, and FlushEnd—completes without any
+// dropped syncs, subsequent cutoffs report AckSyncMissing == false,
+// DirtyLogBytes == 0, and HasClosedDirtyLog == false.
+func TestContractFeatures_FlushHealsClosedDirtyWAL(t *testing.T) {
+	// Phase 1: WAL written + acknowledged, no sync, then closed → closedWhileDirty.
+	events := []trace.Event{
+		// Pre-existing MANIFEST from DB initialization.
+		{ID: 1, Kind: trace.KindCreate, File: "db/MANIFEST-000001", Cat: "pebble-manifest", Handle: 40},
+		// WAL creation and acknowledged write (sync dropped / absent).
+		{ID: 2, Kind: trace.KindCreate, File: "db/000002.log", Cat: "pebble-wal", Handle: 10},
+		{ID: 3, Kind: trace.KindOpBegin, Op: 1, OpKind: "set"},
+		{ID: 4, Kind: trace.KindWrite, File: "db/000002.log", Cat: "pebble-wal", Handle: 10, Off: 0, Len: 256},
+		{ID: 5, Kind: trace.KindOpEnd, Op: 1, OpKind: "set", Err: ""},
+		// WAL closed without syncing its dirty spans.
+		{ID: 6, Kind: trace.KindClose, File: "db/000002.log", Handle: 10},
+
+		// Phase 2: full flush sequence that makes the WAL content durable.
+		{ID: 7, Kind: trace.KindEngineEvent, Note: "FlushBegin"},
+		// SST created, written, synced (SyncData), and closed.
+		{ID: 8, Kind: trace.KindCreate, File: "db/000004.sst", Cat: "pebble-memtable-flush", Handle: 20},
+		{ID: 9, Kind: trace.KindWrite, File: "db/000004.sst", Cat: "pebble-memtable-flush", Handle: 20, Off: 0, Len: 4096},
+		{ID: 10, Kind: trace.KindSyncData, File: "db/000004.sst", Cat: "pebble-memtable-flush", Handle: 20},
+		{ID: 11, Kind: trace.KindClose, File: "db/000004.sst", Handle: 20},
+		// Parent directory synced (makes SST and MANIFEST dir entries durable).
+		{ID: 12, Kind: trace.KindOpenDir, File: "db", Handle: 30, Dir: true},
+		{ID: 13, Kind: trace.KindSync, File: "db", Handle: 30, Dir: true},
+		// MANIFEST written and synced (references the flush SST).
+		{ID: 14, Kind: trace.KindWrite, File: "db/MANIFEST-000001", Cat: "pebble-manifest", Handle: 40, Off: 0, Len: 512},
+		{ID: 15, Kind: trace.KindSync, File: "db/MANIFEST-000001", Cat: "pebble-manifest", Handle: 40},
+		// FlushEnd marks completion of the flush lifecycle.
+		{ID: 16, Kind: trace.KindEngineEvent, Note: "FlushEnd"},
+	}
+
+	// For all cutoffs prior to flush completion (cutoff 6 after WAL close through
+	// cutoff 14 after MANIFEST write), AckSyncMissing must be true and
+	// HasClosedDirtyLog must be true.
+	for cut := uint64(6); cut <= 14; cut++ {
+		cf := graph.ExtractContractFeatures(events, cut)
+		if !cf.AckSyncMissing {
+			t.Errorf("cutoff %d: expected AckSyncMissing=true prior to flush completion, got false", cut)
+		}
+		if !cf.HasClosedDirtyLog {
+			t.Errorf("cutoff %d: expected HasClosedDirtyLog=true prior to flush completion, got false", cut)
+		}
+	}
+
+	// Once the complete flush sequence finishes (cutoffs 15 and 16), the closed WAL
+	// must be healed: AckSyncMissing == false, DirtyLogBytes == 0, and HasClosedDirtyLog == false.
+	for _, cut := range []uint64{15, 16} {
+		cf := graph.ExtractContractFeatures(events, cut)
+		if cf.AckSyncMissing {
+			t.Errorf("cutoff %d: expected AckSyncMissing=false after durable flush heals closed WAL, got true", cut)
+		}
+		if cf.DirtyLogBytes != 0 {
+			t.Errorf("cutoff %d: expected DirtyLogBytes=0 after flush healing, got %d", cut, cf.DirtyLogBytes)
+		}
+		if cf.HasClosedDirtyLog {
+			t.Errorf("cutoff %d: expected HasClosedDirtyLog=false after flush healing, got true", cut)
+		}
+	}
+}
+
 // TestContractScore_ScopedDirectorySyncIsolation verifies that syncing directory A
 // isolates its durability from pending files and renames in directory B.
 func TestContractScore_ScopedDirectorySyncIsolation(t *testing.T) {
@@ -567,5 +634,97 @@ func TestContractScore_ScopedDirectorySyncIsolation(t *testing.T) {
 	}
 	if cfCut17.CriticalPendingRenames != 1 {
 		t.Fatalf("expected CriticalPendingRenames=1 at cut 17, got %d", cfCut17.CriticalPendingRenames)
+	}
+}
+
+// TestContractFeatures_InitialUnsyncedManifestAfterDirSync verifies that when
+// db/MANIFEST-000001 is created, written (Len: 64) with its file Sync omitted
+// (uint64(size) == dirtyBytes), and the parent directory "db" is synced
+// (KindSync, Dir: true) prior to OpBegin, DanglingTableCount == 1 and
+// ContractScore > 0 immediately at the directory sync cutoff (ID=4). This
+// captures the MUT-2 scenario where the initial MANIFEST sync at ID=14 during
+// pebble.Open is dropped, resulting in a 0-byte MANIFEST on disk once the
+// directory entry is flushed.
+func TestContractFeatures_InitialUnsyncedManifestAfterDirSync(t *testing.T) {
+	events := []trace.Event{
+		// MANIFEST-000001 created and written without a file Sync.
+		{ID: 1, Kind: trace.KindCreate, File: "db/MANIFEST-000001", Cat: "pebble-manifest", Handle: 10},
+		{ID: 2, Kind: trace.KindWrite, File: "db/MANIFEST-000001", Cat: "pebble-manifest", Handle: 10, Off: 0, Len: 64},
+		// File Sync omitted: uint64(f.size) == f.dirtyBytes == 64.
+		// Parent directory "db" is synced, which exposes a 0-byte MANIFEST to any subsequent Open.
+		{ID: 3, Kind: trace.KindOpenDir, File: "db", Handle: 20, Dir: true},
+		{ID: 4, Kind: trace.KindSync, File: "db", Handle: 20, Dir: true},
+		// OpBegin has not yet occurred; cutoff is at ID=4.
+	}
+
+	// At the directory-sync cutoff (ID=4), the MANIFEST directory entry is now
+	// durable (dirEntrySynced == true) but the file itself has zero synced bytes
+	// on disk. Any subsequent Open would encounter an EOF and fail. The contract
+	// oracle must flag this immediately.
+	cf := graph.ExtractContractFeatures(events, 4)
+	if cf.DanglingTableCount != 1 {
+		t.Fatalf("expected DanglingTableCount=1 at directory-sync cutoff ID=4 (MUT-2 initial MANIFEST), got %d",
+			cf.DanglingTableCount)
+	}
+	if cf.ContractScore <= 0 {
+		t.Fatalf("expected ContractScore > 0 at directory-sync cutoff ID=4, got %f", cf.ContractScore)
+	}
+}
+
+// TestContractFeatures_PostOpenManifestAppendRequiresRetirementOrDirtyWAL verifies
+// the MUT-6 scenario: when MANIFEST-000001 is created, written (Len: 64), and
+// synced (ID=1..3) during pebble.Open, and a subsequent flush appends to
+// MANIFEST-000001 (Off: 64, Len: 64) without syncing MANIFEST while the prior
+// WAL was cleanly synced before closing (closedWhileDirty == false), the oracle
+// must not flag a violation at FlushEnd alone (DanglingTableCount == 0), because
+// reverting MANIFEST to its synced prefix is still safe. Only once KindReuseForWrite
+// or KindRemove retires the prior WAL while MANIFEST remains dirty must the oracle
+// set DanglingTableCount == 1.
+func TestContractFeatures_PostOpenManifestAppendRequiresRetirementOrDirtyWAL(t *testing.T) {
+	// Base trace: MANIFEST synced on Open, WAL cleanly synced before close,
+	// subsequent flush appends to MANIFEST without a MANIFEST Sync.
+	baseEvents := []trace.Event{
+		// pebble.Open sequence: MANIFEST created, written, synced.
+		{ID: 1, Kind: trace.KindCreate, File: "db/MANIFEST-000001", Cat: "pebble-manifest", Handle: 10},
+		{ID: 2, Kind: trace.KindWrite, File: "db/MANIFEST-000001", Cat: "pebble-manifest", Handle: 10, Off: 0, Len: 64},
+		{ID: 3, Kind: trace.KindSync, File: "db/MANIFEST-000001", Cat: "pebble-manifest", Handle: 10},
+		// WAL opened, written, synced, and cleanly closed (closedWhileDirty == false).
+		{ID: 4, Kind: trace.KindCreate, File: "db/000002.log", Cat: "pebble-wal", Handle: 20},
+		{ID: 5, Kind: trace.KindWrite, File: "db/000002.log", Cat: "pebble-wal", Handle: 20, Off: 0, Len: 128},
+		{ID: 6, Kind: trace.KindSync, File: "db/000002.log", Cat: "pebble-wal", Handle: 20},
+		{ID: 7, Kind: trace.KindClose, File: "db/000002.log", Handle: 20},
+		// Flush appends to MANIFEST without syncing: uint64(f.size) > f.dirtyBytes.
+		{ID: 8, Kind: trace.KindEngineEvent, Note: "FlushBegin"},
+		{ID: 9, Kind: trace.KindWrite, File: "db/MANIFEST-000001", Cat: "pebble-manifest", Handle: 10, Off: 64, Len: 64},
+		// MANIFEST Sync omitted (MUT-6).
+		{ID: 10, Kind: trace.KindEngineEvent, Note: "FlushEnd"},
+	}
+
+	// At FlushEnd (ID=10), with no retirement and no closed dirty WAL,
+	// the oracle must not flag a violation: revert to synced prefix is safe.
+	cfFlushEnd := graph.ExtractContractFeatures(baseEvents, 10)
+	if cfFlushEnd.DanglingTableCount != 0 {
+		t.Fatalf("expected DanglingTableCount=0 at FlushEnd (ID=10) when WAL was cleanly synced and no retirement occurred, got %d",
+			cfFlushEnd.DanglingTableCount)
+	}
+
+	// Sub-test A: KindReuseForWrite retires the prior WAL while MANIFEST is dirty.
+	eventsWithReuse := append(append([]trace.Event{}, baseEvents...), trace.Event{
+		ID: 11, Kind: trace.KindReuseForWrite, File: "db/000002.log", File2: "db/000006.log", Cat: "pebble-wal", Handle: 30,
+	})
+	cfReuse := graph.ExtractContractFeatures(eventsWithReuse, 11)
+	if cfReuse.DanglingTableCount != 1 {
+		t.Fatalf("sub-test A: expected DanglingTableCount=1 at ID=11 after KindReuseForWrite retires WAL with dirty MANIFEST, got %d",
+			cfReuse.DanglingTableCount)
+	}
+
+	// Sub-test B: KindRemove retires the prior WAL while MANIFEST is dirty.
+	eventsWithRemove := append(append([]trace.Event{}, baseEvents...), trace.Event{
+		ID: 11, Kind: trace.KindRemove, File: "db/000002.log",
+	})
+	cfRemove := graph.ExtractContractFeatures(eventsWithRemove, 11)
+	if cfRemove.DanglingTableCount != 1 {
+		t.Fatalf("sub-test B: expected DanglingTableCount=1 at ID=11 after KindRemove retires WAL with dirty MANIFEST, got %d",
+			cfRemove.DanglingTableCount)
 	}
 }
