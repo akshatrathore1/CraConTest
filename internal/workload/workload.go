@@ -4,6 +4,7 @@ package workload
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"math/rand/v2"
 
@@ -20,6 +21,7 @@ type Config struct {
 	ValueBytes int    `json:"value_bytes"`
 	SyncEvery  int    `json:"sync_every"`
 	FlushEvery int    `json:"flush_every"`
+	CompactAt  int    `json:"compact_at,omitempty"`
 }
 
 // DefaultConfig returns the frozen initial driver configuration (Target C2).
@@ -176,6 +178,15 @@ func Plan(cfg Config) []PlanOperation {
 				IsFlushOp: true,
 			})
 		}
+
+		if cfg.CompactAt > 0 && (i+1) == cfg.CompactAt {
+			opID++
+			plan = append(plan, PlanOperation{
+				Op:       opID,
+				Kind:     "compact",
+				Mutating: false,
+			})
+		}
 	}
 
 	return plan
@@ -246,6 +257,15 @@ func Run(db *pebble.DB, marker Marker, cfg Config) ([]history.Entry, error) {
 
 		case "flush":
 			opErr = db.Flush()
+			if opErr == nil {
+				db.TestOnlyWaitForCleaning()
+			}
+
+		case "compact":
+			opErr = db.Compact(context.Background(), nil, []byte("\xff"), false)
+			if opErr == nil {
+				db.TestOnlyWaitForCleaning()
+			}
 		}
 
 		eventTracker++

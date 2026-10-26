@@ -134,3 +134,87 @@ func TestWorkloadExecutionWithPebble(t *testing.T) {
 		t.Fatalf("correlated history.Validate: %v", err)
 	}
 }
+
+func TestWorkloadCompactionPlanningAndExecution(t *testing.T) {
+	cfg := workload.Config{
+		Seed:       42,
+		Operations: 50,
+		KeyCount:   16,
+		ValueBytes: 64,
+		SyncEvery:  5,
+		FlushEvery: 20,
+		CompactAt:  25,
+	}
+
+	plan := workload.Plan(cfg)
+	foundCompact := false
+	for _, op := range plan {
+		if op.Kind == "compact" {
+			foundCompact = true
+			if op.Mutating {
+				t.Errorf("compact operation must be non-mutating")
+			}
+		}
+	}
+	if !foundCompact {
+		t.Fatalf("expected compact operation in plan, but none found")
+	}
+
+	mem := vfs.NewCrashableMem()
+	rec := vfsrec.New(mem)
+	listener := rec.EventListener()
+	opts := &pebble.Options{
+		FS:                          rec,
+		Logger:                      recovery.PanicLogger{},
+		MemTableSize:                64 * 1024,
+		EventListener:               &listener,
+		DisableAutomaticCompactions: true,
+	}
+
+	db, err := pebble.Open("db_compact", opts)
+	if err != nil {
+		t.Fatalf("pebble.Open: %v", err)
+	}
+
+	entries, err := workload.Run(db, rec, cfg)
+	if err != nil {
+		_ = db.Close()
+		t.Fatalf("workload.Run: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("db.Close: %v", err)
+	}
+
+	if err := history.Validate(entries); err != nil {
+		t.Fatalf("history.Validate: %v", err)
+	}
+
+	foundHistCompact := false
+	for _, e := range entries {
+		if e.Kind == "compact" {
+			foundHistCompact = true
+			if e.Err != "" {
+				t.Errorf("compact history entry has unexpected error: %s", e.Err)
+			}
+			if len(e.Mutations) != 0 {
+				t.Errorf("compact history entry should have no mutations")
+			}
+		}
+	}
+	if !foundHistCompact {
+		t.Fatalf("expected compact entry in history ledger, but none found")
+	}
+
+	traceEvents := rec.Events()
+	if err := trace.Validate(traceEvents); err != nil {
+		t.Fatalf("trace.Validate: %v", err)
+	}
+
+	correlated, err := workload.Correlate(entries, traceEvents)
+	if err != nil {
+		t.Fatalf("workload.Correlate: %v", err)
+	}
+	if err := history.Validate(correlated); err != nil {
+		t.Fatalf("correlated history.Validate: %v", err)
+	}
+}

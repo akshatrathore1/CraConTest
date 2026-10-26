@@ -10,11 +10,13 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"sort"
+	"sync"
 
 	"github.com/akshatrathore1/CraConTest/internal/trace"
 )
@@ -103,6 +105,7 @@ func Build(events []trace.Event, base uint64, policies []int) ([]Candidate, erro
 			universe = append(universe, Candidate{Event: cut, Percent: policy, Seed: seed})
 		}
 	}
+	RegisterTrace(events)
 	Sort(universe)
 	return universe, nil
 }
@@ -198,4 +201,353 @@ func Decode(reader io.Reader) ([]Candidate, error) {
 		return nil, fmt.Errorf("decode universe: %w", err)
 	}
 	return universe, nil
+}
+
+// activeTraceLock protects activeTrace.
+var (
+	activeTraceLock sync.RWMutex
+	activeTrace     []trace.Event
+)
+
+// RegisterTrace records the active trace for persistence state classification.
+func RegisterTrace(events []trace.Event) {
+	activeTraceLock.Lock()
+	defer activeTraceLock.Unlock()
+	activeTrace = trace.Clone(events)
+}
+
+// ActiveTrace returns a copy of the currently registered trace, or nil if none.
+func ActiveTrace() []trace.Event {
+	activeTraceLock.RLock()
+	defer activeTraceLock.RUnlock()
+	if activeTrace == nil {
+		return nil
+	}
+	return trace.Clone(activeTrace)
+}
+
+type canonicalFile struct {
+	Path       string `json:"path"`
+	DurableLen int64  `json:"durable_len"`
+	CurrentLen int64  `json:"current_len,omitempty"`
+}
+
+type canonicalState struct {
+	Percent       int             `json:"percent"`
+	LastAckSyncOp uint64          `json:"last_ack_sync_op"`
+	Files         []canonicalFile `json:"files"`
+	Pending       []string        `json:"pending,omitempty"`
+}
+
+type fileEntry struct {
+	path       string
+	durableLen int64
+	currentLen int64
+	deleted    bool
+}
+
+type cutoffState struct {
+	lastAckSyncOp uint64
+	files         map[string]*fileEntry
+	pending       []string
+}
+
+func cloneFiles(src map[string]*fileEntry) map[string]*fileEntry {
+	dst := make(map[string]*fileEntry, len(src))
+	for k, v := range src {
+		cp := *v
+		dst[k] = &cp
+	}
+	return dst
+}
+
+func (s *cutoffState) Key(percent int) string {
+	state := canonicalState{
+		Percent:       percent,
+		LastAckSyncOp: s.lastAckSyncOp,
+		Files:         []canonicalFile{},
+	}
+	if len(s.pending) > 0 {
+		state.Pending = append([]string(nil), s.pending...)
+		sort.Strings(state.Pending)
+	}
+
+	names := make([]string, 0, len(s.files))
+	for name := range s.files {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	for _, name := range names {
+		f := s.files[name]
+		if f.deleted {
+			continue
+		}
+		if percent == 0 {
+			if f.durableLen > 0 {
+				state.Files = append(state.Files, canonicalFile{
+					Path:       f.path,
+					DurableLen: f.durableLen,
+				})
+			}
+		} else {
+			state.Files = append(state.Files, canonicalFile{
+				Path:       f.path,
+				DurableLen: f.durableLen,
+				CurrentLen: f.currentLen,
+			})
+		}
+	}
+	encoded, err := json.Marshal(state)
+	if err != nil {
+		panic(fmt.Sprintf("candidate: state key encoding: %v", err))
+	}
+	digest := sha256.Sum256(encoded)
+	return hex.EncodeToString(digest[:])
+}
+
+// buildCutoffStates performs a single forward pass over events, computing the
+// snapshot of persistence state for every cutoff 0..len(events).
+func buildCutoffStates(events []trace.Event) []*cutoffState {
+	states := make([]*cutoffState, len(events)+1)
+	files := make(map[string]*fileEntry)
+	handles := make(map[uint64]*fileEntry)
+	var pending []string
+	var lastAckSyncOp uint64
+	var activeOpSync bool
+
+	states[0] = &cutoffState{
+		lastAckSyncOp: 0,
+		files:         cloneFiles(files),
+		pending:       nil,
+	}
+
+	for _, event := range events {
+		switch event.Kind {
+		case trace.KindMkdirAll:
+			files[event.File] = &fileEntry{path: event.File}
+		case trace.KindCreate:
+			f := &fileEntry{path: event.File}
+			files[event.File] = f
+			handles[event.Handle] = f
+			pending = append(pending, "create:"+event.File)
+		case trace.KindOpen, trace.KindOpenReadWrite, trace.KindOpenDir:
+			f := files[event.File]
+			if f == nil {
+				f = &fileEntry{path: event.File}
+				files[event.File] = f
+			}
+			handles[event.Handle] = f
+		case trace.KindWrite, trace.KindWriteAt:
+			f := handles[event.Handle]
+			if f != nil && event.Len > 0 {
+				end := event.Off + int64(event.Len)
+				if end > f.currentLen {
+					f.currentLen = end
+				}
+			}
+		case trace.KindSync, trace.KindSyncData, trace.KindSyncTo:
+			if event.IsBarrier() {
+				f := handles[event.Handle]
+				if f != nil {
+					f.durableLen = f.currentLen
+				}
+				if event.Dir {
+					pending = nil
+				}
+				activeOpSync = true
+			}
+		case trace.KindClose:
+			delete(handles, event.Handle)
+		case trace.KindRename:
+			f := files[event.File]
+			if f != nil {
+				delete(files, event.File)
+				f.path = event.File2
+				files[event.File2] = f
+			}
+			pending = append(pending, "rename:"+event.File+"->"+event.File2)
+		case trace.KindRemove, trace.KindRemoveAll:
+			f := files[event.File]
+			if f != nil {
+				f.deleted = true
+				delete(files, event.File)
+			}
+			pending = append(pending, "remove:"+event.File)
+		case trace.KindOpBegin:
+			activeOpSync = false
+		case trace.KindOpEnd:
+			if activeOpSync && trace.MutatingOperation(event.OpKind) && event.Err == "" {
+				lastAckSyncOp++
+			}
+			activeOpSync = false
+		}
+
+		states[event.ID] = &cutoffState{
+			lastAckSyncOp: lastAckSyncOp,
+			files:         cloneFiles(files),
+			pending:       append([]string(nil), pending...),
+		}
+	}
+
+	return states
+}
+
+// StateHash returns the canonical persistence state key for a cutoff in a trace
+// under a given retention policy.
+func StateHash(events []trace.Event, cut uint64, percent int) string {
+	states := buildCutoffStates(events)
+	if cut >= uint64(len(states)) {
+		cut = uint64(len(states) - 1)
+	}
+	return states[cut].Key(percent)
+}
+
+type groupKey struct {
+	event   uint64
+	percent int
+}
+
+func collapseWithoutTrace(candidates []Candidate) []Candidate {
+	ordered := append([]Candidate(nil), candidates...)
+	Sort(ordered)
+	seen := make(map[groupKey]bool, len(ordered))
+	result := make([]Candidate, 0, len(ordered))
+	for _, c := range ordered {
+		k := groupKey{event: c.Event, percent: c.Percent}
+		if seen[k] {
+			continue
+		}
+		seen[k] = true
+		result = append(result, c)
+	}
+	return result
+}
+
+func isCutoffMutation(events []trace.Event, cut uint64) bool {
+	if cut == 0 || cut > uint64(len(events)) {
+		return false
+	}
+	return events[cut-1].IsMutation()
+}
+
+func isBetterCandidateRepresentative(events []trace.Event, a, b Candidate) bool {
+	bbA := trace.BeforeBoundary(events, a.Event)
+	bbB := trace.BeforeBoundary(events, b.Event)
+	if bbA != bbB {
+		return bbA // boundary cutoffs preferred
+	}
+
+	mutA := isCutoffMutation(events, a.Event)
+	mutB := isCutoffMutation(events, b.Event)
+	if mutA != mutB {
+		return mutA // prefer mutations over annotations
+	}
+
+	return Less(a, b)
+}
+
+// CollapseEquivalenceStates groups candidates by canonical persistence state
+// (using StateHash) and returns one representative candidate per distinct state.
+// Redundant OpEnd markers and redundant intermediate cutoffs are collapsed.
+// Representatives prioritize cutoffs where trace.BeforeBoundary is true,
+// followed by canonical order. The returned slice is sorted canonically.
+func CollapseEquivalenceStates(candidates []Candidate, events ...[]trace.Event) []Candidate {
+	var evs []trace.Event
+	if len(events) > 0 && len(events[0]) > 0 {
+		evs = events[0]
+	} else {
+		evs = ActiveTrace()
+	}
+
+	if len(evs) == 0 {
+		return collapseWithoutTrace(candidates)
+	}
+
+	states := buildCutoffStates(evs)
+	numStates := uint64(len(states))
+
+	type classEntry struct {
+		key        string
+		candidates []Candidate
+	}
+	classMap := make(map[string]int)
+	var classes []classEntry
+
+	for _, c := range candidates {
+		cut := c.Event
+		if cut >= numStates {
+			cut = numStates - 1
+		}
+		key := states[cut].Key(c.Percent)
+		idx, found := classMap[key]
+		if !found {
+			idx = len(classes)
+			classMap[key] = idx
+			classes = append(classes, classEntry{key: key})
+		}
+		classes[idx].candidates = append(classes[idx].candidates, c)
+	}
+
+	representatives := make([]Candidate, 0, len(classes))
+	for _, cls := range classes {
+		best := cls.candidates[0]
+		for j := 1; j < len(cls.candidates); j++ {
+			cand := cls.candidates[j]
+			if isBetterCandidateRepresentative(evs, cand, best) {
+				best = cand
+			}
+		}
+		representatives = append(representatives, best)
+	}
+
+	Sort(representatives)
+	return representatives
+}
+
+// CollapseEquivalenceStatesWithTrace is a convenience wrapper passing an explicit trace.
+func CollapseEquivalenceStatesWithTrace(events []trace.Event, candidates []Candidate) []Candidate {
+	return CollapseEquivalenceStates(candidates, events)
+}
+
+// EquivalenceClasses groups candidates into equivalence classes by their canonical StateHash.
+func EquivalenceClasses(candidates []Candidate, events ...[]trace.Event) map[string][]Candidate {
+	var evs []trace.Event
+	if len(events) > 0 && len(events[0]) > 0 {
+		evs = events[0]
+	} else {
+		evs = ActiveTrace()
+	}
+
+	if len(evs) == 0 {
+		m := make(map[string][]Candidate)
+		for _, c := range candidates {
+			key := fmt.Sprintf("cut_%d_p_%d", c.Event, c.Percent)
+			m[key] = append(m[key], c)
+		}
+		return m
+	}
+
+	states := buildCutoffStates(evs)
+	numStates := uint64(len(states))
+	result := make(map[string][]Candidate)
+	for _, c := range candidates {
+		cut := c.Event
+		if cut >= numStates {
+			cut = numStates - 1
+		}
+		key := states[cut].Key(c.Percent)
+		result[key] = append(result[key], c)
+	}
+	return result
+}
+
+// BuildCollapsed builds the universe and immediately collapses it down to
+// distinct canonical persistence states.
+func BuildCollapsed(events []trace.Event, base uint64, policies []int) ([]Candidate, error) {
+	universe, err := Build(events, base, policies)
+	if err != nil {
+		return nil, err
+	}
+	return CollapseEquivalenceStates(universe, events), nil
 }
