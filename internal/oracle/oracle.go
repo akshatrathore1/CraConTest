@@ -127,7 +127,23 @@ func Check(ctx Context) Outcome {
 		}
 		// Cross-reference history markers with trace events.
 		for _, e := range ctx.History {
-			if e.BeginEvent > 0 && e.BeginEvent <= uint64(len(ctx.Events)) {
+			if e.BeginEvent > uint64(len(ctx.Events)) {
+				return Outcome{
+					Candidate: cand,
+					Class:     ClassOracleError,
+					Rule:      "invalid_history",
+					Detail:    fmt.Sprintf("begin_event %d exceeds trace length %d for op %d", e.BeginEvent, len(ctx.Events), e.Op),
+				}
+			}
+			if e.EndEvent > uint64(len(ctx.Events)) {
+				return Outcome{
+					Candidate: cand,
+					Class:     ClassOracleError,
+					Rule:      "invalid_history",
+					Detail:    fmt.Sprintf("end_event %d exceeds trace length %d for op %d", e.EndEvent, len(ctx.Events), e.Op),
+				}
+			}
+			if e.BeginEvent > 0 {
 				ev := ctx.Events[e.BeginEvent-1]
 				if ev.Kind != trace.KindOpBegin || ev.Op != e.Op || ev.OpKind != e.Kind {
 					return Outcome{
@@ -138,7 +154,7 @@ func Check(ctx Context) Outcome {
 					}
 				}
 			}
-			if e.EndEvent > 0 && e.EndEvent <= uint64(len(ctx.Events)) {
+			if e.EndEvent > 0 {
 				ev := ctx.Events[e.EndEvent-1]
 				if ev.Kind != trace.KindOpEnd || ev.Op != e.Op || ev.OpKind != e.Kind || ev.Err != e.Err {
 					return Outcome{

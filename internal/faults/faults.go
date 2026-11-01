@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -29,6 +30,14 @@ const (
 	MUT8 = "MUT-8" // RocksDB #10460: fsyncs omitted after trigger event
 	MUT9 = "MUT-9" // Single k-th directory sync drop
 
+	// Extended parameterized and stochastic fault models.
+	MUTX1 = "MUT-X1" // drop only the k-th WAL sync call
+	MUTX2 = "MUT-X2" // drop only the k-th MANIFEST sync call
+	MUTX3 = "MUT-X3" // drop only the k-th SST (flush/compaction output) sync call
+	MUTX4 = "MUT-X4" // flaky fsync: each non-dir sync dropped w.p. 4%
+	MUTX5 = "MUT-X5" // flaky dir fsync: each dir sync dropped w.p. 12%
+	MUTX6 = "MUT-X6" // OUT-OF-CONTRACT CONTROL: silently lose the k-th WAL Write (never reaches the file)
+
 	// Descriptive aliases
 	MutWalK       = "MUT-WAL-K"
 	MutManRot     = "MUT-MAN-ROT"
@@ -39,7 +48,7 @@ const (
 
 // IDs returns the list of all supported canonical fault identifiers.
 func IDs() []string {
-	return []string{MUT0, MUT1, MUT2, MUT3, MUT4, MUT5, MUT6, MUT7, MUT8, MUT9}
+	return []string{MUT0, MUT1, MUT2, MUT3, MUT4, MUT5, MUT6, MUT7, MUT8, MUT9, MUTX1, MUTX2, MUTX3, MUTX4, MUTX5, MUTX6}
 }
 
 // Aliases returns all supported descriptive alias fault identifiers.
@@ -47,8 +56,42 @@ func Aliases() []string {
 	return []string{MutWalK, MutManRot, MutRocks10573, MutRocks10460, MutDirK}
 }
 
+// parseParameterizedID parses parameterized fault identifiers such as MUT-X1_k6 or MUT-X5_p12.
+func parseParameterizedID(id string) (canonical string, k int, ok bool) {
+	switch {
+	case strings.HasPrefix(id, "MUT-X1_k"):
+		nStr := strings.TrimPrefix(id, "MUT-X1_k")
+		if n, err := strconv.Atoi(nStr); err == nil && n > 0 {
+			return MUTX1, n, true
+		}
+	case strings.HasPrefix(id, "MUT-X2_k"):
+		nStr := strings.TrimPrefix(id, "MUT-X2_k")
+		if n, err := strconv.Atoi(nStr); err == nil && n > 0 {
+			return MUTX2, n, true
+		}
+	case strings.HasPrefix(id, "MUT-X3_k"):
+		nStr := strings.TrimPrefix(id, "MUT-X3_k")
+		if n, err := strconv.Atoi(nStr); err == nil && n > 0 {
+			return MUTX3, n, true
+		}
+	case id == "MUT-X4_p04":
+		return MUTX4, 0, true
+	case id == "MUT-X5_p12":
+		return MUTX5, 0, true
+	case strings.HasPrefix(id, "MUT-X6_k"):
+		nStr := strings.TrimPrefix(id, "MUT-X6_k")
+		if n, err := strconv.Atoi(nStr); err == nil && n > 0 {
+			return MUTX6, n, true
+		}
+	}
+	return "", 0, false
+}
+
 // NormalizeID converts a canonical ID or alias into its canonical form.
 func NormalizeID(id string) (string, error) {
+	if canon, _, ok := parseParameterizedID(id); ok {
+		return canon, nil
+	}
 	switch id {
 	case MUT0:
 		return MUT0, nil
@@ -70,6 +113,8 @@ func NormalizeID(id string) (string, error) {
 		return MUT8, nil
 	case MUT9, MutDirK:
 		return MUT9, nil
+	case MUTX1, MUTX2, MUTX3, MUTX4, MUTX5, MUTX6:
+		return id, nil
 	default:
 		return "", fmt.Errorf("faults: unknown fault id %q (supported: %v)", id, IDs())
 	}
@@ -96,21 +141,27 @@ type Config struct {
 	DirDropK    int    // Drop strictly the k-th directory sync for MUT9 (default: 1)
 	TriggerName string // Lifecycle trigger event for MUT8 (default: "CompactionBegin")
 	DropBudget  int    // Number of syncs to drop after trigger for MUT8 (default: 1)
+	XK          int    // Parameterized k-th event drop for MUT-X1, MUT-X2, MUT-X3, MUT-X6 (used when XK > 0)
 }
 
 // DefaultConfig returns calibrated defaults for a given fault identifier.
 func DefaultConfig(id string) Config {
+	_, k, ok := parseParameterizedID(id)
 	norm, _ := NormalizeID(id)
 	if norm == "" {
 		norm = id
 	}
-	return Config{
+	cfg := Config{
 		ID:          norm,
 		WALDropK:    1,
 		DirDropK:    1,
 		TriggerName: "CompactionBegin",
 		DropBudget:  1,
 	}
+	if ok && k > 0 {
+		cfg.XK = k
+	}
+	return cfg
 }
 
 // FS wraps an inner vfs.FS and injects faults based on its configuration.
@@ -139,6 +190,29 @@ type FS struct {
 	// MUT-9 state
 	dirSyncCount    int
 	kDirSyncDropped bool
+
+	// sealed-holdout state
+	xN       [6]int
+	xDropped bool
+	xCall    int
+}
+
+func envInt(name string, def int) int {
+	if v := os.Getenv(name); v != "" {
+		var x int
+		if _, err := fmt.Sscanf(v, "%d", &x); err == nil {
+			return x
+		}
+	}
+	return def
+}
+
+func flakyHash(seed, idx int) float64 {
+	z := uint64(seed)*0x9E3779B97F4A7C15 + uint64(idx)*0xBF58476D1CE4E5B9 + 0x94D049BB133111EB
+	z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9
+	z = (z ^ (z >> 27)) * 0x94D049BB133111EB
+	z ^= z >> 31
+	return float64(z>>11) / float64(1<<53)
 }
 
 // Compile-time interface check.
@@ -154,6 +228,9 @@ func New(id string, inner vfs.FS) (vfs.FS, error) {
 func NewWithConfig(cfg Config, inner vfs.FS) (vfs.FS, error) {
 	if inner == nil {
 		return nil, errors.New("faults: inner FS cannot be nil")
+	}
+	if _, k, ok := parseParameterizedID(cfg.ID); ok && k > 0 && cfg.XK <= 0 {
+		cfg.XK = k
 	}
 	normID, err := NormalizeID(cfg.ID)
 	if err != nil {
@@ -290,6 +367,9 @@ func (fs *FS) Reset() {
 	fs.triggerDropCount = 0
 	fs.dirSyncCount = 0
 	fs.kDirSyncDropped = false
+	fs.xN = [6]int{}
+	fs.xDropped = false
+	fs.xCall = 0
 }
 
 func (fs *FS) onFileCreate(name string, category vfs.DiskWriteCategory) {
@@ -387,6 +467,62 @@ func (fs *FS) shouldDropSync(f *file, op string) bool {
 				fs.kDirSyncDropped = true
 				return true
 			}
+		}
+		return false
+
+	case MUTX1:
+		if string(f.category) == "pebble-wal" && !f.isDir {
+			fs.xN[1]++
+			k := fs.cfg.XK
+			if k <= 0 {
+				k = envInt("CRACON_K", 2)
+			}
+			if fs.xN[1] == k && !fs.xDropped {
+				fs.xDropped = true
+				return true
+			}
+		}
+		return false
+
+	case MUTX2:
+		if string(f.category) == "pebble-manifest" && !f.isDir {
+			fs.xN[2]++
+			k := fs.cfg.XK
+			if k <= 0 {
+				k = envInt("CRACON_K", 2)
+			}
+			if fs.xN[2] == k && !fs.xDropped {
+				fs.xDropped = true
+				return true
+			}
+		}
+		return false
+
+	case MUTX3:
+		if (string(f.category) == "pebble-memtable-flush" || string(f.category) == "pebble-compaction") && !f.isDir {
+			fs.xN[3]++
+			k := fs.cfg.XK
+			if k <= 0 {
+				k = envInt("CRACON_K", 1)
+			}
+			if fs.xN[3] == k && !fs.xDropped {
+				fs.xDropped = true
+				return true
+			}
+		}
+		return false
+
+	case MUTX4:
+		if !f.isDir {
+			fs.xCall++
+			return flakyHash(envInt("CRACON_FSEED", 1), fs.xCall) < 0.04
+		}
+		return false
+
+	case MUTX5:
+		if f.isDir {
+			fs.xCall++
+			return flakyHash(envInt("CRACON_FSEED", 1), fs.xCall) < 0.12
 		}
 		return false
 
@@ -560,6 +696,22 @@ func (f *file) ReadAt(p []byte, off int64) (int, error) {
 }
 
 func (f *file) Write(p []byte) (int, error) {
+	if f.fs != nil && f.fs.cfg.ID == MUTX6 && string(f.category) == "pebble-wal" {
+		f.fs.mu.Lock()
+		f.fs.xN[4]++
+		k := f.fs.cfg.XK
+		if k <= 0 {
+			k = envInt("CRACON_K", 2)
+		}
+		drop := f.fs.xN[4] == k && !f.fs.xDropped
+		if drop {
+			f.fs.xDropped = true
+		}
+		f.fs.mu.Unlock()
+		if drop {
+			return len(p), nil // acknowledged but never applied
+		}
+	}
 	return f.inner.Write(p)
 }
 

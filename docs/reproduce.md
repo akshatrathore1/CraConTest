@@ -27,11 +27,31 @@ The CLI has five subcommands. Flags use a single dash:
 
 | Command | Flags |
 |---|---|
-| `record` | `-spec <config.json> -out <run-dir> -fault <MUT-0 … MUT-9>` |
+| `record` | `-spec <config.json> -out <run-dir> [-fault <MUT-0 … MUT-9, MUT-X1 … MUT-X6>] [-policies 0,100]` |
 | `plan` | `-run <run-dir> [-seed <ranking seed>]` |
 | `explore` | `-run <run-dir> [-timeout <duration>]` |
 | `evaluate` | `-run <run-dir> [-budgets 0,1,5,...] [-discovery <csv> -plot <svg>]` |
-| `benchmark` | `[-seeds 42,100,...] [-faults MUT-1,...] [-ops 120] [-report <md>] [-csv <csv>]` |
+| `benchmark` | `[-seeds 42,100,...] [-faults MUT-1,...] [-ops 120] [-report <md>] [-csv <csv>] [-per-seed-csv <csv>]` |
+
+### Directory Structure for Reproduction Artifacts
+
+```
+CraConTest/
+├── analysis/
+│   ├── paired_stats.py        # Paired per-seed Wilcoxon & t-test analysis
+│   └── requirements.txt       # Python dependencies (scipy>=1.11.0)
+├── results/
+│   ├── README.md              # Organization of Stage 1 & Stage 2 results artifacts
+│   ├── benchmark_summary.csv  # Aggregated 32-seed benchmark metrics (MUT-0..9)
+│   ├── benchmark_per_seed.csv # Unaggregated per-seed discovery metrics (MUT-0..9)
+│   ├── holdout_summary.csv    # Aggregated 32-seed holdout metrics (MUT-X1..X6)
+│   └── holdout_per_seed.csv   # Unaggregated per-seed discovery metrics (MUT-X1..X6)
+├── docs/
+│   ├── report.md              # Technical report
+│   ├── reproduce.md           # Reproduction runbook
+│   └── benchmark-report.md    # Multi-seed benchmark empirical report
+└── paper/                     # Reserved for publication materials
+```
 
 ---
 
@@ -98,7 +118,13 @@ done
 To evaluate ranking strategies across both dense and sparse failure distributions with statistical confidence intervals, the multi-seed benchmark evaluates 32 deterministic workload seeds across all 10 fault models:
 
 ```bash
-./cracontest benchmark -report docs/benchmark-report.md -csv results/benchmark_summary.csv
+./cracontest benchmark -report docs/benchmark-report.md -csv results/benchmark_summary.csv -per-seed-csv results/benchmark_per_seed.csv
+```
+
+To run the paired statistical comparison across seeds via python3:
+
+```bash
+python3 analysis/paired_stats.py results/benchmark_per_seed.csv "Seeded Benchmark Faults (32 seeds)" MUT-1 MUT-2 MUT-3 MUT-4 MUT-5 MUT-6 MUT-8 MUT-9
 ```
 
 The multi-seed benchmark runs 32 deterministic workload seeds (`42, 100..900, 1001..1022`; 120 operations, `SyncEvery = 8`, `FlushEvery = 40`) across `MUT-0` through `MUT-9` with automatic background compactions and table stats disabled (`DisableAutomaticCompactions: true`, `DisableTableStats: true`, and deterministic mid-workload compaction `CompactAt = 80` for `MUT-8`) so traces and candidate counts are 100% repeatable across runs and platforms.
@@ -110,15 +136,37 @@ The multi-seed benchmark runs 32 deterministic workload seeds (`42, 100..900, 10
 | Fault Model | Fault Description | Failure Density | DCG $k_1$ | R2 $k_1$ | B0 $k_1$ | DCG $S_{25}$ / $S_{100}$ | R2 $S_{25}$ / $S_{100}$ | B0 $S_{25}$ / $S_{100}$ |
 |---|---|---|---|---|---|---|---|---|
 | **MUT-0** | Null Control (No Fault) | 0.0% | 0.00 | 0.00 | 0.00 | 0.00 / 0.00 | 0.00 / 0.00 | 0.00 / 0.00 |
-| **MUT-1** | All WAL Syncs Dropped | 36.4% | **1.00** | 1.44 | 2.00 | **23.97** / **24.00** | 17.13 / **24.00** | 6.12 / 14.61 |
-| **MUT-2** | MANIFEST Syncs Dropped | 47.3% | **1.00** | 1.17 | 1.58 | **25.00** / **33.03** | 21.15 / **33.03** | 5.64 / 13.75 |
+| **MUT-1** | All WAL Syncs Dropped | 36.4% | **1.00** | 1.44 | 2.00 | **23.94** / **23.97** | 17.12 / **23.97** | 6.12 / 14.61 |
+| **MUT-2** | MANIFEST Syncs Dropped | 47.3% | **1.00** | 1.17 | 1.55 | **25.00** / **33.03** | 21.15 / **33.03** | 5.67 / 13.78 |
 | **MUT-3** | Directory Syncs Dropped | 42.5% | **1.00** | 1.44 | 2.00 | 24.00 / **27.00** | 17.26 / **27.00** | 5.00 / 11.22 |
-| **MUT-4** | SST Flush Syncs Dropped | 29.8% | **1.00** | 1.95 | 2.39 | **21.69** / **21.69** | 12.57 / **21.69** | 3.53 / 8.59 |
+| **MUT-4** | SST Flush Syncs Dropped | 29.8% | **1.00** | 1.95 | 2.39 | **21.72** / **21.72** | 12.58 / **21.72** | 3.56 / 8.62 |
 | **MUT-5** | Sparse $k$-th WAL Sync Dropped ($k=1$) | 2.7% | **1.00** | 13.01 | 25.97 | **2.00** / **2.00** | 1.30 / **2.00** | 0.48 / 1.00 |
 | **MUT-6** | Second Manifest Sync Dropped | 0.8% | **1.00** | 7.72 | 31.12 | **1.62** / **1.62** | 1.07 / **1.62** | 0.00 / 0.81 |
 | **MUT-7** | Options Dir Sync (No-op Control) | 0.0% | 0.00 | 0.00 | 0.00 | 0.00 / 0.00 | 0.00 / 0.00 | 0.00 / 0.00 |
-| **MUT-8** | Compaction SST Sync Drop | 15.2% | **1.00** | 3.58 | 4.41 | **12.88** / **12.88** | 6.74 / 12.82 | 2.00 / 5.08 |
+| **MUT-8** | Compaction SST Sync Drop | 15.2% | **1.00** | 3.56 | 4.44 | **12.88** / **12.88** | 6.72 / 12.82 | 2.00 / 5.05 |
 | **MUT-9** | Single $k$-th Directory Sync Drop | 41.4% | **1.00** | 1.40 | 1.95 | **25.00** / **27.00** | 17.78 / **27.00** | 3.03 / 9.83 |
+
+### 4.2 Holdout & Out-of-Contract Benchmark (32 Seeds, MUT-X1 to MUT-X6)
+
+To verify that durability-contract priors generalize to unseen fault settings, the holdout suite evaluates 17 parameterized, delayed, and stochastic fault models across 32 deterministic seeds:
+
+```bash
+./cracontest benchmark \
+  -faults MUT-X1_k2,MUT-X1_k3,MUT-X1_k4,MUT-X1_k6,MUT-X1_k9,MUT-X2_k1,MUT-X2_k3,MUT-X2_k4,MUT-X2_k5,MUT-X3_k1,MUT-X3_k2,MUT-X3_k3,MUT-X4_p04,MUT-X5_p12,MUT-X6_k2,MUT-X6_k5,MUT-X6_k9 \
+  -csv results/holdout_summary.csv \
+  -per-seed-csv results/holdout_per_seed.csv \
+  -report ""
+```
+
+To run paired statistical comparisons on the holdout per-seed results:
+
+```bash
+# Holdout Faults (MUT-X1..X5)
+python3 analysis/paired_stats.py results/holdout_per_seed.csv "Holdout Faults" MUT-X1_k2 MUT-X1_k3 MUT-X1_k4 MUT-X1_k6 MUT-X1_k9 MUT-X2_k1 MUT-X2_k3 MUT-X3_k1 MUT-X3_k2 MUT-X3_k3 MUT-X4_p04 MUT-X5_p12
+
+# Out-of-Contract Negative Control (MUT-X6)
+python3 analysis/paired_stats.py results/holdout_per_seed.csv "Out-of-Contract Control" MUT-X6_k2 MUT-X6_k5 MUT-X6_k9
+```
 
 ## 5. Acceptance Tests
 

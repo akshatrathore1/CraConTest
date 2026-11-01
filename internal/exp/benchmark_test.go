@@ -1,6 +1,7 @@
 package exp_test
 
 import (
+	"encoding/csv"
 	"os"
 	"path/filepath"
 	"strings"
@@ -373,5 +374,172 @@ func TestMultiSeed_CSV_And_Report_Generation(t *testing.T) {
 	}
 	if !strings.Contains(string(reportData), "DCG achieves lower cost-to-first-failure than R2") {
 		t.Errorf("report missing expected superiority text: %s", string(reportData))
+	}
+}
+
+func TestWriteMultiSeedPerSeedCSV(t *testing.T) {
+	tmpDir := t.TempDir()
+	csvPath := filepath.Join(tmpDir, "benchmark_per_seed.csv")
+
+	res := &exp.BenchmarkResult{
+		Timestamp: "2026-11-01T00:00:00Z",
+		GitCommit: "34728d40930c",
+		Config: exp.BenchmarkConfig{
+			WorkloadSeeds: []uint64{42, 100},
+			FaultIDs:      []string{faults.MUT1},
+		},
+		FaultSummaries: map[string]exp.FaultModelSummary{
+			faults.MUT1: {
+				FaultID:         faults.MUT1,
+				RunCount:        2,
+				AvgUniverseSize: 120,
+				AvgFailures:     5,
+				FaultDensityPct: 4.17,
+				Runs: []exp.SingleRunResult{
+					{
+						Seed:          42,
+						FaultID:       faults.MUT1,
+						UniverseSize:  120,
+						TotalFailures: 5,
+						B0: exp.B0Metrics{
+							K1FailureMedian: 20.0,
+							S25Median:       3.0,
+							S100Median:      5.0,
+							BFullMedian:     25.0,
+							AUCNormFailures: 0.4500,
+							AUCNormBugs:     0.6500,
+							K1SingleSeed:    18,
+							S25SingleSeed:   2,
+						},
+						Strategies: map[string]exp.StrategyMetrics{
+							"dcg": {
+								StrategyName:    "Durability-Contract Guided (DCG)",
+								K1FailureFloat:  1.0,
+								S25Float:        5.0,
+								S100Float:       5.0,
+								BFullFloat:      10.0,
+								AUCNormFailures: 0.9500,
+								AUCNormBugs:     0.9800,
+								K1SingleSeed:    1,
+								S25SingleSeed:   5,
+							},
+							"r2": {
+								StrategyName:    "State-Representative Random (R2)",
+								K1FailureFloat:  12.0,
+								S25Float:        3.5,
+								S100Float:       5.0,
+								BFullFloat:      15.0,
+								AUCNormFailures: 0.7500,
+								AUCNormBugs:     0.8200,
+								K1SingleSeed:    10,
+								S25SingleSeed:   3,
+							},
+						},
+					},
+					{
+						Seed:          100,
+						FaultID:       faults.MUT1,
+						UniverseSize:  120,
+						TotalFailures: 6,
+						B0: exp.B0Metrics{
+							K1FailureMedian: 19.0,
+							S25Median:       3.0,
+							S100Median:      6.0,
+							BFullMedian:     24.0,
+							AUCNormFailures: 0.4600,
+							AUCNormBugs:     0.6600,
+							K1SingleSeed:    17,
+							S25SingleSeed:   3,
+						},
+						Strategies: map[string]exp.StrategyMetrics{
+							"dcg": {
+								StrategyName:    "Durability-Contract Guided (DCG)",
+								K1FailureFloat:  1.0,
+								S25Float:        6.0,
+								S100Float:       6.0,
+								BFullFloat:      9.0,
+								AUCNormFailures: 0.9600,
+								AUCNormBugs:     0.9900,
+								K1SingleSeed:    1,
+								S25SingleSeed:   6,
+							},
+							"r2": {
+								StrategyName:    "State-Representative Random (R2)",
+								K1FailureFloat:  11.0,
+								S25Float:        4.0,
+								S100Float:       6.0,
+								BFullFloat:      14.0,
+								AUCNormFailures: 0.7700,
+								AUCNormBugs:     0.8400,
+								K1SingleSeed:    9,
+								S25SingleSeed:   4,
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	if err := exp.WriteMultiSeedPerSeedCSV(res, csvPath); err != nil {
+		t.Fatalf("WriteMultiSeedPerSeedCSV failed: %v", err)
+	}
+
+	f, err := os.Open(csvPath)
+	if err != nil {
+		t.Fatalf("open csv failed: %v", err)
+	}
+	defer f.Close()
+
+	r := csv.NewReader(f)
+	records, err := r.ReadAll()
+	if err != nil {
+		t.Fatalf("read all csv failed: %v", err)
+	}
+
+	if len(records) < 2 {
+		t.Fatalf("expected header + rows, got %d records", len(records))
+	}
+
+	expectedHeader := []string{
+		"fault_id", "seed", "universe_size", "total_failures", "fault_density_pct",
+		"strategy_code", "strategy", "k1_single", "s25_single",
+		"k1_failure_mean", "s25_mean", "s100_mean", "b_full_mean",
+		"auc_norm_failures", "auc_norm_bugs", "git_commit",
+	}
+
+	if len(records[0]) != len(expectedHeader) {
+		t.Fatalf("header length mismatch: expected %d, got %d", len(expectedHeader), len(records[0]))
+	}
+
+	for i, col := range expectedHeader {
+		if records[0][i] != col {
+			t.Errorf("header col %d: expected %q, got %q", i, col, records[0][i])
+		}
+	}
+
+	// Verify row data: 2 runs * 3 strategies (dcg, r2, b0) = 6 rows
+	if len(records) != 7 {
+		t.Errorf("expected 7 records (1 header + 6 data rows), got %d", len(records))
+	}
+
+	// Check sample row values
+	foundDCG := false
+	for _, row := range records[1:] {
+		if row[0] == faults.MUT1 && row[1] == "42" && row[5] == "dcg" {
+			foundDCG = true
+			if row[7] != "1" { // k1_single
+				t.Errorf("expected k1_single 1 for dcg, got %s", row[7])
+			}
+			if row[8] != "5" { // s25_single
+				t.Errorf("expected s25_single 5 for dcg, got %s", row[8])
+			}
+			if row[15] != "34728d40930c" { // git_commit
+				t.Errorf("expected git_commit 34728d40930c, got %s", row[15])
+			}
+		}
+	}
+	if !foundDCG {
+		t.Errorf("expected row for MUT-1, seed 42, dcg not found")
 	}
 }

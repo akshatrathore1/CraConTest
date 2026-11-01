@@ -2,6 +2,7 @@ package faults_test
 
 import (
 	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -85,7 +86,10 @@ func (m *mockFS) PathBase(path string) string {
 
 func TestFaultIDsAndValidation(t *testing.T) {
 	ids := faults.IDs()
-	expected := []string{"MUT-0", "MUT-1", "MUT-2", "MUT-3", "MUT-4", "MUT-5", "MUT-6", "MUT-7", "MUT-8", "MUT-9"}
+	expected := []string{
+		"MUT-0", "MUT-1", "MUT-2", "MUT-3", "MUT-4", "MUT-5", "MUT-6", "MUT-7", "MUT-8", "MUT-9",
+		"MUT-X1", "MUT-X2", "MUT-X3", "MUT-X4", "MUT-X5", "MUT-X6",
+	}
 	if len(ids) != len(expected) {
 		t.Fatalf("unexpected IDs length: got %d, want %d", len(ids), len(expected))
 	}
@@ -1096,7 +1100,7 @@ func runWorkloadWithFS(t *testing.T, wrappedFS vfs.FS) ([]trace.Event, []history
 		Operations: 50,
 		KeyCount:   16,
 		ValueBytes: 64,
-		SyncEvery:  5,
+		SyncEvery:  1,
 		FlushEvery: 25,
 	}
 
@@ -1307,4 +1311,348 @@ func countFlushSyncs(events []trace.Event) int {
 		}
 	}
 	return count
+}
+
+func TestFaultReset(t *testing.T) {
+	mem := vfs.NewCrashableMem()
+
+	// 1. Verify Reset on MUT-X1 (WAL sync drop: drops k-th WAL sync, default k=2)
+	fsX1Obj, err := faults.New(faults.MUTX1, mem)
+	if err != nil {
+		t.Fatalf("faults.New MUT-X1: %v", err)
+	}
+	fsX1 := fsX1Obj.(*faults.FS)
+	vX1 := reflect.ValueOf(fsX1).Elem()
+	xNField1 := vX1.FieldByName("xN")
+
+	fX1, err := fsX1.Create("test1.wal", "pebble-wal")
+	if err != nil {
+		t.Fatalf("Create test1.wal: %v", err)
+	}
+	_ = fX1.Sync() // sync 1: xN[1]=1, not dropped
+	_ = fX1.Sync() // sync 2: xN[1]=2, dropped!
+	_ = fX1.Close()
+
+	if xNField1.Index(1).Int() != 2 {
+		t.Fatalf("expected xN[1]==2, got %d", xNField1.Index(1).Int())
+	}
+	if !vX1.FieldByName("xDropped").Bool() {
+		t.Fatalf("expected xDropped==true after 2nd WAL sync")
+	}
+
+	fsX1.Reset()
+
+	for i := 0; i < xNField1.Len(); i++ {
+		if val := xNField1.Index(i).Int(); val != 0 {
+			t.Errorf("post-reset expected xN[%d]==0, got %d", i, val)
+		}
+	}
+	if vX1.FieldByName("xDropped").Bool() {
+		t.Errorf("post-reset expected xDropped==false, got true")
+	}
+	if vX1.FieldByName("xCall").Int() != 0 {
+		t.Errorf("post-reset expected xCall==0, got %d", vX1.FieldByName("xCall").Int())
+	}
+
+	// Behavioral verification: after Reset, k-th sync should drop again
+	fX1Post, err := fsX1.Create("test1_post.wal", "pebble-wal")
+	if err != nil {
+		t.Fatalf("Create test1_post.wal: %v", err)
+	}
+	_ = fX1Post.Sync() // sync 1
+	if xNField1.Index(1).Int() != 1 || vX1.FieldByName("xDropped").Bool() {
+		t.Errorf("post-reset sync 1: expected xN[1]==1, xDropped==false")
+	}
+	_ = fX1Post.Sync() // sync 2: drop!
+	if xNField1.Index(1).Int() != 2 || !vX1.FieldByName("xDropped").Bool() {
+		t.Errorf("post-reset sync 2: expected xN[1]==2, xDropped==true")
+	}
+	_ = fX1Post.Close()
+
+	// 2. Verify Reset on MUT-X4 (stochastic sync drop: advances xCall)
+	fsX4Obj, err := faults.New(faults.MUTX4, mem)
+	if err != nil {
+		t.Fatalf("faults.New MUT-X4: %v", err)
+	}
+	fsX4 := fsX4Obj.(*faults.FS)
+	vX4 := reflect.ValueOf(fsX4).Elem()
+
+	fX4, err := fsX4.Create("test4.sst", "pebble-memtable-flush")
+	if err != nil {
+		t.Fatalf("Create test4.sst: %v", err)
+	}
+	for i := 0; i < 7; i++ {
+		_ = fX4.Sync()
+	}
+	_ = fX4.Close()
+
+	if vX4.FieldByName("xCall").Int() != 7 {
+		t.Fatalf("expected xCall==7, got %d", vX4.FieldByName("xCall").Int())
+	}
+
+	fsX4.Reset()
+
+	if vX4.FieldByName("xCall").Int() != 0 {
+		t.Errorf("post-reset MUT-X4 expected xCall==0, got %d", vX4.FieldByName("xCall").Int())
+	}
+	xNField4 := vX4.FieldByName("xN")
+	for i := 0; i < xNField4.Len(); i++ {
+		if val := xNField4.Index(i).Int(); val != 0 {
+			t.Errorf("post-reset MUT-X4 expected xN[%d]==0, got %d", i, val)
+		}
+	}
+	if vX4.FieldByName("xDropped").Bool() {
+		t.Errorf("post-reset MUT-X4 expected xDropped==false, got true")
+	}
+
+	// 3. Verify Reset on MUT-X6 (write loss: drops k-th WAL Write, default k=2)
+	fsX6Obj, err := faults.New(faults.MUTX6, mem)
+	if err != nil {
+		t.Fatalf("faults.New MUT-X6: %v", err)
+	}
+	fsX6 := fsX6Obj.(*faults.FS)
+	vX6 := reflect.ValueOf(fsX6).Elem()
+	xNField6 := vX6.FieldByName("xN")
+
+	fX6, err := fsX6.Create("test6.wal", "pebble-wal")
+	if err != nil {
+		t.Fatalf("Create test6.wal: %v", err)
+	}
+	_, _ = fX6.Write([]byte("first"))
+	_, _ = fX6.Write([]byte("second")) // dropped!
+	_ = fX6.Close()
+
+	if xNField6.Index(4).Int() != 2 {
+		t.Fatalf("expected xN[4]==2, got %d", xNField6.Index(4).Int())
+	}
+	if !vX6.FieldByName("xDropped").Bool() {
+		t.Fatalf("expected xDropped==true after 2nd WAL write")
+	}
+
+	fsX6.Reset()
+
+	if xNField6.Index(4).Int() != 0 {
+		t.Errorf("post-reset MUT-X6 expected xN[4]==0, got %d", xNField6.Index(4).Int())
+	}
+	if vX6.FieldByName("xDropped").Bool() {
+		t.Errorf("post-reset MUT-X6 expected xDropped==false, got true")
+	}
+
+	// 4. Verify Reset on standard fault states (MUT-7, MUT-8, MUT-9)
+	fs9Obj, err := faults.New(faults.MUT9, mem)
+	if err != nil {
+		t.Fatalf("faults.New MUT-9: %v", err)
+	}
+	fs9 := fs9Obj.(*faults.FS)
+	fs9.ArmDirSyncDrop()
+	fs9.Trigger("CompactionBegin")
+
+	if !fs9.PendingDirSyncDrop() || !fs9.IsTriggered() {
+		t.Fatalf("expected pendingDirSyncDrop and triggered to be true")
+	}
+
+	fs9.Reset()
+
+	if fs9.PendingDirSyncDrop() {
+		t.Errorf("expected PendingDirSyncDrop==false after Reset")
+	}
+	if fs9.IsTriggered() {
+		t.Errorf("expected IsTriggered==false after Reset")
+	}
+	if fs9.DirSyncCount() != 0 {
+		t.Errorf("expected DirSyncCount==0 after Reset, got %d", fs9.DirSyncCount())
+	}
+	if fs9.KDirSyncDropped() {
+		t.Errorf("expected KDirSyncDropped==false after Reset")
+	}
+}
+
+func TestParameterizedFaultIDs(t *testing.T) {
+	mem := vfs.NewCrashableMem()
+
+	tests := []struct {
+		inputID     string
+		wantCanonID string
+		wantXK      int
+		expectErr   bool
+	}{
+		// MUT-X1
+		{inputID: "MUT-X1_k2", wantCanonID: faults.MUTX1, wantXK: 2},
+		{inputID: "MUT-X1_k3", wantCanonID: faults.MUTX1, wantXK: 3},
+		{inputID: "MUT-X1_k4", wantCanonID: faults.MUTX1, wantXK: 4},
+		{inputID: "MUT-X1_k6", wantCanonID: faults.MUTX1, wantXK: 6},
+		{inputID: "MUT-X1_k9", wantCanonID: faults.MUTX1, wantXK: 9},
+		// MUT-X2
+		{inputID: "MUT-X2_k1", wantCanonID: faults.MUTX2, wantXK: 1},
+		{inputID: "MUT-X2_k3", wantCanonID: faults.MUTX2, wantXK: 3},
+		{inputID: "MUT-X2_k4", wantCanonID: faults.MUTX2, wantXK: 4},
+		{inputID: "MUT-X2_k5", wantCanonID: faults.MUTX2, wantXK: 5},
+		// MUT-X3
+		{inputID: "MUT-X3_k1", wantCanonID: faults.MUTX3, wantXK: 1},
+		{inputID: "MUT-X3_k2", wantCanonID: faults.MUTX3, wantXK: 2},
+		{inputID: "MUT-X3_k3", wantCanonID: faults.MUTX3, wantXK: 3},
+		// MUT-X4
+		{inputID: "MUT-X4_p04", wantCanonID: faults.MUTX4, wantXK: 0},
+		// MUT-X5
+		{inputID: "MUT-X5_p12", wantCanonID: faults.MUTX5, wantXK: 0},
+		// MUT-X6
+		{inputID: "MUT-X6_k2", wantCanonID: faults.MUTX6, wantXK: 2},
+		{inputID: "MUT-X6_k5", wantCanonID: faults.MUTX6, wantXK: 5},
+		{inputID: "MUT-X6_k9", wantCanonID: faults.MUTX6, wantXK: 9},
+		// Bare IDs (canonical)
+		{inputID: "MUT-X1", wantCanonID: faults.MUTX1, wantXK: 0},
+		{inputID: "MUT-X2", wantCanonID: faults.MUTX2, wantXK: 0},
+		{inputID: "MUT-X3", wantCanonID: faults.MUTX3, wantXK: 0},
+		{inputID: "MUT-X4", wantCanonID: faults.MUTX4, wantXK: 0},
+		{inputID: "MUT-X5", wantCanonID: faults.MUTX5, wantXK: 0},
+		{inputID: "MUT-X6", wantCanonID: faults.MUTX6, wantXK: 0},
+		// Invalid parameterized IDs
+		{inputID: "MUT-X1_k0", expectErr: true},
+		{inputID: "MUT-X1_k-1", expectErr: true},
+		{inputID: "MUT-X1_foo", expectErr: true},
+		{inputID: "MUT-X4_p05", expectErr: true},
+		{inputID: "MUT-X5_p25", expectErr: true},
+		{inputID: "MUT-X6_k0", expectErr: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.inputID, func(t *testing.T) {
+			norm, err := faults.NormalizeID(tc.inputID)
+			if tc.expectErr {
+				if err == nil {
+					t.Errorf("NormalizeID(%q): expected error, got nil (norm=%q)", tc.inputID, norm)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("NormalizeID(%q): unexpected error: %v", tc.inputID, err)
+			}
+			if norm != tc.wantCanonID {
+				t.Errorf("NormalizeID(%q): got %q, want %q", tc.inputID, norm, tc.wantCanonID)
+			}
+
+			cfg := faults.DefaultConfig(tc.inputID)
+			if cfg.ID != tc.wantCanonID {
+				t.Errorf("DefaultConfig(%q).ID: got %q, want %q", tc.inputID, cfg.ID, tc.wantCanonID)
+			}
+			if cfg.XK != tc.wantXK {
+				t.Errorf("DefaultConfig(%q).XK: got %d, want %d", tc.inputID, cfg.XK, tc.wantXK)
+			}
+
+			fs, err := faults.New(tc.inputID, mem)
+			if err != nil {
+				t.Fatalf("faults.New(%q): %v", tc.inputID, err)
+			}
+			if idGetter, ok := fs.(interface{ ID() string }); ok {
+				if idGetter.ID() != tc.wantCanonID {
+					t.Errorf("fs.ID(): got %q, want %q", idGetter.ID(), tc.wantCanonID)
+				}
+			}
+		})
+	}
+
+	// 2. Behavioral verification of XK on MUT-X1_k3 (drop strictly 3rd sync, not 2nd)
+	t.Run("Behavior_MUT-X1_k3", func(t *testing.T) {
+		fsObj, err := faults.New("MUT-X1_k3", mem)
+		if err != nil {
+			t.Fatalf("faults.New: %v", err)
+		}
+		fs := fsObj.(*faults.FS)
+		f, err := fs.Create("test.wal", "pebble-wal")
+		if err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		defer f.Close()
+
+		v := reflect.ValueOf(fs).Elem()
+		xDropped := func() bool { return v.FieldByName("xDropped").Bool() }
+
+		if err := f.Sync(); err != nil || xDropped() {
+			t.Fatalf("sync 1: unexpected drop or error: %v", err)
+		}
+		if err := f.Sync(); err != nil || xDropped() {
+			t.Fatalf("sync 2: unexpected drop or error: %v", err)
+		}
+		if err := f.Sync(); err != nil || !xDropped() {
+			t.Fatalf("sync 3: expected drop (xDropped=true), got false")
+		}
+	})
+
+	// 3. Behavioral verification of XK on MUT-X6_k3 (drop strictly 3rd write, not 2nd)
+	t.Run("Behavior_MUT-X6_k3", func(t *testing.T) {
+		fsObj, err := faults.New("MUT-X6_k3", mem)
+		if err != nil {
+			t.Fatalf("faults.New: %v", err)
+		}
+		fs := fsObj.(*faults.FS)
+		f, err := fs.Create("test.wal", "pebble-wal")
+		if err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		defer f.Close()
+
+		v := reflect.ValueOf(fs).Elem()
+		xDropped := func() bool { return v.FieldByName("xDropped").Bool() }
+
+		if _, err := f.Write([]byte("w1")); err != nil || xDropped() {
+			t.Fatalf("write 1: unexpected drop")
+		}
+		if _, err := f.Write([]byte("w2")); err != nil || xDropped() {
+			t.Fatalf("write 2: unexpected drop")
+		}
+		if _, err := f.Write([]byte("w3")); err != nil || !xDropped() {
+			t.Fatalf("write 3: expected drop, got false")
+		}
+	})
+
+	// 4. Behavioral verification of XK on MUT-X2_k3 (drop strictly 3rd manifest sync)
+	t.Run("Behavior_MUT-X2_k3", func(t *testing.T) {
+		fsObj, err := faults.New("MUT-X2_k3", mem)
+		if err != nil {
+			t.Fatalf("faults.New: %v", err)
+		}
+		fs := fsObj.(*faults.FS)
+		f, err := fs.Create("MANIFEST-000001", "pebble-manifest")
+		if err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		defer f.Close()
+
+		v := reflect.ValueOf(fs).Elem()
+		xDropped := func() bool { return v.FieldByName("xDropped").Bool() }
+
+		if err := f.Sync(); err != nil || xDropped() {
+			t.Fatalf("sync 1: unexpected drop or error: %v", err)
+		}
+		if err := f.Sync(); err != nil || xDropped() {
+			t.Fatalf("sync 2: unexpected drop or error: %v", err)
+		}
+		if err := f.Sync(); err != nil || !xDropped() {
+			t.Fatalf("sync 3: expected drop (xDropped=true), got false")
+		}
+	})
+
+	// 5. Behavioral verification of XK on MUT-X3_k2 (drop strictly 2nd flush sync)
+	t.Run("Behavior_MUT-X3_k2", func(t *testing.T) {
+		fsObj, err := faults.New("MUT-X3_k2", mem)
+		if err != nil {
+			t.Fatalf("faults.New: %v", err)
+		}
+		fs := fsObj.(*faults.FS)
+		f, err := fs.Create("000001.sst", "pebble-memtable-flush")
+		if err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		defer f.Close()
+
+		v := reflect.ValueOf(fs).Elem()
+		xDropped := func() bool { return v.FieldByName("xDropped").Bool() }
+
+		if err := f.Sync(); err != nil || xDropped() {
+			t.Fatalf("sync 1: unexpected drop or error: %v", err)
+		}
+		if err := f.Sync(); err != nil || !xDropped() {
+			t.Fatalf("sync 2: expected drop (xDropped=true), got false")
+		}
+	})
 }

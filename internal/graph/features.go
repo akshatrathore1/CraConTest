@@ -763,7 +763,7 @@ func ComputeContractFeaturesWithWeights(events []trace.Event, weights DCGWeights
 			if !f.isManifest || (f.dirtyBytes == 0 && f.dirEntrySynced) {
 				continue
 			}
-			// Case 1: Initial MANIFEST has 0 synced bytes on disk (uint64(f.size) == f.dirtyBytes, e.g. MUT-2).
+			// Case 1: Initial MANIFEST has 0 synced bytes on disk (uint64(f.size) == f.dirtyBytes).
 			// Once its directory entry is synced (exposing a 0-byte MANIFEST to Open) or a lifecycle boundary is crossed, it is corrupt.
 			if f.dirtyBytes > 0 && uint64(f.size) == f.dirtyBytes && (f.dirEntrySynced || isManifestBoundary) {
 				manifestDirtyUncommitted = true
@@ -775,7 +775,7 @@ func ComputeContractFeaturesWithWeights(events []trace.Event, weights DCGWeights
 				manifestDirtyUncommitted = true
 				break
 			}
-			// Case 3: Subsequent MANIFEST append where a valid synced prefix already exists on disk (uint64(f.size) > f.dirtyBytes, e.g. MUT-6).
+			// Case 3: Subsequent MANIFEST append where a valid synced prefix already exists on disk (uint64(f.size) > f.dirtyBytes).
 			// Reverting MANIFEST to its synced prefix is safe until an old WAL/SST is retired (ReuseForWrite/Remove),
 			// or a closed dirty WAL is followed by a subsequent WAL sync advancing the durability frontier, or MANIFEST is closed dirty.
 			if f.dirtyBytes > 0 && uint64(f.size) > f.dirtyBytes {

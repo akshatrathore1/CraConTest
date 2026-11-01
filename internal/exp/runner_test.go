@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -222,4 +223,32 @@ func TestRunExploreTimeoutHandling(t *testing.T) {
 	}
 	// If 1ns wasn't small enough on this fast machine, that's fine, but check no error.
 	t.Logf("Completed without timeout: outcome classes: %v, %v", res.Outcomes[0].Class, res.Outcomes[1].Class)
+}
+
+func TestRunExploreCorruptJournalReturnsError(t *testing.T) {
+	events, hist := runSmallWorkload(t, 10)
+	universe, err := candidate.Build(events, 42, []int{0, 100})
+	if err != nil {
+		t.Fatalf("candidate.Build: %v", err)
+	}
+
+	tmpDir := t.TempDir()
+	corruptJournal := filepath.Join(tmpDir, "corrupt.journal")
+	if err := os.WriteFile(corruptJournal, []byte("{invalid json line\n"), 0600); err != nil {
+		t.Fatalf("write corrupt journal: %v", err)
+	}
+
+	_, err = exp.RunExplore(exp.RunnerConfig{
+		Universe:    universe[:2],
+		Events:      events,
+		History:     hist,
+		JournalPath: corruptJournal,
+		Timeout:     3 * time.Second,
+	})
+	if err == nil {
+		t.Fatal("expected error from corrupt journal, got nil")
+	}
+	if !strings.Contains(err.Error(), "runner read journal") {
+		t.Fatalf("expected 'runner read journal' error, got: %v", err)
+	}
 }

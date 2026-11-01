@@ -2,6 +2,7 @@ package workload_test
 
 import (
 	"bytes"
+	"encoding/json"
 	"testing"
 
 	"github.com/akshatrathore1/CraConTest/internal/history"
@@ -216,5 +217,64 @@ func TestWorkloadCompactionPlanningAndExecution(t *testing.T) {
 	}
 	if err := history.Validate(correlated); err != nil {
 		t.Fatalf("correlated history.Validate: %v", err)
+	}
+}
+
+func TestConfigMaxManifestFileSize(t *testing.T) {
+	cfg := workload.DefaultConfig()
+	if cfg.MaxManifestFileSize != 0 {
+		t.Fatalf("expected default MaxManifestFileSize 0, got %d", cfg.MaxManifestFileSize)
+	}
+
+	cfg.MaxManifestFileSize = 1024 * 1024
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("json.Marshal failed: %v", err)
+	}
+
+	var parsed workload.Config
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		t.Fatalf("json.Unmarshal failed: %v", err)
+	}
+
+	if parsed.MaxManifestFileSize != 1024*1024 {
+		t.Fatalf("expected MaxManifestFileSize %d, got %d", 1024*1024, parsed.MaxManifestFileSize)
+	}
+}
+
+func TestWorkloadValidateAndPlanInvalidConfig(t *testing.T) {
+	valid := workload.DefaultConfig()
+	if err := workload.Validate(valid); err != nil {
+		t.Fatalf("expected valid default config, got: %v", err)
+	}
+
+	invalidConfigs := []struct {
+		name string
+		cfg  workload.Config
+	}{
+		{"zero operations", func() workload.Config { c := valid; c.Operations = 0; return c }()},
+		{"negative operations", func() workload.Config { c := valid; c.Operations = -5; return c }()},
+		{"zero key count", func() workload.Config { c := valid; c.KeyCount = 0; return c }()},
+		{"negative key count", func() workload.Config { c := valid; c.KeyCount = -1; return c }()},
+		{"zero value bytes", func() workload.Config { c := valid; c.ValueBytes = 0; return c }()},
+		{"negative value bytes", func() workload.Config { c := valid; c.ValueBytes = -10; return c }()},
+		{"negative sync every", func() workload.Config { c := valid; c.SyncEvery = -1; return c }()},
+		{"negative flush every", func() workload.Config { c := valid; c.FlushEvery = -1; return c }()},
+	}
+
+	for _, tc := range invalidConfigs {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := workload.Validate(tc.cfg); err == nil {
+				t.Fatalf("expected Validate to return error for %s", tc.name)
+			}
+			plan := workload.Plan(tc.cfg)
+			if plan != nil {
+				t.Fatalf("expected Plan to return nil for invalid config %s, got len %d", tc.name, len(plan))
+			}
+			_, err := workload.Run(nil, nil, tc.cfg)
+			if err == nil {
+				t.Fatalf("expected Run to return error for invalid config %s", tc.name)
+			}
+		})
 	}
 }

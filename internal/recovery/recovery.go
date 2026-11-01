@@ -87,6 +87,11 @@ func SafeOpen(fs vfs.FS, dir string, timeout time.Duration) OpenResult {
 		}
 		return OpenResult{DB: r.db}
 	case <-ctx.Done():
+		go func() {
+			if r := <-ch; r.db != nil {
+				_ = r.db.Close()
+			}
+		}()
 		return OpenResult{Timeout: true}
 	}
 }

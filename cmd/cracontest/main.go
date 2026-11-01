@@ -43,6 +43,7 @@ type RunMetadata struct {
 	GoVersion     string          `json:"go_version"`
 	GOOS          string          `json:"goos"`
 	GOARCH        string          `json:"goarch"`
+	GitCommit     string          `json:"git_commit,omitempty"`
 }
 
 func main() {
@@ -103,8 +104,28 @@ func runRecord(args []string) error {
 	outDir := fs.String("out", "", "output run directory")
 	runDir := fs.String("run", "", "output run directory (alias for -out)")
 	faultID := fs.String("fault", faults.MUT0, "seeded fault ID: "+strings.Join(faults.IDs(), ", "))
+	policiesFlag := fs.String("policies", "0,100", "comma-separated retention percentages in 0..100")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+
+	var policies []int
+	for _, part := range strings.Split(*policiesFlag, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		p, err := strconv.Atoi(part)
+		if err != nil {
+			return fmt.Errorf("record: invalid policy %q: %w", part, err)
+		}
+		if p < 0 || p > 100 {
+			return fmt.Errorf("record: invalid policy %q (must be 0..100)", part)
+		}
+		policies = append(policies, p)
+	}
+	if len(policies) == 0 {
+		return errors.New("record: at least one retention policy required")
 	}
 
 	targetDir := *outDir
@@ -148,6 +169,11 @@ func runRecord(args []string) error {
 		MemTableSize:                64 * 1024,
 		EventListener:               &listener,
 		DisableAutomaticCompactions: true,
+		L0CompactionThreshold:       1000,
+		L0StopWritesThreshold:       1000,
+	}
+	if cfg.MaxManifestFileSize > 0 {
+		opts.MaxManifestFileSize = cfg.MaxManifestFileSize
 	}
 
 	db, err := pebble.Open("db", opts)
@@ -183,12 +209,13 @@ func runRecord(args []string) error {
 		Timestamp:     time.Now().UTC().Format(time.RFC3339),
 		FaultID:       *faultID,
 		BaseSeed:      cfg.Seed,
-		Policies:      []int{0, 100},
+		Policies:      policies,
 		Workload:      cfg,
 		PebbleVersion: "v2.1.7",
 		GoVersion:     runtime.Version(),
 		GOOS:          runtime.GOOS,
 		GOARCH:        runtime.GOARCH,
+		GitCommit:     exp.CurrentGitCommit(),
 	}
 
 	// Write run.json
@@ -624,8 +651,11 @@ func runBenchmarkCmd(args []string) error {
 	seedsFlag := fs.String("seeds", "", "comma-separated workload seeds")
 	faultsFlag := fs.String("faults", "", "comma-separated fault IDs")
 	opsFlag := fs.Int("ops", 120, "operations per workload run")
+	policiesFlag := fs.String("policies", "", "comma-separated retention percentages (default: 0,100)")
+	maxManifestSizeFlag := fs.Int64("max-manifest-size", 0, "optional MaxManifestFileSize in bytes")
 	reportFlag := fs.String("report", "", "path to output empirical markdown report")
 	csvFlag := fs.String("csv", "", "optional path to output summary CSV")
+	perSeedCSVFlag := fs.String("per-seed-csv", "", "path for per-seed CSV output (default: results/benchmark_per_seed.csv for full matrix)")
 	controlFlag := fs.Bool("control", true, "run MUT-0 null control check")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -635,6 +665,29 @@ func runBenchmarkCmd(args []string) error {
 
 	cfg.Workload.Operations = *opsFlag
 	cfg.TrackMUT0 = *controlFlag
+
+	if *policiesFlag != "" {
+		var policies []int
+		for _, part := range strings.Split(*policiesFlag, ",") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			p, err := strconv.Atoi(part)
+			if err != nil || p < 0 || p > 100 {
+				return fmt.Errorf("invalid policy %q: must be integer in 0..100", part)
+			}
+			policies = append(policies, p)
+		}
+		if len(policies) == 0 {
+			return errors.New("benchmark: at least one retention policy required when -policies specified")
+		}
+		cfg.Policies = policies
+	}
+
+	if *maxManifestSizeFlag > 0 {
+		cfg.Workload.MaxManifestFileSize = *maxManifestSizeFlag
+	}
 
 	if *seedsFlag != "" {
 		var seeds []uint64
@@ -669,6 +722,11 @@ func runBenchmarkCmd(args []string) error {
 		targetCSV = "results/benchmark_summary.csv"
 	}
 
+	targetPerSeedCSV := *perSeedCSVFlag
+	if targetPerSeedCSV == "" && *seedsFlag == "" && *faultsFlag == "" {
+		targetPerSeedCSV = "results/benchmark_per_seed.csv"
+	}
+
 	fmt.Printf("Starting Multi-Seed Benchmark across %d seeds and %d faults (%d ops/run)...\n",
 		len(cfg.WorkloadSeeds), len(cfg.FaultIDs), cfg.Workload.Operations)
 
@@ -697,6 +755,16 @@ func runBenchmarkCmd(args []string) error {
 			return fmt.Errorf("write csv: %w", err)
 		}
 		fmt.Printf("Generated summary CSV -> %s\n", targetCSV)
+	}
+
+	if targetPerSeedCSV != "" {
+		if err := os.MkdirAll(filepath.Dir(targetPerSeedCSV), 0755); err != nil {
+			return fmt.Errorf("mkdir for per-seed csv: %w", err)
+		}
+		if err := exp.WriteMultiSeedPerSeedCSV(res, targetPerSeedCSV); err != nil {
+			return fmt.Errorf("write per-seed csv: %w", err)
+		}
+		fmt.Printf("Generated per-seed CSV -> %s\n", targetPerSeedCSV)
 	}
 
 	fmt.Printf("Benchmark completed successfully in %v.\n", res.TotalDuration)

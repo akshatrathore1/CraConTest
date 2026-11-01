@@ -103,9 +103,9 @@ func TestBuildRejects(test *testing.T) {
 	events := smallTrace()
 	for name, policies := range map[string][]int{
 		"empty":        {},
-		"intermediate": {0, 50},
 		"duplicate":    {0, 0},
 		"out of range": {101},
+		"negative":     {-1},
 	} {
 		if _, err := candidate.Build(events, 0, policies); err == nil {
 			test.Fatalf("%s policies accepted", name)
@@ -115,6 +115,33 @@ func TestBuildRejects(test *testing.T) {
 	broken[2].ID = 9
 	if _, err := candidate.Build(broken, 0, []int{0}); err == nil {
 		test.Fatal("invalid trace accepted")
+	}
+}
+
+func TestBuildIntermediate(test *testing.T) {
+	events := smallTrace()
+	universe, err := candidate.Build(events, 42, []int{0, 50, 100})
+	if err != nil {
+		test.Fatalf("Build failed: %v", err)
+	}
+	cuts, err := trace.CutIDs(events)
+	if err != nil {
+		test.Fatalf("CutIDs failed: %v", err)
+	}
+	if len(universe) != 3*len(cuts) {
+		test.Fatalf("universe size %d, want %d", len(universe), 3*len(cuts))
+	}
+	for index, item := range universe {
+		if index > 0 && !candidate.Less(universe[index-1], item) {
+			test.Fatalf("universe not in strict canonical order at index %d", index)
+		}
+		seed, err := candidate.DeriveSeed(42, item.Event, item.Percent)
+		if err != nil {
+			test.Fatalf("DeriveSeed failed: %v", err)
+		}
+		if item.Seed != seed {
+			test.Fatalf("seed mismatch at index %d: got %d, want %d", index, item.Seed, seed)
+		}
 	}
 }
 

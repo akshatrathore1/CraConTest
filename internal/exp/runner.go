@@ -3,6 +3,7 @@ package exp
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -173,14 +174,21 @@ func RunExplore(cfg RunnerConfig) (*ExploreResult, error) {
 
 	if cfg.JournalPath != "" {
 		// Read existing journal if present.
-		if f, err := os.Open(cfg.JournalPath); err == nil {
-			if pastOutcomes, err := ReadJournal(f); err == nil {
-				existingOutcomes = pastOutcomes
+		f, err := os.Open(cfg.JournalPath)
+		if err != nil {
+			if !errors.Is(err, os.ErrNotExist) {
+				return nil, err
 			}
+		} else {
+			pastOutcomes, err := ReadJournal(f)
 			_ = f.Close()
+			if err != nil {
+				return nil, fmt.Errorf("runner read journal: %w", err)
+			}
+			existingOutcomes = pastOutcomes
 		}
 
-		jf, err := os.OpenFile(cfg.JournalPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+		jf, err := os.OpenFile(cfg.JournalPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
 		if err != nil {
 			return nil, fmt.Errorf("runner open journal: %w", err)
 		}
@@ -216,11 +224,13 @@ func RunExplore(cfg RunnerConfig) (*ExploreResult, error) {
 
 		// Log started in journal.
 		if jw != nil {
-			_ = jw.writeRecord(JournalRecord{
+			if err := jw.writeRecord(JournalRecord{
 				Stage:     StageStarted,
 				Candidate: cand,
 				Time:      time.Now(),
-			})
+			}); err != nil {
+				return nil, fmt.Errorf("runner write journal: %w", err)
+			}
 		}
 
 		candStart := time.Now()
@@ -234,7 +244,9 @@ func RunExplore(cfg RunnerConfig) (*ExploreResult, error) {
 				Rule:      "missing_features",
 				Detail:    fmt.Sprintf("no write categories for cutoff %d", cand.Event),
 			}
-			finishCandidate(jw, cand, &terminalOutcome, &stageTimings, candStart, &outcomes, timingsMap, &summary)
+			if err := finishCandidate(jw, cand, &terminalOutcome, &stageTimings, candStart, &outcomes, timingsMap, &summary); err != nil {
+				return nil, fmt.Errorf("runner write journal: %w", err)
+			}
 			continue
 		}
 
@@ -259,7 +271,9 @@ func RunExplore(cfg RunnerConfig) (*ExploreResult, error) {
 				Rule:      "clone_failure",
 				Detail:    err.Error(),
 			}
-			finishCandidate(jw, cand, &terminalOutcome, &stageTimings, candStart, &outcomes, timingsMap, &summary)
+			if err := finishCandidate(jw, cand, &terminalOutcome, &stageTimings, candStart, &outcomes, timingsMap, &summary); err != nil {
+				return nil, fmt.Errorf("runner write journal: %w", err)
+			}
 			continue
 		}
 
@@ -274,7 +288,9 @@ func RunExplore(cfg RunnerConfig) (*ExploreResult, error) {
 				Class:     oracle.ClassHang,
 				Detail:    fmt.Sprintf("SafeOpen timeout after %v", timeout),
 			}
-			finishCandidate(jw, cand, &terminalOutcome, &stageTimings, candStart, &outcomes, timingsMap, &summary)
+			if err := finishCandidate(jw, cand, &terminalOutcome, &stageTimings, candStart, &outcomes, timingsMap, &summary); err != nil {
+				return nil, fmt.Errorf("runner write journal: %w", err)
+			}
 			continue
 		}
 
@@ -284,7 +300,9 @@ func RunExplore(cfg RunnerConfig) (*ExploreResult, error) {
 				Class:     oracle.ClassPanic,
 				Detail:    openRes.Panic,
 			}
-			finishCandidate(jw, cand, &terminalOutcome, &stageTimings, candStart, &outcomes, timingsMap, &summary)
+			if err := finishCandidate(jw, cand, &terminalOutcome, &stageTimings, candStart, &outcomes, timingsMap, &summary); err != nil {
+				return nil, fmt.Errorf("runner write journal: %w", err)
+			}
 			continue
 		}
 
@@ -294,7 +312,9 @@ func RunExplore(cfg RunnerConfig) (*ExploreResult, error) {
 				Class:     oracle.ClassOpenError,
 				Detail:    openRes.Err.Error(),
 			}
-			finishCandidate(jw, cand, &terminalOutcome, &stageTimings, candStart, &outcomes, timingsMap, &summary)
+			if err := finishCandidate(jw, cand, &terminalOutcome, &stageTimings, candStart, &outcomes, timingsMap, &summary); err != nil {
+				return nil, fmt.Errorf("runner write journal: %w", err)
+			}
 			continue
 		}
 
@@ -304,7 +324,9 @@ func RunExplore(cfg RunnerConfig) (*ExploreResult, error) {
 				Class:     oracle.ClassOpenError,
 				Detail:    "SafeOpen returned nil DB",
 			}
-			finishCandidate(jw, cand, &terminalOutcome, &stageTimings, candStart, &outcomes, timingsMap, &summary)
+			if err := finishCandidate(jw, cand, &terminalOutcome, &stageTimings, candStart, &outcomes, timingsMap, &summary); err != nil {
+				return nil, fmt.Errorf("runner write journal: %w", err)
+			}
 			continue
 		}
 
@@ -320,7 +342,9 @@ func RunExplore(cfg RunnerConfig) (*ExploreResult, error) {
 				Signature: oracle.FormatSignature("structural", "unknown", cutCategories),
 				Detail:    err.Error(),
 			}
-			finishCandidate(jw, cand, &terminalOutcome, &stageTimings, candStart, &outcomes, timingsMap, &summary)
+			if err := finishCandidate(jw, cand, &terminalOutcome, &stageTimings, candStart, &outcomes, timingsMap, &summary); err != nil {
+				return nil, fmt.Errorf("runner write journal: %w", err)
+			}
 			continue
 		}
 
@@ -333,7 +357,9 @@ func RunExplore(cfg RunnerConfig) (*ExploreResult, error) {
 				Class:     oracle.ClassOpenError,
 				Detail:    fmt.Sprintf("DumpContents: %v", err),
 			}
-			finishCandidate(jw, cand, &terminalOutcome, &stageTimings, candStart, &outcomes, timingsMap, &summary)
+			if err := finishCandidate(jw, cand, &terminalOutcome, &stageTimings, candStart, &outcomes, timingsMap, &summary); err != nil {
+				return nil, fmt.Errorf("runner write journal: %w", err)
+			}
 			continue
 		}
 
@@ -348,7 +374,9 @@ func RunExplore(cfg RunnerConfig) (*ExploreResult, error) {
 		})
 		stageTimings.Oracle = time.Since(startOracle)
 
-		finishCandidate(jw, cand, &terminalOutcome, &stageTimings, candStart, &outcomes, timingsMap, &summary)
+		if err := finishCandidate(jw, cand, &terminalOutcome, &stageTimings, candStart, &outcomes, timingsMap, &summary); err != nil {
+			return nil, fmt.Errorf("runner write journal: %w", err)
+		}
 	}
 
 	summary.TotalTime = time.Since(totalStart)
@@ -368,23 +396,26 @@ func finishCandidate(
 	outcomes *[]oracle.Outcome,
 	timingsMap map[candidate.Candidate]StageTimings,
 	summary *RunSummary,
-) {
+) error {
 	timings.Total = time.Since(candStart)
 	outcome.Candidate = cand
 
 	if jw != nil {
-		_ = jw.writeRecord(JournalRecord{
+		if err := jw.writeRecord(JournalRecord{
 			Stage:     StageFinished,
 			Candidate: cand,
 			Outcome:   outcome,
 			Timings:   timings,
 			Time:      time.Now(),
-		})
+		}); err != nil {
+			return err
+		}
 	}
 
 	*outcomes = append(*outcomes, *outcome)
 	timingsMap[cand] = *timings
 	updateSummary(summary, outcome.Class)
+	return nil
 }
 
 func updateSummary(summary *RunSummary, class oracle.Class) {

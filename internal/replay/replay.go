@@ -71,10 +71,10 @@ func (s *State) Advance(cut uint64) error {
 }
 
 // Clone clones the filesystem using CrashClone with the given unsynced retention
-// percentage (0 or 100) and RNG seed. Outstanding handles remain open during clone.
+// percentage (0..100) and RNG seed. Outstanding handles remain open during clone.
 func (s *State) Clone(percent int, seed uint64) (vfs.FS, error) {
-	if percent != 0 && percent != 100 {
-		return nil, fmt.Errorf("replay: unsupported retention policy %d (only 0 and 100)", percent)
+	if percent < 0 || percent > 100 {
+		return nil, fmt.Errorf("replay: retention percent %d outside 0..100", percent)
 	}
 
 	rng := rand.New(rand.NewPCG(0, seed))

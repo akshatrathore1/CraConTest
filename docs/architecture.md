@@ -149,6 +149,8 @@ counts against seeded faults.
 - Overhead breakdown: ranking time, replay+clone time, recovery+check time.
 - Recall (fraction of seeded faults detected) and false-positive count.
 - Discovery CSVs and SVG plots, written by `cracontest evaluate -discovery <csv> -plot <svg>`.
+- Multi-seed benchmark metrics (`results/benchmark_summary.csv` and `results/benchmark_per_seed.csv`).
+- Paired statistical analysis computed via `py -3.12 analysis/paired_stats.py results/benchmark_per_seed.csv "Seeded Benchmark Faults (32 seeds)" MUT-1 MUT-2 MUT-3 MUT-4 MUT-5 MUT-6 MUT-8 MUT-9`.
 
 ## Cost Model
 
@@ -188,10 +190,13 @@ CraConTest/
 │   ├── history/          # Client-visible operation ledger
 │   ├── oracle/           # Consistency rules and outcomes
 │   └── exp/              # Run specs, journal, evaluator, and multi-seed benchmark runner
+├── analysis/             # Statistical comparison scripts and dependencies
+│   ├── paired_stats.py   # Paired per-seed Wilcoxon & t-test analysis
+│   └── requirements.txt  # Python dependencies (scipy)
 ├── experiments/configs/  # Workload specifications (main.json, smoke.json)
-├── results/              # Stored run directories, discovery CSVs and plots
+├── results/              # Stored run directories, discovery CSVs, benchmark_per_seed.csv, and plots
 ├── docs/                 # This document and others
-└── paper/                # Publication materials
+└── paper/                # Publication materials (ADR 2026-10-27-a-paper-directory-policy: gitkeep only)
 ```
 
 ### Import Rules

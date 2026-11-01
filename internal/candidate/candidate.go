@@ -75,16 +75,16 @@ func DeriveSeed(base, event uint64, percent int) (uint64, error) {
 }
 
 // Build returns the canonical universe for a trace: every cutoff chosen by
-// trace.CutIDs combined with every policy, one derived seed per tuple. The
-// initial execution profile accepts only the endpoint policies 0 and 100.
+// trace.CutIDs combined with every policy, one derived seed per tuple. Any
+// retention policy in 0..100 is supported.
 func Build(events []trace.Event, base uint64, policies []int) ([]Candidate, error) {
 	if len(policies) == 0 {
 		return nil, errors.New("candidate: no retention policies")
 	}
 	seen := make(map[int]bool, len(policies))
 	for _, policy := range policies {
-		if policy != 0 && policy != 100 {
-			return nil, fmt.Errorf("candidate: unsupported execution policy %d (only 0 and 100)", policy)
+		if policy < 0 || policy > 100 {
+			return nil, fmt.Errorf("candidate: percent %d outside 0..100", policy)
 		}
 		if seen[policy] {
 			return nil, fmt.Errorf("candidate: duplicate policy %d", policy)

@@ -15,13 +15,14 @@ import (
 
 // Config specifies the configuration for deterministic workload execution.
 type Config struct {
-	Seed       uint64 `json:"seed"`
-	Operations int    `json:"operations"`
-	KeyCount   int    `json:"key_count"`
-	ValueBytes int    `json:"value_bytes"`
-	SyncEvery  int    `json:"sync_every"`
-	FlushEvery int    `json:"flush_every"`
-	CompactAt  int    `json:"compact_at,omitempty"`
+	Seed                uint64 `json:"seed"`
+	Operations          int    `json:"operations"`
+	KeyCount            int    `json:"key_count"`
+	ValueBytes          int    `json:"value_bytes"`
+	SyncEvery           int    `json:"sync_every"`
+	FlushEvery          int    `json:"flush_every"`
+	CompactAt           int    `json:"compact_at,omitempty"`
+	MaxManifestFileSize int64  `json:"max_manifest_file_size,omitempty"`
 }
 
 // DefaultConfig returns the frozen initial driver configuration (Target C2).
@@ -34,6 +35,26 @@ func DefaultConfig() Config {
 		SyncEvery:  10,
 		FlushEvery: 100,
 	}
+}
+
+// Validate verifies that cfg contains valid operational parameters.
+func Validate(cfg Config) error {
+	if cfg.Operations <= 0 {
+		return fmt.Errorf("operations must be > 0, got %d", cfg.Operations)
+	}
+	if cfg.KeyCount <= 0 {
+		return fmt.Errorf("key_count must be > 0, got %d", cfg.KeyCount)
+	}
+	if cfg.ValueBytes <= 0 {
+		return fmt.Errorf("value_bytes must be > 0, got %d", cfg.ValueBytes)
+	}
+	if cfg.SyncEvery < 0 {
+		return fmt.Errorf("sync_every must be >= 0, got %d", cfg.SyncEvery)
+	}
+	if cfg.FlushEvery < 0 {
+		return fmt.Errorf("flush_every must be >= 0, got %d", cfg.FlushEvery)
+	}
+	return nil
 }
 
 // Marker defines the callback boundary used to log client operation boundaries.
@@ -73,6 +94,9 @@ func makeValue(rng *rand.Rand, size int, tag string) []byte {
 
 // Plan generates the deterministic sequence of operations for cfg.
 func Plan(cfg Config) []PlanOperation {
+	if err := Validate(cfg); err != nil {
+		return nil
+	}
 	rng := rand.New(rand.NewPCG(0, cfg.Seed))
 	var plan []PlanOperation
 	var opID uint64
@@ -195,6 +219,9 @@ func Plan(cfg Config) []PlanOperation {
 // Run executes the planned workload on db, calling marker methods around each
 // operation, and returns the verified history ledger.
 func Run(db *pebble.DB, marker Marker, cfg Config) ([]history.Entry, error) {
+	if err := Validate(cfg); err != nil {
+		return nil, fmt.Errorf("workload validate config: %w", err)
+	}
 	plan := Plan(cfg)
 	historyEntries := make([]history.Entry, 0, len(plan))
 

@@ -6,6 +6,7 @@ import (
 	"math"
 	"math/rand/v2"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -247,9 +248,15 @@ func WriteMultiSeedCSV(res *BenchmarkResult, csvPath string) error {
 		"b_full_median", "b_full_mean",
 		"auc_norm_failures", "auc_norm_bugs",
 		"theoretical_expectation_mean",
+		"git_commit",
 	}
 	if err := w.Write(header); err != nil {
 		return err
+	}
+
+	gitCommit := res.GitCommit
+	if gitCommit == "" {
+		gitCommit = "unknown"
 	}
 
 	faultOrder := []string{
@@ -258,9 +265,22 @@ func WriteMultiSeedCSV(res *BenchmarkResult, csvPath string) error {
 		faults.MUT9,
 	}
 
+	seenFaults := make(map[string]bool)
+	for _, fid := range faultOrder {
+		seenFaults[fid] = true
+	}
+	var extraFaults []string
+	for fid := range res.FaultSummaries {
+		if !seenFaults[fid] {
+			extraFaults = append(extraFaults, fid)
+		}
+	}
+	sort.Strings(extraFaults)
+	allFaults := append(faultOrder, extraFaults...)
+
 	stratOrder := []string{"dcg", "dcg-flag-only", "r2", "r1", "b6", "b0", "b7", "b5", "b4", "b1", "b2", "b3"}
 
-	for _, fid := range faultOrder {
+	for _, fid := range allFaults {
 		summ, ok := res.FaultSummaries[fid]
 		if !ok {
 			continue
@@ -308,6 +328,7 @@ func WriteMultiSeedCSV(res *BenchmarkResult, csvPath string) error {
 				fmt.Sprintf("%.4f", s.AUCNormFailuresMean),
 				fmt.Sprintf("%.4f", s.AUCNormBugsMean),
 				fmt.Sprintf("%.2f", theoMean),
+				gitCommit,
 			}
 			if err := w.Write(row); err != nil {
 				return err
@@ -322,12 +343,22 @@ func WriteMultiSeedCSV(res *BenchmarkResult, csvPath string) error {
 func GenerateMultiSeedReportMarkdown(res *BenchmarkResult) string {
 	var sb strings.Builder
 
+	dateStr := res.Timestamp
+	if len(dateStr) >= 10 {
+		dateStr = dateStr[:10]
+	}
+	commit := res.GitCommit
+	if commit == "" {
+		commit = "unknown"
+	}
+
 	sb.WriteString("# CraConTest: Multi-Seed Evaluation Across Fault Models\n\n")
-	sb.WriteString(fmt.Sprintf("**Date:** %s  \n", res.Timestamp[:10]))
+	sb.WriteString(fmt.Sprintf("**Date:** %s  \n", dateStr))
+	sb.WriteString(fmt.Sprintf("**Git Commit:** `%s`  \n", commit))
 	sb.WriteString(fmt.Sprintf("**Evaluation Engine:** CockroachDB Pebble v2.1.7 (Go runtime: %s)  \n", time.Now().UTC().Format(time.RFC3339)))
 	sb.WriteString(fmt.Sprintf("**Workload Seeds (%d):** `%v`  \n", len(res.Config.WorkloadSeeds), res.Config.WorkloadSeeds))
 	sb.WriteString(fmt.Sprintf("**Execution Time:** %.2f seconds total  \n", res.TotalDuration.Seconds()))
-	sb.WriteString(fmt.Sprintf("**Null Control (MUT-0):** %d false alarms across all %d seeds (100%% oracle accuracy)  \n\n",
+	sb.WriteString(fmt.Sprintf("**Null Control (MUT-0):** %d false alarms across all %d seeds at 0%%/100%% retention  \n\n",
 		res.MUT0Violations, len(res.Config.WorkloadSeeds)))
 	sb.WriteString("---\n\n")
 
@@ -369,7 +400,7 @@ func GenerateMultiSeedReportMarkdown(res *BenchmarkResult) string {
 		sb.WriteString("**Evaluation metrics detailed below.**\n\n")
 	}
 
-	sb.WriteString(fmt.Sprintf("- **Control Invariance (MUT-0):** %d false alarms across all %d workload seeds (100.0%% oracle precision).\n",
+	sb.WriteString(fmt.Sprintf("- **Control Invariance (MUT-0):** %d false alarms across all %d seeds at 0%%/100%% retention.\n",
 		res.MUT0Violations, len(res.Config.WorkloadSeeds)))
 
 	// MUT-8 post-compaction sync evaluation
@@ -409,10 +440,10 @@ func GenerateMultiSeedReportMarkdown(res *BenchmarkResult) string {
 	sb.WriteString("| **MUT-9** | Dense ($k=1$) / Sparse ($k \\ge 7$) | Single $k$-th directory sync drop ($k=1$ default; $k \\in \\{7,9,10,12\\}$ sparse) | `v1:violation:durably_committed:lost_files` | ~41.4% ($k=1$) |\n\n")
 
 	sb.WriteString("### 2.3 Evaluated Ranking Strategies\n\n")
-	sb.WriteString("1. **DCG (Durability-Contract Guided / B8):** Prioritizes concrete durability contract violations (dangling table references, uncommitted directory renames, dropped WAL sync records) before exploring uncontracted state representatives.\n")
-	sb.WriteString("2. **DCG-FlagOnly (Contract-Flag Ablation):** Partitions candidate space strictly by contract violation flags without secondary scoring heuristics.\n")
+	sb.WriteString("1. **DCG (Durability-Contract Guided / B8):** Trace-derived durability-contract analysis that prioritizes concrete durability contract violations (dangling table references, uncommitted directory renames, dropped WAL sync records) before exploring uncontracted state representatives.\n")
+	sb.WriteString("2. **DCG-FlagOnly (Contract-Flag Ablation):** Partitions candidate space strictly by contract violation flags without secondary scoring heuristics. DCG-FlagOnly ties full DCG on nearly every setting, showing that the binary durability-contract flags combined with StateKey equivalence partitioning drive the speedup.\n")
 	sb.WriteString("3. **RHG (Reachability-Hazard Guided / B7):** Scores cutoffs by reachable uncommitted mutations and hazard surfaces.\n")
-	sb.WriteString("4. **R2 (State-Representative R1):** Partitions 0% retention candidates into equivalence classes by canonical `StateKey`, selects one representative candidate per distinct persistence state, and shuffles representatives before testing redundant cutoffs.\n")
+	sb.WriteString("4. **R2 (State-Representative Random):** Partitions 0% retention candidates into equivalence classes by canonical `StateKey`, selects boundary-adjacent representatives within each `StateKey` class using graph features (`BeforeBoundary`, `SemanticTier`, `Desc`) before shuffling classes, and tests redundant cutoffs afterward.\n")
 	sb.WriteString("5. **R1 (0%-Retention-First Random):** Partitions universe into 0% unsynced data retention and 100% retention; evaluates 0% retention first in pure random order.\n")
 	sb.WriteString("6. **LIFO (Recent-First):** Prioritizes the most recent crash cutoffs in reverse trace order.\n")
 	sb.WriteString("7. **B6 (Sync-Boundary):** Boundary-adjacent candidate prioritization.\n")
@@ -574,4 +605,153 @@ func getMultiSeedFaultIndex(fid string) int {
 func WriteMultiSeedReportToFile(res *BenchmarkResult, targetPath string) error {
 	content := GenerateMultiSeedReportMarkdown(res)
 	return os.WriteFile(targetPath, []byte(content), 0644)
+}
+
+// WriteMultiSeedPerSeedCSV exports unaggregated per-seed discovery metrics for all evaluated strategies.
+func WriteMultiSeedPerSeedCSV(res *BenchmarkResult, csvPath string) error {
+	if err := os.MkdirAll(filepath.Dir(csvPath), 0755); err != nil {
+		return err
+	}
+	f, err := os.Create(csvPath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	w := csv.NewWriter(f)
+	defer w.Flush()
+
+	header := []string{
+		"fault_id", "seed", "universe_size", "total_failures", "fault_density_pct",
+		"strategy_code", "strategy", "k1_single", "s25_single",
+		"k1_failure_mean", "s25_mean", "s100_mean", "b_full_mean",
+		"auc_norm_failures", "auc_norm_bugs", "git_commit",
+	}
+	if err := w.Write(header); err != nil {
+		return err
+	}
+
+	gitCommit := res.GitCommit
+	if gitCommit == "" {
+		gitCommit = "unknown"
+	}
+
+	faultOrder := []string{
+		faults.MUT1, faults.MUT2, faults.MUT3, faults.MUT4,
+		faults.MUT5, faults.MUT6, faults.MUT7, faults.MUT8,
+		faults.MUT9,
+	}
+
+	seenFaults := make(map[string]bool)
+	for _, fid := range faultOrder {
+		seenFaults[fid] = true
+	}
+	var extraFaults []string
+	for fid := range res.FaultSummaries {
+		if !seenFaults[fid] {
+			extraFaults = append(extraFaults, fid)
+		}
+	}
+	sort.Strings(extraFaults)
+	allFaults := append(faultOrder, extraFaults...)
+
+	stratOrder := []string{"dcg", "dcg-flag-only", "r2", "r1", "b6", "b0", "b7", "b5", "b4", "b1", "b2", "b3"}
+
+	for _, fid := range allFaults {
+		summ, ok := res.FaultSummaries[fid]
+		if !ok || len(summ.Runs) == 0 {
+			continue
+		}
+
+		for _, r := range summ.Runs {
+			densPct := 0.0
+			if r.UniverseSize > 0 {
+				densPct = float64(r.TotalFailures) / float64(r.UniverseSize) * 100.0
+			}
+
+			stratKeysSeen := make(map[string]bool)
+			for _, code := range stratOrder {
+				stratKeysSeen[code] = true
+				if code == "b0" {
+					row := []string{
+						fid,
+						fmt.Sprintf("%d", r.Seed),
+						fmt.Sprintf("%d", r.UniverseSize),
+						fmt.Sprintf("%d", r.TotalFailures),
+						fmt.Sprintf("%.2f", densPct),
+						"b0",
+						"Uniform Random (B0)",
+						fmt.Sprintf("%d", r.B0.K1SingleSeed),
+						fmt.Sprintf("%d", r.B0.S25SingleSeed),
+						fmt.Sprintf("%.2f", r.B0.K1FailureMedian),
+						fmt.Sprintf("%.2f", r.B0.S25Median),
+						fmt.Sprintf("%.2f", r.B0.S100Median),
+						fmt.Sprintf("%.2f", r.B0.BFullMedian),
+						fmt.Sprintf("%.4f", r.B0.AUCNormFailures),
+						fmt.Sprintf("%.4f", r.B0.AUCNormBugs),
+						gitCommit,
+					}
+					if err := w.Write(row); err != nil {
+						return err
+					}
+				} else if m, exists := r.Strategies[code]; exists {
+					row := []string{
+						fid,
+						fmt.Sprintf("%d", r.Seed),
+						fmt.Sprintf("%d", r.UniverseSize),
+						fmt.Sprintf("%d", r.TotalFailures),
+						fmt.Sprintf("%.2f", densPct),
+						code,
+						m.StrategyName,
+						fmt.Sprintf("%d", m.K1SingleSeed),
+						fmt.Sprintf("%d", m.S25SingleSeed),
+						fmt.Sprintf("%.2f", m.K1FailureFloat),
+						fmt.Sprintf("%.2f", m.S25Float),
+						fmt.Sprintf("%.2f", m.S100Float),
+						fmt.Sprintf("%.2f", m.BFullFloat),
+						fmt.Sprintf("%.4f", m.AUCNormFailures),
+						fmt.Sprintf("%.4f", m.AUCNormBugs),
+						gitCommit,
+					}
+					if err := w.Write(row); err != nil {
+						return err
+					}
+				}
+			}
+
+			var extraCodes []string
+			for code := range r.Strategies {
+				if !stratKeysSeen[code] {
+					extraCodes = append(extraCodes, code)
+				}
+			}
+			sort.Strings(extraCodes)
+			for _, code := range extraCodes {
+				m := r.Strategies[code]
+				row := []string{
+					fid,
+					fmt.Sprintf("%d", r.Seed),
+					fmt.Sprintf("%d", r.UniverseSize),
+					fmt.Sprintf("%d", r.TotalFailures),
+					fmt.Sprintf("%.2f", densPct),
+					code,
+					m.StrategyName,
+					fmt.Sprintf("%d", m.K1SingleSeed),
+					fmt.Sprintf("%d", m.S25SingleSeed),
+					fmt.Sprintf("%.2f", m.K1FailureFloat),
+					fmt.Sprintf("%.2f", m.S25Float),
+					fmt.Sprintf("%.2f", m.S100Float),
+					fmt.Sprintf("%.2f", m.BFullFloat),
+					fmt.Sprintf("%.4f", m.AUCNormFailures),
+					fmt.Sprintf("%.4f", m.AUCNormBugs),
+					gitCommit,
+				}
+				if err := w.Write(row); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	return nil
 }

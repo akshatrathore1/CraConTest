@@ -2,6 +2,7 @@ package recovery_test
 
 import (
 	"fmt"
+	"io"
 	"math/rand/v2"
 	"testing"
 	"time"
@@ -298,4 +299,92 @@ func TestCrashCycleManyOperations(t *testing.T) {
 	if len(contents) != 100 {
 		t.Errorf("expected 100 keys, got %d", len(contents))
 	}
+}
+
+type blockingFS struct {
+	vfs.FS
+	delayChan  chan struct{}
+	lockClosed chan struct{}
+}
+
+func (b *blockingFS) List(dir string) ([]string, error) {
+	if b.delayChan != nil {
+		<-b.delayChan
+	}
+	return b.FS.List(dir)
+}
+
+func (b *blockingFS) Lock(name string) (io.Closer, error) {
+	closer, err := b.FS.Lock(name)
+	if err != nil {
+		return nil, err
+	}
+	return &lockCloserWrapper{
+		Closer: closer,
+		onClose: func() {
+			if b.lockClosed != nil {
+				close(b.lockClosed)
+			}
+		},
+	}, nil
+}
+
+type lockCloserWrapper struct {
+	io.Closer
+	onClose func()
+}
+
+func (l *lockCloserWrapper) Close() error {
+	err := l.Closer.Close()
+	if l.onClose != nil {
+		l.onClose()
+		l.onClose = nil
+	}
+	return err
+}
+
+func TestSafeOpenTimeoutClosesLateDB(t *testing.T) {
+	memFS := vfs.NewCrashableMem()
+	opts := &pebble.Options{
+		FS:     memFS,
+		Logger: recovery.PanicLogger{},
+	}
+	db, err := pebble.Open("testdb", opts)
+	if err != nil {
+		t.Fatalf("setup open: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("setup close: %v", err)
+	}
+
+	delayChan := make(chan struct{})
+	lockClosed := make(chan struct{})
+
+	bfs := &blockingFS{
+		FS:         memFS,
+		delayChan:  delayChan,
+		lockClosed: lockClosed,
+	}
+
+	res := recovery.SafeOpen(bfs, "testdb", 20*time.Millisecond)
+	if !res.Timeout {
+		t.Fatalf("expected SafeOpen to timeout, got %+v", res)
+	}
+
+	// Unblock pebble.Open now.
+	close(delayChan)
+
+	select {
+	case <-lockClosed:
+		// Late DB was closed by the cleanup goroutine!
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for late pebble.DB to be closed by SafeOpen cleanup goroutine")
+	}
+
+	// Reopening testdb should succeed because the lock was released on close.
+	db2, err := pebble.Open("testdb", opts)
+	if err != nil {
+		t.Fatalf("re-open after cleanup failed: %v", err)
+	}
+	_ = db2.Close()
 }

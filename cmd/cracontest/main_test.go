@@ -163,3 +163,72 @@ func TestCLIBenchmarkCommand(t *testing.T) {
 		t.Errorf("expected summary csv at %s, stat failed: %v", csvPath, err)
 	}
 }
+
+func TestCLIRecordWithPolicies(t *testing.T) {
+	tempDir := t.TempDir()
+	runDir := filepath.Join(tempDir, "policy_run")
+
+	err := runRecord([]string{
+		"-out", runDir,
+		"-policies", "0,50,100",
+	})
+	if err != nil {
+		t.Fatalf("runRecord with policies failed: %v", err)
+	}
+
+	meta, _, _, err := loadRunData(runDir, false)
+	if err != nil {
+		t.Fatalf("loadRunData failed: %v", err)
+	}
+
+	expected := []int{0, 50, 100}
+	if len(meta.Policies) != len(expected) {
+		t.Fatalf("meta.Policies length: got %d, want %d", len(meta.Policies), len(expected))
+	}
+	for i, p := range expected {
+		if meta.Policies[i] != p {
+			t.Errorf("meta.Policies[%d]: got %d, want %d", i, meta.Policies[i], p)
+		}
+	}
+
+	// Test invalid policies return error
+	for _, invalid := range []string{"-1", "101", "abc", ""} {
+		err := runRecord([]string{
+			"-out", filepath.Join(tempDir, "err_run"),
+			"-policies", invalid,
+		})
+		if err == nil {
+			t.Errorf("expected error for -policies %q, got nil", invalid)
+		}
+	}
+}
+
+func TestCLIBenchmarkWithPoliciesAndManifestSize(t *testing.T) {
+	tempDir := t.TempDir()
+	repPath := filepath.Join(tempDir, "rep.md")
+	csvPath := filepath.Join(tempDir, "sum.csv")
+
+	err := runBenchmarkCmd([]string{
+		"-seeds", "42",
+		"-faults", "MUT-1",
+		"-ops", "20",
+		"-policies", "0,50,100",
+		"-max-manifest-size", "1048576",
+		"-report", repPath,
+		"-csv", csvPath,
+		"-control=false",
+	})
+	if err != nil {
+		t.Fatalf("runBenchmarkCmd with policies and manifest size failed: %v", err)
+	}
+
+	// Test invalid policies in benchmark returns error
+	err = runBenchmarkCmd([]string{
+		"-seeds", "42",
+		"-faults", "MUT-1",
+		"-policies", "150",
+	})
+	if err == nil {
+		t.Errorf("expected error for invalid benchmark -policies, got nil")
+	}
+}

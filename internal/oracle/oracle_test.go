@@ -150,3 +150,38 @@ func TestOracleTraceCrossReference(t *testing.T) {
 		t.Fatalf("expected oracle_error on marker mismatch, got %s", outcomeBad.Class)
 	}
 }
+
+func TestCheckRejectsOutOfRangeHistoryMarkers(t *testing.T) {
+	events := []trace.Event{
+		{ID: 1, Kind: trace.KindOpBegin, Op: 1, OpKind: "set"},
+		{ID: 2, Kind: trace.KindOpEnd, Op: 1, OpKind: "set"},
+	}
+
+	// Case 1: BeginEvent out of range
+	entryBadBegin := testEntry(1, 99, 2, true, "set", setMut("a", "A"))
+	ctxBegin := oracle.Context{
+		Candidate: candidate.Candidate{Event: 2, Percent: 100, Seed: 1},
+		History:   []history.Entry{entryBadBegin},
+		Events:    events,
+		Recovered: oracle.State{"a": "A"},
+	}
+	resBegin := oracle.Check(ctxBegin)
+	if resBegin.Class != oracle.ClassOracleError || resBegin.Rule != "invalid_history" {
+		t.Fatalf("expected ClassOracleError / invalid_history for out-of-range BeginEvent, got %s / %s (detail: %s)",
+			resBegin.Class, resBegin.Rule, resBegin.Detail)
+	}
+
+	// Case 2: EndEvent out of range
+	entryBadEnd := testEntry(1, 1, 99, true, "set", setMut("a", "A"))
+	ctxEnd := oracle.Context{
+		Candidate: candidate.Candidate{Event: 2, Percent: 100, Seed: 1},
+		History:   []history.Entry{entryBadEnd},
+		Events:    events,
+		Recovered: oracle.State{"a": "A"},
+	}
+	resEnd := oracle.Check(ctxEnd)
+	if resEnd.Class != oracle.ClassOracleError || resEnd.Rule != "invalid_history" {
+		t.Fatalf("expected ClassOracleError / invalid_history for out-of-range EndEvent, got %s / %s (detail: %s)",
+			resEnd.Class, resEnd.Rule, resEnd.Detail)
+	}
+}

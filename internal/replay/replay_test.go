@@ -382,7 +382,13 @@ func TestReplayUnsupportedPolicy(t *testing.T) {
 	}
 	defer state.Close()
 
-	if _, err := state.Clone(50, 1); err == nil {
-		t.Fatalf("expected error for 50%% retention, got nil")
+	for _, invalid := range []int{-1, 101} {
+		if _, err := state.Clone(invalid, 1); err == nil {
+			t.Fatalf("expected error for %d%% retention, got nil", invalid)
+		}
+	}
+
+	if _, err := state.Clone(50, 1); err != nil {
+		t.Fatalf("expected success for 50%% retention, got: %v", err)
 	}
 }

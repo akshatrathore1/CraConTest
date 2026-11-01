@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"os/exec"
 	"sort"
 	"strings"
 	"time"
@@ -73,10 +74,12 @@ type StrategyMetrics struct {
 	K1FailureFloat   float64 `json:"k1_failure_float,omitempty"`
 	K1Violation      int     `json:"k1_violation"` // 1-based index of first consistency violation
 	K1ViolationFloat float64 `json:"k1_violation_float,omitempty"`
+	K1SingleSeed     int     `json:"k1_single_seed,omitempty"`
 	BFull            int     `json:"b_full"` // budget required to discover all unique bug signatures
 	BFullFloat       float64 `json:"b_full_float,omitempty"`
 	S25              int     `json:"s25"` // distinct failing states discovered within 25 crashes
 	S25Float         float64 `json:"s25_float,omitempty"`
+	S25SingleSeed    int     `json:"s25_single_seed,omitempty"`
 	S100             int     `json:"s100"` // distinct failing states discovered within 100 crashes
 	S100Float        float64 `json:"s100_float,omitempty"`
 	Bugs100          int     `json:"bugs100"` // distinct bug signatures discovered within 100 crashes
@@ -93,12 +96,14 @@ type B0Metrics struct {
 	K1ViolationMedian float64 `json:"k1_violation_median"`
 	K1ViolationP10    float64 `json:"k1_violation_p10"`
 	K1ViolationP90    float64 `json:"k1_violation_p90"`
+	K1SingleSeed      int     `json:"k1_single_seed,omitempty"`
 	BFullMedian       float64 `json:"b_full_median"`
 	BFullP10          float64 `json:"b_full_p10"`
 	BFullP90          float64 `json:"b_full_p90"`
 	S25Median         float64 `json:"s25_median"`
 	S25P10            float64 `json:"s25_p10"`
 	S25P90            float64 `json:"s25_p90"`
+	S25SingleSeed     int     `json:"s25_single_seed,omitempty"`
 	S100Median        float64 `json:"s100_median"`
 	S100P10           float64 `json:"s100_p10"`
 	S100P90           float64 `json:"s100_p90"`
@@ -175,6 +180,7 @@ type FaultModelSummary struct {
 // BenchmarkResult encapsulates the complete multi-seed benchmarking results.
 type BenchmarkResult struct {
 	Timestamp      string                       `json:"timestamp"`
+	GitCommit      string                       `json:"git_commit,omitempty"`
 	Config         BenchmarkConfig              `json:"config"`
 	FaultSummaries map[string]FaultModelSummary `json:"fault_summaries"`
 	MUT0Violations int                          `json:"mut0_violations"`
@@ -350,6 +356,11 @@ func RunSingleSeedFault(seed uint64, faultID string, cfg BenchmarkConfig) (*Sing
 		EventListener:               &listener,
 		DisableAutomaticCompactions: true,
 		DisableTableStats:           true,
+		L0CompactionThreshold:       1000,
+		L0StopWritesThreshold:       1000,
+	}
+	if cfg.Workload.MaxManifestFileSize > 0 {
+		opts.MaxManifestFileSize = cfg.Workload.MaxManifestFileSize
 	}
 
 	db, err := pebble.Open("db", opts)
@@ -534,6 +545,7 @@ func RunSingleSeedFault(seed uint64, faultID string, cfg BenchmarkConfig) (*Sing
 		}
 	}
 
+	rankedSingleB0 := strategy.NewRandom(seed).Rank(view, universe)
 	b0Metrics := B0Metrics{
 		K1FailureMedian:   percentile(k1Fails, 50),
 		K1FailureP10:      percentile(k1Fails, 10),
@@ -541,12 +553,14 @@ func RunSingleSeedFault(seed uint64, faultID string, cfg BenchmarkConfig) (*Sing
 		K1ViolationMedian: percentile(k1Viols, 50),
 		K1ViolationP10:    percentile(k1Viols, 10),
 		K1ViolationP90:    percentile(k1Viols, 90),
+		K1SingleSeed:      CalculateK1(rankedSingleB0, normOutcomes, false),
 		BFullMedian:       percentile(bFulls, 50),
 		BFullP10:          percentile(bFulls, 10),
 		BFullP90:          percentile(bFulls, 90),
 		S25Median:         percentile(s25Fails, 50),
 		S25P10:            percentile(s25Fails, 10),
 		S25P90:            percentile(s25Fails, 90),
+		S25SingleSeed:     CalculateS25(rankedSingleB0, normOutcomes, view),
 		S100Median:        percentile(s100Fails, 50),
 		S100P10:           percentile(s100Fails, 10),
 		S100P90:           percentile(s100Fails, 90),
@@ -609,10 +623,12 @@ func RunSingleSeedFault(seed uint64, faultID string, cfg BenchmarkConfig) (*Sing
 			K1FailureFloat:   float64(k1F),
 			K1Violation:      k1V,
 			K1ViolationFloat: float64(k1V),
+			K1SingleSeed:     k1F,
 			BFull:            bf,
 			BFullFloat:       float64(bf),
 			S25:              s25,
 			S25Float:         float64(s25),
+			S25SingleSeed:    s25,
 			S100:             s100,
 			S100Float:        float64(s100),
 			Bugs100:          b100,
@@ -703,16 +719,22 @@ func RunSingleSeedFault(seed uint64, faultID string, cfg BenchmarkConfig) (*Sing
 		meanS100 /= float64(numShuffle)
 		meanB100 /= float64(numShuffle)
 
+		rankedSingle := makeStrat(seed).Rank(view, universe)
+		k1Single := CalculateK1(rankedSingle, normOutcomes, false)
+		s25Single := CalculateS25(rankedSingle, normOutcomes, view)
+
 		stratMap[code] = StrategyMetrics{
 			StrategyName:     makeStrat(seed).Name(),
 			K1Failure:        int(math.Round(percentile(rK1Fails, 50))),
 			K1FailureFloat:   meanK1F,
 			K1Violation:      int(math.Round(percentile(rK1Viols, 50))),
 			K1ViolationFloat: meanK1V,
+			K1SingleSeed:     k1Single,
 			BFull:            int(math.Round(percentile(rBFulls, 50))),
 			BFullFloat:       meanBF,
 			S25:              int(math.Round(percentile(rS25s, 50))),
 			S25Float:         meanS25,
+			S25SingleSeed:    s25Single,
 			S100:             int(math.Round(percentile(rS100s, 50))),
 			S100Float:        meanS100,
 			Bugs100:          int(math.Round(percentile(rB100s, 50))),
@@ -754,6 +776,28 @@ func RunSingleSeedFault(seed uint64, faultID string, cfg BenchmarkConfig) (*Sing
 		Strategies:             stratMap,
 		ElapsedTime:            time.Since(start),
 	}, nil
+}
+
+// CurrentGitCommit returns the 12-character short git commit hash of HEAD, or "unknown".
+func CurrentGitCommit() string {
+	cmd := exec.Command("git", "rev-parse", "--short=12", "HEAD")
+	out, err := cmd.Output()
+	if err == nil {
+		s := strings.TrimSpace(string(out))
+		if s != "" {
+			return s
+		}
+	}
+	// Fallback to checking within CraConTest if invoked from workspace root
+	cmd2 := exec.Command("git", "-C", "CraConTest", "rev-parse", "--short=12", "HEAD")
+	out2, err2 := cmd2.Output()
+	if err2 == nil {
+		s2 := strings.TrimSpace(string(out2))
+		if s2 != "" {
+			return s2
+		}
+	}
+	return "unknown"
 }
 
 // RunBenchmark executes empirical benchmarking across all configured workload seeds and fault models.
@@ -819,6 +863,7 @@ func RunBenchmark(cfg BenchmarkConfig, progress func(string)) (*BenchmarkResult,
 
 	return &BenchmarkResult{
 		Timestamp:      time.Now().UTC().Format(time.RFC3339),
+		GitCommit:      CurrentGitCommit(),
 		Config:         cfg,
 		FaultSummaries: faultSummaries,
 		MUT0Violations: mut0Violations,
