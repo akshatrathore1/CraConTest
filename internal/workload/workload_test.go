@@ -278,3 +278,41 @@ func TestWorkloadValidateAndPlanInvalidConfig(t *testing.T) {
 		})
 	}
 }
+
+func TestWorkloadCheckpointPlan(t *testing.T) {
+	cfg := workload.Config{
+		Seed:         42,
+		Operations:   9,
+		KeyCount:     8,
+		ValueBytes:   16,
+		SyncEvery:    0,
+		FlushEvery:   0,
+		CheckpointAt: 3,
+	}
+	plan := workload.Plan(cfg)
+	if len(plan) != 12 {
+		t.Fatalf("expected 12 planned ops (9 client + 3 checkpoint), got %d", len(plan))
+	}
+
+	var ckptIndices []int
+	var ckptOps []uint64
+	for idx, op := range plan {
+		if op.Kind == "checkpoint" {
+			ckptIndices = append(ckptIndices, idx)
+			ckptOps = append(ckptOps, op.Op)
+			if op.Mutating {
+				t.Errorf("checkpoint op should not be mutating")
+			}
+		}
+	}
+
+	if len(ckptIndices) != 3 {
+		t.Fatalf("expected 3 checkpoint ops, got %d", len(ckptIndices))
+	}
+	expectedOps := []uint64{4, 8, 12}
+	for i, opID := range expectedOps {
+		if ckptOps[i] != opID {
+			t.Errorf("checkpoint %d: got Op %d, want %d", i, ckptOps[i], opID)
+		}
+	}
+}

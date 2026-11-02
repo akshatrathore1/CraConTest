@@ -87,7 +87,7 @@ func (m *mockFS) PathBase(path string) string {
 func TestFaultIDsAndValidation(t *testing.T) {
 	ids := faults.IDs()
 	expected := []string{
-		"MUT-0", "MUT-0-FIX5825", "MUT-1", "MUT-2", "MUT-3", "MUT-4", "MUT-5", "MUT-6", "MUT-7", "MUT-8", "MUT-9",
+		"MUT-0", "MUT-0-FIX5825", "MUT-0-FIXCKPT", "MUT-1", "MUT-2", "MUT-3", "MUT-4", "MUT-5", "MUT-6", "MUT-7", "MUT-8", "MUT-9",
 		"MUT-X1", "MUT-X2", "MUT-X3", "MUT-X4", "MUT-X5", "MUT-X6",
 	}
 	if len(ids) != len(expected) {
@@ -152,8 +152,13 @@ func TestFaultIDsAndValidation(t *testing.T) {
 	if !faults.IsSparse("MUT-9") || !faults.IsSparse("MUT-DIR-K") {
 		t.Error("MUT-9 and MUT-DIR-K should be sparse")
 	}
-	if faults.IsSparse(faults.MUT0) || faults.IsSparse(faults.MUT1) {
-		t.Error("MUT-0 and MUT-1 should not be sparse")
+	if faults.IsSparse(faults.MUT0) || faults.IsSparse(faults.MUT1) || faults.IsSparse(faults.MUT0FixCkpt) {
+		t.Error("MUT-0, MUT-1, and MUT-0-FIXCKPT should not be sparse")
+	}
+
+	normCkpt, err := faults.NormalizeID("MUT-0-FIXCKPT")
+	if err != nil || normCkpt != "MUT-0-FIXCKPT" {
+		t.Errorf("NormalizeID(MUT-0-FIXCKPT): got (%q, %v), want (MUT-0-FIXCKPT, nil)", normCkpt, err)
 	}
 
 	// Verify NewWithConfig defaulting

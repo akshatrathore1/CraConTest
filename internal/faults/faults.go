@@ -21,6 +21,7 @@ import (
 const (
 	MUT0        = "MUT-0"         // Null pass-through control
 	MUT0Fix5825 = "MUT-0-FIX5825" // Pebble #5825 fix: pre-sync parent directory on marker creation
+	MUT0FixCkpt = "MUT-0-FIXCKPT" // Checkpoint fix: pre-sync parent directory before marker/CURRENT visibility
 	MUT1        = "MUT-1"         // Dense WAL sync drop
 	MUT2        = "MUT-2"         // Dense Manifest sync drop
 	MUT3        = "MUT-3"         // Dense Directory sync drop
@@ -49,7 +50,7 @@ const (
 
 // IDs returns the list of all supported canonical fault identifiers.
 func IDs() []string {
-	return []string{MUT0, MUT0Fix5825, MUT1, MUT2, MUT3, MUT4, MUT5, MUT6, MUT7, MUT8, MUT9, MUTX1, MUTX2, MUTX3, MUTX4, MUTX5, MUTX6}
+	return []string{MUT0, MUT0Fix5825, MUT0FixCkpt, MUT1, MUT2, MUT3, MUT4, MUT5, MUT6, MUT7, MUT8, MUT9, MUTX1, MUTX2, MUTX3, MUTX4, MUTX5, MUTX6}
 }
 
 // Aliases returns all supported descriptive alias fault identifiers.
@@ -98,6 +99,8 @@ func NormalizeID(id string) (string, error) {
 		return MUT0, nil
 	case MUT0Fix5825:
 		return MUT0Fix5825, nil
+	case MUT0FixCkpt:
+		return MUT0FixCkpt, nil
 	case MUT1:
 		return MUT1, nil
 	case MUT2:
@@ -130,7 +133,7 @@ func IsSparse(id string) bool {
 		return false
 	}
 	switch norm {
-	case MUT0Fix5825:
+	case MUT0Fix5825, MUT0FixCkpt:
 		return false
 	case MUT2, MUT3, MUT4, MUT5, MUT6, MUT7, MUT8, MUT9:
 		return true
@@ -411,7 +414,7 @@ func (fs *FS) shouldDropSync(f *file, op string) bool {
 	defer fs.mu.Unlock()
 
 	switch fs.cfg.ID {
-	case MUT0, MUT0Fix5825:
+	case MUT0, MUT0Fix5825, MUT0FixCkpt:
 		return false
 
 	case MUT1:
@@ -547,6 +550,19 @@ func (fs *FS) maybeSyncParentDir(path string) {
 			_ = df.Close()
 		}
 	}
+	if fs.cfg.ID == MUT0FixCkpt {
+		if strings.HasPrefix(path, "checkpoint") &&
+			(strings.Contains(path, "marker.manifest") || strings.HasSuffix(path, "CURRENT")) {
+			parentDir := fs.inner.PathDir(path)
+			if parentDir == "" {
+				parentDir = "."
+			}
+			if d, err2 := fs.inner.OpenDir(parentDir); err2 == nil {
+				_ = d.Sync()
+				_ = d.Close()
+			}
+		}
+	}
 }
 
 // Create implements vfs.FS.
@@ -566,6 +582,7 @@ func (fs *FS) Create(name string, category vfs.DiskWriteCategory) (vfs.File, err
 
 // Link implements vfs.FS.
 func (fs *FS) Link(oldname, newname string) error {
+	fs.maybeSyncParentDir(newname)
 	fs.mu.Lock()
 	if fs.cfg.ID == MUT7 {
 		baseNew := fs.inner.PathBase(newname)

@@ -125,6 +125,8 @@ type SingleRunResult struct {
 	B0                     B0Metrics                  `json:"b0"`
 	Strategies             map[string]StrategyMetrics `json:"strategies"`
 	ElapsedTime            time.Duration              `json:"elapsed_time_ns"`
+	PlanRankMs             int64                      `json:"plan_rank_ms,omitempty"`
+	ExploreTotalMs         int64                      `json:"explore_total_ms,omitempty"`
 }
 
 // AggregatedStrategyStats holds aggregated metrics for a strategy across multiple workload seeds.
@@ -392,6 +394,7 @@ func RunSingleSeedFault(seed uint64, faultID string, cfg BenchmarkConfig) (*Sing
 	if len(policies) == 0 {
 		policies = []int{0, 100}
 	}
+	startPlan := time.Now()
 	universe, err := candidate.Build(traceEvents, seed, policies)
 	if err != nil {
 		return nil, fmt.Errorf("build universe: %w", err)
@@ -401,6 +404,7 @@ func RunSingleSeedFault(seed uint64, faultID string, cfg BenchmarkConfig) (*Sing
 	if err != nil {
 		return nil, fmt.Errorf("build graph: %w", err)
 	}
+	planGraphDuration := time.Since(startPlan)
 
 	timeout := cfg.SafeOpenTimeout
 	if timeout <= 0 {
@@ -592,9 +596,14 @@ func RunSingleSeedFault(seed uint64, faultID string, cfg BenchmarkConfig) (*Sing
 
 	totalFailures := expRes.Summary.Violations + expRes.Summary.OpenErrors
 	stratMap := make(map[string]StrategyMetrics, len(deterministicStrats)+2)
+	var dcgRankDuration time.Duration
 
 	for _, s := range deterministicStrats {
+		tRankStart := time.Now()
 		ranked := s.strat.Rank(view, universe)
+		if s.code == "dcg" {
+			dcgRankDuration = time.Since(tRankStart)
+		}
 		if err := strategy.ValidatePermutation(universe, ranked); err != nil {
 			return nil, fmt.Errorf("validate permutation for %s: %w", s.code, err)
 		}
@@ -776,6 +785,8 @@ func RunSingleSeedFault(seed uint64, faultID string, cfg BenchmarkConfig) (*Sing
 		B0:                     b0Metrics,
 		Strategies:             stratMap,
 		ElapsedTime:            time.Since(start),
+		PlanRankMs:             (planGraphDuration + dcgRankDuration).Milliseconds(),
+		ExploreTotalMs:         expRes.Summary.TotalTime.Milliseconds(),
 	}, nil
 }
 

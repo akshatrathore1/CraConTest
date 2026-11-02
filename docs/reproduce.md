@@ -194,6 +194,57 @@ python3 analysis/paired_stats.py results/realbug_pebble5825_per_seed.csv "Pebble
 - **Causal Verification:** Under `MUT-0`, 69 failures occur across 32 seeds (all manifesting exclusively at 50% partial-retention candidates). Under `MUT-0-FIX5825`, which forces parent directory sync on `Create`, `OpenReadWrite`, and `Rename`, failures drop to **0 across all 32 seeds**, causally confirming the fix for Pebble #5825.
 - **Post-Hoc Partial-Retention Prior (`dcg-pr`):** Standard `dcg` prioritizes 0%-retention candidates first, requiring a median $k_1$ of **310.50** (mean 288.53) to discover the partial-retention failure. `dcg-pr` incorporates a partial-retention prior tracking `UnsyncedDirEntryCount >= 2`, discovering the first failure at median $k_1 = \mathbf{2.50}$ (mean 10.50, AUC 0.8355), compared to uniform random B0 median $k_1 = 161.00$ (mean 173.32) and state-representative B5 median $k_1 = 65.00$ (mean 64.80).
 
+### 4.4 Pebble Checkpoint Real-Bug Holdout A/B Benchmark (32 Seeds, MUT-0 vs MUT-0-FIXCKPT)
+
+To evaluate real-world crash recovery failure caused by unsynced parent directory entries in checkpoint creation (CockroachDB Pebble commit `15b500fb`), the checkpoint holdout benchmark evaluates unfaulted `MUT-0` against the causal fix control `MUT-0-FIXCKPT` across 32 seeds under partial retention (0%, 50%, 100%) with `-checkpoint-at 60`:
+
+```bash
+./cracontest benchmark \
+  -faults MUT-0,MUT-0-FIXCKPT \
+  -checkpoint-at 60 \
+  -policies 0,50,100 \
+  -csv results/realbug_checkpoint_summary.csv \
+  -per-seed-csv results/realbug_checkpoint_per_seed.csv \
+  -report ""
+```
+
+To run paired statistical comparisons on the Pebble Checkpoint per-seed results:
+
+```bash
+python3 analysis/paired_stats.py results/realbug_checkpoint_per_seed.csv "Pebble Checkpoint Real-Bug (32 seeds)" MUT-0
+```
+
+#### Results Summary:
+- **Causal Verification:** In Pebble `db.Checkpoint("checkpoint")`, checkpoint manifest and marker pointer files (`marker.manifest.*`) are written before `dir.Sync()`. Under 50% partial retention, unsynced directory entries are dropped while marker pointers persist, causing checkpoint recovery failure (`open_error`) on 20 of 32 seeds (30 total checkpoint recovery failures). Under `MUT-0-FIXCKPT`, which forces parent directory sync when creating checkpoint manifest/marker files, checkpoint recovery failures drop to **0 across all 32 seeds**.
+- **Pre-Freeze Prior Discovery (`dcg-pr`):** The partial-retention prior (`dcg-pr`) was frozen before evaluation (tag `v1.0-dcg-pr-freeze`). `dcg-pr` discovers the checkpoint failure at median $k_1 = \mathbf{1.00}$ (mean 82.42), compared to 0%-retention-first DCG median $k_1 = 218.50$ (mean 300.08) and uniform random B0 median $k_1 = 149.00$ (mean 160.08).
+
+### 4.5 MUT-5 Universe-Scaling Benchmark (ops ∈ {120, 300, 600, 1200})
+
+To evaluate candidate universe scaling behavior on single-sync drop faults (`MUT-5`, single WAL sync drop), the scaling experiment evaluates 8 seeds across 4 operations scales:
+
+```bash
+go test -count=1 -timeout 1200s -run TestScalingMUT5 ./internal/exp/...
+```
+
+Outputs: `results/scaling_mut5_per_seed.csv` and `results/scaling_mut5_summary.csv`.
+
+#### Results Summary:
+- Candidate universes scale from ~338 (120 ops) to ~2,958 (1,200 ops).
+- DCG maintains constant $O(1)$ discovery cost: median $k_1 = 1.00$, mean $k_1 = 1.00$ across all 4 scales.
+- Random and heuristic baselines scale linearly with universe size: B0 mean $k_1$ scales from 25.75 to 222.38; B2 (LIFO) mean $k_1$ scales from 260.50 to 2,881.25; R2 mean $k_1$ scales from 11.62 to 83.50.
+- Average planning/ranking runtime remains sub-60ms (56.1ms) even at ~3,000 candidates.
+
+### 4.6 Multi-Shape Null-Control Verification (108 Runs, 0 False Alarms)
+
+To establish zero false alarm rates across diverse workload geometries, the multi-shape null-control check tests 12 shapes across 9 seeds on `MUT-0` at 0%/100% policies:
+
+```bash
+go test -count=1 -timeout 1200s -run TestNullControlMultiShape ./internal/exp/...
+```
+
+Outputs: `results/null_control_multishape.csv`.
+Result: Exactly 0 violations, 0 open errors, 0 panics, and 0 hangs across all 108 runs (>50,000 crash states explored).
+
 ## 5. Acceptance Tests
 
 | Check | Command | Measured result | Runtime |

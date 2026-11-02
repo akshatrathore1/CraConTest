@@ -22,6 +22,7 @@ type Config struct {
 	SyncEvery           int    `json:"sync_every"`
 	FlushEvery          int    `json:"flush_every"`
 	CompactAt           int    `json:"compact_at,omitempty"`
+	CheckpointAt        int    `json:"checkpoint_at,omitempty"`
 	MaxManifestFileSize int64  `json:"max_manifest_file_size,omitempty"`
 }
 
@@ -53,6 +54,9 @@ func Validate(cfg Config) error {
 	}
 	if cfg.FlushEvery < 0 {
 		return fmt.Errorf("flush_every must be >= 0, got %d", cfg.FlushEvery)
+	}
+	if cfg.CheckpointAt < 0 {
+		return fmt.Errorf("checkpoint_at must be >= 0, got %d", cfg.CheckpointAt)
 	}
 	return nil
 }
@@ -211,6 +215,15 @@ func Plan(cfg Config) []PlanOperation {
 				Mutating: false,
 			})
 		}
+
+		if cfg.CheckpointAt > 0 && (i+1)%cfg.CheckpointAt == 0 {
+			opID++
+			plan = append(plan, PlanOperation{
+				Op:       opID,
+				Kind:     "checkpoint",
+				Mutating: false,
+			})
+		}
 	}
 
 	return plan
@@ -293,6 +306,9 @@ func Run(db *pebble.DB, marker Marker, cfg Config) ([]history.Entry, error) {
 			if opErr == nil {
 				db.TestOnlyWaitForCleaning()
 			}
+
+		case "checkpoint":
+			_ = db.Checkpoint("checkpoint")
 		}
 
 		eventTracker++

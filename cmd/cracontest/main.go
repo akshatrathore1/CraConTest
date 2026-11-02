@@ -658,6 +658,7 @@ func runBenchmarkCmd(args []string) error {
 	csvFlag := fs.String("csv", "", "optional path to output summary CSV")
 	perSeedCSVFlag := fs.String("per-seed-csv", "", "path for per-seed CSV output (default: results/benchmark_per_seed.csv for full matrix)")
 	controlFlag := fs.Bool("control", true, "run MUT-0 null control check")
+	checkpointAt := fs.Int("checkpoint-at", 0, "emit a Checkpoint op every N operations (0 = disabled)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -665,6 +666,7 @@ func runBenchmarkCmd(args []string) error {
 	cfg := exp.DefaultMultiSeedBenchmarkConfig()
 
 	cfg.Workload.Operations = *opsFlag
+	cfg.Workload.CheckpointAt = *checkpointAt
 	cfg.TrackMUT0 = *controlFlag
 
 	if *policiesFlag != "" {

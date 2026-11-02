@@ -65,7 +65,7 @@ func Clone(entries []Entry) []Entry {
 
 func isValidKind(kind string) bool {
 	switch kind {
-	case "set", "delete", "range_delete", "batch", "get", "iterate", "flush", "compact":
+	case "set", "delete", "range_delete", "batch", "get", "iterate", "flush", "compact", "checkpoint":
 		return true
 	default:
 		return false

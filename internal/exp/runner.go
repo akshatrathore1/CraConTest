@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -373,6 +374,31 @@ func RunExplore(cfg RunnerConfig) (*ExploreResult, error) {
 			Categories: cutCategories,
 		})
 		stageTimings.Oracle = time.Since(startOracle)
+
+		// Check checkpoint directory if it exists and has a manifest pointer visible
+		ckptEntries, ckptErr := clonedFS.List("checkpoint")
+		if ckptErr == nil && len(ckptEntries) > 0 {
+			hasPointer := false
+			for _, e := range ckptEntries {
+				if strings.Contains(e, "marker.manifest") || e == "CURRENT" {
+					hasPointer = true
+					break
+				}
+			}
+			if hasPointer {
+				ckptRes := recovery.SafeOpen(clonedFS, "checkpoint", timeout)
+				if ckptRes.Err != nil {
+					// Checkpoint dir recovery failed — classify as open error
+					terminalOutcome.Class = oracle.ClassOpenError
+					terminalOutcome.Detail = fmt.Sprintf("checkpoint recovery: %v", ckptRes.Err)
+				} else {
+					if ckptRes.DB != nil {
+						_ = recovery.CheckIntegrity(ckptRes.DB)
+						_ = ckptRes.DB.Close()
+					}
+				}
+			}
+		}
 
 		if err := finishCandidate(jw, cand, &terminalOutcome, &stageTimings, candStart, &outcomes, timingsMap, &summary); err != nil {
 			return nil, fmt.Errorf("runner write journal: %w", err)

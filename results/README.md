@@ -53,6 +53,23 @@ Stage 2 stores aggregated 95%-confidence-interval summaries and unaggregated per
    - `realbug_pebble5825_summary.csv`: Aggregated summary statistics across 32 seeds comparing standard DCG, DCG-PR (`dcg-pr`), DCG Flag-Only, R2, R1, and baseline search heuristics.
    - `realbug_pebble5825_per_seed.csv`: Unaggregated per-seed discovery metrics across 32 seeds. Demonstrates that while standard DCG prioritizes 0% retention first (median $k_1 = 310.50$, mean $k_1 = 288.53$), `dcg-pr` incorporates a post-hoc partial-retention prior tracking `UnsyncedDirEntryCount >= 2`, discovering the failure at median $k_1 = 2.50$ (mean $k_1 = 10.50$).
 
+4. **Pebble Checkpoint Real-Bug Holdout A/B Benchmark (`results/realbug_checkpoint_summary.csv`, `results/realbug_checkpoint_per_seed.csv`):**
+   - Scope: Real-world holdout bug from CockroachDB Pebble commit `15b500fb` (`checkpoint.go` directory sync omission) evaluated across 32 deterministic seeds (`42, 100..900, 1001..1022`) under partial retention policies (0%, 50%, 100%) with `-checkpoint-at 60`.
+   - `MUT-0` (unfaulted baseline): Pebble `db.Checkpoint("checkpoint")` writes checkpoint manifest and marker pointer files (`marker.manifest.*`) before `dir.Sync()`. Under 50% partial retention, unsynced directory entries are dropped while marker pointers survive, causing checkpoint recovery failure (`open_error`) on 20 of 32 seeds (30 total checkpoint recovery failures).
+   - `MUT-0-FIXCKPT` (causal fix control): Forces immediate parent directory sync when writing checkpoint manifests and markers inside `checkpoint`. Completely eliminates checkpoint recovery failures across all 32 seeds (0 checkpoint failures).
+   - `realbug_checkpoint_summary.csv`: Aggregated summary statistics across 32 seeds comparing standard DCG, DCG-PR (`dcg-pr`), DCG Flag-Only, R2, R1, and baseline search heuristics. Demonstrates that `dcg-pr` (prior frozen before evaluation) discovers checkpoint failures at median $k_1 = \mathbf{1.00}$ (mean $k_1 = 82.42$), whereas 0%-retention-first DCG has median $k_1 = 218.50$ (mean $k_1 = 300.08$), and random B0 has median $k_1 = 149.00$ (mean $k_1 = 160.08$).
+   - `realbug_checkpoint_per_seed.csv`: Unaggregated per-seed discovery metrics across all 32 seeds.
+
+5. **MUT-5 Universe-Scaling Benchmark (`results/scaling_mut5_summary.csv`, `results/scaling_mut5_per_seed.csv`):**
+   - Scope: Scaling behavior of prioritization strategies on `MUT-5` (single WAL sync drop) across operations $\in \{120, 300, 600, 1200\}$ and 8 seeds ($\in \{42, 100, 200, 300, 400, 500, 600, 700\}$), generating candidate universes from ~338 to ~2,958 candidates.
+   - `scaling_mut5_summary.csv`: Summary metrics across the 4 operation counts showing mean and median $k_1$ for DCG, R2, R1, B0, and B2 (LIFO), along with average planning and exploration times.
+   - `scaling_mut5_per_seed.csv`: Unaggregated per-seed, per-ops run metrics (32 runs total) recording `ops, seed, universe_size, k1_dcg, k1_r2, k1_r1, k1_b0, k1_b2, plan_rank_ms, explore_total_ms`.
+   - Key findings: DCG preserves constant $O(1)$ first-failure cost ($k_1 = 1.00$ across all ops levels), while B0 scales linearly from mean $k_1 = 25.75$ to $222.38$, and B2 (LIFO) scales linearly from mean $k_1 = 260.50$ to $2881.25$. Planning and ranking overhead remains sub-60ms (56.1ms) even at ~3,000 candidates.
+
+6. **Multi-Shape Null-Control Verification (`results/null_control_multishape.csv`):**
+   - Scope: Extended empirical false-alarm verification across 12 distinct workload shapes (varying operations $\in [80, 300]$, key counts $\in [8, 64]$, value sizes $\in [32, 256]$ bytes, sync intervals $\in [4, 12]$, flush intervals $\in [25, 60]$, and compactions) and 9 seeds ($42, 100..800$) on `MUT-0` at 0%/100% retention policies (108 runs total).
+   - Findings: Exactly 0 violations, 0 open errors, 0 panics, and 0 hangs across all 108 runs (>50,000 crash candidates evaluated), verifying a 0.00% false-alarm rate across diverse workload topologies.
+
 ---
 
 ## Statistical Reproduction Commands
@@ -71,4 +88,7 @@ python3 analysis/paired_stats.py results/holdout_per_seed.csv "Out-of-Contract C
 
 # Pebble #5825 Real-Bug A/B Benchmark (MUT-0)
 python3 analysis/paired_stats.py results/realbug_pebble5825_per_seed.csv "Pebble #5825 Real-Bug (32 seeds)" MUT-0
+
+# Pebble Checkpoint Real-Bug Holdout Benchmark (MUT-0)
+python3 analysis/paired_stats.py results/realbug_checkpoint_per_seed.csv "Pebble Checkpoint Real-Bug (32 seeds)" MUT-0
 ```
