@@ -19,18 +19,24 @@ import (
 
 // Seeded fault IDs.
 const (
-	MUT0        = "MUT-0"         // Null pass-through control
-	MUT0Fix5825 = "MUT-0-FIX5825" // Pebble #5825 fix: pre-sync parent directory on marker creation
-	MUT0FixCkpt = "MUT-0-FIXCKPT" // Checkpoint fix: pre-sync parent directory before marker/CURRENT visibility
-	MUT1        = "MUT-1"         // Dense WAL sync drop
-	MUT2        = "MUT-2"         // Dense Manifest sync drop
-	MUT3        = "MUT-3"         // Dense Directory sync drop
-	MUT4        = "MUT-4"         // Dense SST flush sync drop
-	MUT5        = "MUT-5"         // Single k-th WAL sync drop
-	MUT6        = "MUT-6"         // Single manifest-rotation sync drop
-	MUT7        = "MUT-7"         // RocksDB #10573: dir sync omitted after CURRENT rename
-	MUT8        = "MUT-8"         // RocksDB #10460: fsyncs omitted after trigger event
-	MUT9        = "MUT-9"         // Single k-th directory sync drop
+	MUT0 = "MUT-0" // Null pass-through control
+	MUT1 = "MUT-1" // Dense WAL sync drop
+	MUT2 = "MUT-2" // Dense Manifest sync drop
+	MUT3 = "MUT-3" // Dense Directory sync drop
+	MUT4 = "MUT-4" // Dense SST flush sync drop
+	MUT5 = "MUT-5" // Single k-th WAL sync drop
+	MUT6 = "MUT-6" // Single manifest-rotation sync drop
+	MUT7 = "MUT-7" // RocksDB #10573: dir sync omitted after CURRENT rename
+	MUT8 = "MUT-8" // RocksDB #10460: fsyncs omitted after trigger event
+	MUT9 = "MUT-9" // Single k-th directory sync drop
+
+	// Causal barrier repair controls (formal systems-research identifiers).
+	Barrier5825 = "BARRIER-5825" // Manifest-Rotation Directory Barrier Control: pre-syncs parent dir on marker creation
+	BarrierCkpt = "BARRIER-CKPT" // Checkpoint Directory Barrier Control: pre-syncs parent dir before marker/CURRENT visibility
+
+	// Backward-compatible legacy aliases (normalized to the canonical BARRIER-* forms above).
+	MUT0Fix5825 = "MUT-0-FIX5825" // legacy alias → BARRIER-5825
+	MUT0FixCkpt = "MUT-0-FIXCKPT" // legacy alias → BARRIER-CKPT
 
 	// Extended parameterized and stochastic fault models.
 	MUTX1 = "MUT-X1" // drop only the k-th WAL sync call
@@ -50,7 +56,7 @@ const (
 
 // IDs returns the list of all supported canonical fault identifiers.
 func IDs() []string {
-	return []string{MUT0, MUT0Fix5825, MUT0FixCkpt, MUT1, MUT2, MUT3, MUT4, MUT5, MUT6, MUT7, MUT8, MUT9, MUTX1, MUTX2, MUTX3, MUTX4, MUTX5, MUTX6}
+	return []string{MUT0, Barrier5825, BarrierCkpt, MUT1, MUT2, MUT3, MUT4, MUT5, MUT6, MUT7, MUT8, MUT9, MUTX1, MUTX2, MUTX3, MUTX4, MUTX5, MUTX6}
 }
 
 // Aliases returns all supported descriptive alias fault identifiers.
@@ -90,6 +96,8 @@ func parseParameterizedID(id string) (canonical string, k int, ok bool) {
 }
 
 // NormalizeID converts a canonical ID or alias into its canonical form.
+// Legacy aliases MUT-0-FIX5825 and MUT-0-FIXCKPT normalize to BARRIER-5825
+// and BARRIER-CKPT respectively for backward compatibility.
 func NormalizeID(id string) (string, error) {
 	if canon, _, ok := parseParameterizedID(id); ok {
 		return canon, nil
@@ -97,10 +105,10 @@ func NormalizeID(id string) (string, error) {
 	switch id {
 	case MUT0:
 		return MUT0, nil
-	case MUT0Fix5825:
-		return MUT0Fix5825, nil
-	case MUT0FixCkpt:
-		return MUT0FixCkpt, nil
+	case Barrier5825, MUT0Fix5825:
+		return Barrier5825, nil
+	case BarrierCkpt, MUT0FixCkpt:
+		return BarrierCkpt, nil
 	case MUT1:
 		return MUT1, nil
 	case MUT2:
@@ -133,7 +141,7 @@ func IsSparse(id string) bool {
 		return false
 	}
 	switch norm {
-	case MUT0Fix5825, MUT0FixCkpt:
+	case Barrier5825, BarrierCkpt:
 		return false
 	case MUT2, MUT3, MUT4, MUT5, MUT6, MUT7, MUT8, MUT9:
 		return true
@@ -203,16 +211,6 @@ type FS struct {
 	xN       [6]int
 	xDropped bool
 	xCall    int
-}
-
-func envInt(name string, def int) int {
-	if v := os.Getenv(name); v != "" {
-		var x int
-		if _, err := fmt.Sscanf(v, "%d", &x); err == nil {
-			return x
-		}
-	}
-	return def
 }
 
 func flakyHash(seed, idx int) float64 {
@@ -414,7 +412,7 @@ func (fs *FS) shouldDropSync(f *file, op string) bool {
 	defer fs.mu.Unlock()
 
 	switch fs.cfg.ID {
-	case MUT0, MUT0Fix5825, MUT0FixCkpt:
+	case MUT0, Barrier5825, BarrierCkpt:
 		return false
 
 	case MUT1:
@@ -483,7 +481,7 @@ func (fs *FS) shouldDropSync(f *file, op string) bool {
 			fs.xN[1]++
 			k := fs.cfg.XK
 			if k <= 0 {
-				k = envInt("CRACON_K", 2)
+				k = 2 // default: drop the 2nd WAL sync
 			}
 			if fs.xN[1] == k && !fs.xDropped {
 				fs.xDropped = true
@@ -497,7 +495,7 @@ func (fs *FS) shouldDropSync(f *file, op string) bool {
 			fs.xN[2]++
 			k := fs.cfg.XK
 			if k <= 0 {
-				k = envInt("CRACON_K", 2)
+				k = 2 // default: drop the 2nd MANIFEST sync
 			}
 			if fs.xN[2] == k && !fs.xDropped {
 				fs.xDropped = true
@@ -511,7 +509,7 @@ func (fs *FS) shouldDropSync(f *file, op string) bool {
 			fs.xN[3]++
 			k := fs.cfg.XK
 			if k <= 0 {
-				k = envInt("CRACON_K", 1)
+				k = 1 // default: drop the 1st SST sync
 			}
 			if fs.xN[3] == k && !fs.xDropped {
 				fs.xDropped = true
@@ -523,14 +521,14 @@ func (fs *FS) shouldDropSync(f *file, op string) bool {
 	case MUTX4:
 		if !f.isDir {
 			fs.xCall++
-			return flakyHash(envInt("CRACON_FSEED", 1), fs.xCall) < 0.04
+			return flakyHash(1, fs.xCall) < 0.04
 		}
 		return false
 
 	case MUTX5:
 		if f.isDir {
 			fs.xCall++
-			return flakyHash(envInt("CRACON_FSEED", 1), fs.xCall) < 0.12
+			return flakyHash(1, fs.xCall) < 0.12
 		}
 		return false
 
@@ -540,7 +538,7 @@ func (fs *FS) shouldDropSync(f *file, op string) bool {
 }
 
 func (fs *FS) maybeSyncParentDir(path string) {
-	if fs.cfg.ID == MUT0Fix5825 && strings.Contains(path, "marker.manifest") {
+	if fs.cfg.ID == Barrier5825 && strings.Contains(path, "marker.manifest") {
 		parentDir := fs.inner.PathDir(path)
 		if parentDir == "" {
 			parentDir = "."
@@ -550,9 +548,8 @@ func (fs *FS) maybeSyncParentDir(path string) {
 			_ = df.Close()
 		}
 	}
-	if fs.cfg.ID == MUT0FixCkpt {
-		if strings.HasPrefix(path, "checkpoint") &&
-			(strings.Contains(path, "marker.manifest") || strings.HasSuffix(path, "CURRENT")) {
+	if fs.cfg.ID == BarrierCkpt {
+		if strings.Contains(path, "marker.manifest") || strings.HasSuffix(path, "CURRENT") {
 			parentDir := fs.inner.PathDir(path)
 			if parentDir == "" {
 				parentDir = "."
@@ -739,7 +736,7 @@ func (f *file) Write(p []byte) (int, error) {
 		f.fs.xN[4]++
 		k := f.fs.cfg.XK
 		if k <= 0 {
-			k = envInt("CRACON_K", 2)
+			k = 2 // default: drop the 2nd WAL write
 		}
 		drop := f.fs.xN[4] == k && !f.fs.xDropped
 		if drop {

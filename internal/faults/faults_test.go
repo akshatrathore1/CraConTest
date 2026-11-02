@@ -87,7 +87,7 @@ func (m *mockFS) PathBase(path string) string {
 func TestFaultIDsAndValidation(t *testing.T) {
 	ids := faults.IDs()
 	expected := []string{
-		"MUT-0", "MUT-0-FIX5825", "MUT-0-FIXCKPT", "MUT-1", "MUT-2", "MUT-3", "MUT-4", "MUT-5", "MUT-6", "MUT-7", "MUT-8", "MUT-9",
+		"MUT-0", "BARRIER-5825", "BARRIER-CKPT", "MUT-1", "MUT-2", "MUT-3", "MUT-4", "MUT-5", "MUT-6", "MUT-7", "MUT-8", "MUT-9",
 		"MUT-X1", "MUT-X2", "MUT-X3", "MUT-X4", "MUT-X5", "MUT-X6",
 	}
 	if len(ids) != len(expected) {
@@ -152,13 +152,13 @@ func TestFaultIDsAndValidation(t *testing.T) {
 	if !faults.IsSparse("MUT-9") || !faults.IsSparse("MUT-DIR-K") {
 		t.Error("MUT-9 and MUT-DIR-K should be sparse")
 	}
-	if faults.IsSparse(faults.MUT0) || faults.IsSparse(faults.MUT1) || faults.IsSparse(faults.MUT0FixCkpt) {
-		t.Error("MUT-0, MUT-1, and MUT-0-FIXCKPT should not be sparse")
+	if faults.IsSparse(faults.MUT0) || faults.IsSparse(faults.MUT1) || faults.IsSparse(faults.BarrierCkpt) {
+		t.Error("MUT-0, MUT-1, and BARRIER-CKPT should not be sparse")
 	}
 
 	normCkpt, err := faults.NormalizeID("MUT-0-FIXCKPT")
-	if err != nil || normCkpt != "MUT-0-FIXCKPT" {
-		t.Errorf("NormalizeID(MUT-0-FIXCKPT): got (%q, %v), want (MUT-0-FIXCKPT, nil)", normCkpt, err)
+	if err != nil || normCkpt != faults.BarrierCkpt {
+		t.Errorf("NormalizeID(MUT-0-FIXCKPT): got (%q, %v), want (BARRIER-CKPT, nil)", normCkpt, err)
 	}
 
 	// Verify NewWithConfig defaulting
@@ -1662,26 +1662,35 @@ func TestParameterizedFaultIDs(t *testing.T) {
 	})
 }
 
-func TestMUT0Fix5825NormalizeAndParentDirSync(t *testing.T) {
-	// NormalizeID must accept MUT-0-FIX5825.
-	norm, err := faults.NormalizeID(faults.MUT0Fix5825)
+func TestBarrier5825NormalizeAndParentDirSync(t *testing.T) {
+	// NormalizeID must accept both the canonical BARRIER-5825 and legacy alias MUT-0-FIX5825.
+	norm, err := faults.NormalizeID(faults.Barrier5825)
 	if err != nil {
-		t.Fatalf("NormalizeID(%q) error: %v", faults.MUT0Fix5825, err)
+		t.Fatalf("NormalizeID(%q) error: %v", faults.Barrier5825, err)
 	}
-	if norm != faults.MUT0Fix5825 {
-		t.Fatalf("NormalizeID(%q) = %q, want %q", faults.MUT0Fix5825, norm, faults.MUT0Fix5825)
+	if norm != faults.Barrier5825 {
+		t.Fatalf("NormalizeID(%q) = %q, want %q", faults.Barrier5825, norm, faults.Barrier5825)
 	}
 
-	// Verify IDs() includes MUT0Fix5825.
+	// Legacy alias MUT-0-FIX5825 must normalize to BARRIER-5825.
+	normLegacy, err := faults.NormalizeID(faults.MUT0Fix5825)
+	if err != nil {
+		t.Fatalf("NormalizeID(legacy %q) error: %v", faults.MUT0Fix5825, err)
+	}
+	if normLegacy != faults.Barrier5825 {
+		t.Fatalf("NormalizeID(legacy %q) = %q, want %q", faults.MUT0Fix5825, normLegacy, faults.Barrier5825)
+	}
+
+	// Verify IDs() includes BARRIER-5825 (not the legacy name).
 	found := false
 	for _, id := range faults.IDs() {
-		if id == faults.MUT0Fix5825 {
+		if id == faults.Barrier5825 {
 			found = true
 			break
 		}
 	}
 	if !found {
-		t.Fatalf("IDs() does not contain %q", faults.MUT0Fix5825)
+		t.Fatalf("IDs() does not contain %q", faults.Barrier5825)
 	}
 
 	// Verify that Create on a marker.manifest path triggers a parent-dir sync.
@@ -1690,9 +1699,9 @@ func TestMUT0Fix5825NormalizeAndParentDirSync(t *testing.T) {
 	if err := inner.MkdirAll("db", 0755); err != nil {
 		t.Fatalf("MkdirAll: %v", err)
 	}
-	fs, err := faults.New(faults.MUT0Fix5825, inner)
+	fs, err := faults.New(faults.Barrier5825, inner)
 	if err != nil {
-		t.Fatalf("New(%q): %v", faults.MUT0Fix5825, err)
+		t.Fatalf("New(%q): %v", faults.Barrier5825, err)
 	}
 	// Create a non-marker file first (no parent-dir sync should be forced).
 	f, err := fs.Create("db/MANIFEST-000001", vfs.WriteCategoryUnspecified)

@@ -2,6 +2,7 @@ package exp
 
 import (
 	"encoding/csv"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -28,10 +29,84 @@ type shapeSpec struct {
 	compactAt  int
 }
 
+func nullControlResultsDir() string {
+	dir := filepath.Join("..", "..", "results")
+	if fi, err := os.Stat(dir); err == nil && fi.IsDir() {
+		return dir
+	}
+	return "results"
+}
+
+// validateNullControlCSV reads the committed CSV and checks it has 108 rows with all-zero failure counts.
+func validateNullControlCSV(t *testing.T, csvPath string) {
+	t.Helper()
+	f, err := os.Open(csvPath)
+	if err != nil {
+		t.Fatalf("null_control_multishape.csv not found at %s: %v (run with -update to regenerate)", csvPath, err)
+	}
+	defer f.Close()
+	r := csv.NewReader(f)
+	header, err := r.Read()
+	if err != nil {
+		t.Fatalf("read header: %v", err)
+	}
+	// Find column indices
+	colIdx := func(name string) int {
+		for i, h := range header {
+			if h == name {
+				return i
+			}
+		}
+		t.Fatalf("column %q not found in header", name)
+		return -1
+	}
+	viIdx := colIdx("violations")
+	oeIdx := colIdx("open_errors")
+	pIdx := colIdx("panics")
+	hIdx := colIdx("hangs")
+
+	rows := 0
+	for {
+		rec, err := r.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("read row %d: %v", rows+1, err)
+		}
+		rows++
+		for _, idx := range []int{viIdx, oeIdx, pIdx, hIdx} {
+			v, err := strconv.Atoi(rec[idx])
+			if err != nil || v != 0 {
+				t.Fatalf("row %d: non-zero failure count %q=%s (expected 0 false alarms)", rows, header[idx], rec[idx])
+			}
+		}
+	}
+	if rows != 108 {
+		t.Fatalf("expected 108 data rows in null_control_multishape.csv, got %d (run with -update to regenerate)", rows)
+	}
+	t.Logf("Validated %d rows with 0 false alarms in %s", rows, csvPath)
+}
+
 func TestNullControlMultiShape(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping multi-shape null control benchmark in short mode")
 	}
+
+	resultsDir := nullControlResultsDir()
+	csvPath := filepath.Join(resultsDir, "null_control_multishape.csv")
+
+	if !*updateArtifacts {
+		validateNullControlCSV(t, csvPath)
+		return
+	}
+
+	// Generation mode: run the full suite and write the CSV.
+	runNullControlSuite(t, csvPath)
+}
+
+func runNullControlSuite(t *testing.T, csvPath string) {
+	t.Helper()
 
 	shapes := []shapeSpec{
 		{id: 1, ops: 80, keyCount: 8, valueBytes: 32, syncEvery: 4, flushEvery: 25, compactAt: 0},
@@ -49,11 +124,6 @@ func TestNullControlMultiShape(t *testing.T) {
 	}
 
 	seeds := []uint64{42, 100, 200, 300, 400, 500, 600, 700, 800}
-
-	resultsDir := filepath.Join("..", "..", "results")
-	if fi, err := os.Stat(resultsDir); err != nil || !fi.IsDir() {
-		resultsDir = "results"
-	}
 
 	gitCommit := CurrentGitCommit()
 
@@ -184,14 +254,16 @@ func TestNullControlMultiShape(t *testing.T) {
 		}
 	}
 
-	csvPath := filepath.Join(resultsDir, "null_control_multishape.csv")
-	f, err := os.Create(csvPath)
+	if err := os.MkdirAll(filepath.Dir(csvPath), 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", filepath.Dir(csvPath), err)
+	}
+	outF, err := os.Create(csvPath)
 	if err != nil {
 		t.Fatalf("create %s failed: %v", csvPath, err)
 	}
-	defer f.Close()
+	defer outF.Close()
 
-	w := csv.NewWriter(f)
+	w := csv.NewWriter(outF)
 	if err := w.Write([]string{
 		"shape_id", "seed", "operations", "key_count", "value_bytes",
 		"sync_every", "flush_every", "compact_at", "universe_size",

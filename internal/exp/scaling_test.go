@@ -2,7 +2,9 @@ package exp
 
 import (
 	"encoding/csv"
+	"flag"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -14,18 +16,85 @@ import (
 	"github.com/akshatrathore1/CraConTest/internal/faults"
 )
 
+// updateArtifacts controls whether benchmark tests regenerate committed CSV
+// artifacts in results/ (true) or validate the committed files read-only (false).
+// Use: go test -v -count=1 -timeout 1200s -run TestScalingMUT5 ./internal/exp -update
+var updateArtifacts = flag.Bool("update", false, "regenerate committed benchmark CSV artifacts in results/")
+
+func scalingResultsDir() string {
+	dir := filepath.Join("..", "..", "results")
+	if fi, err := os.Stat(dir); err == nil && fi.IsDir() {
+		return dir
+	}
+	return "results"
+}
+
+// validateScalingCSV reads the committed per-seed CSV and checks it has 32 rows with k1_dcg == 1.
+func validateScalingCSV(t *testing.T, perSeedPath string) {
+	t.Helper()
+	f, err := os.Open(perSeedPath)
+	if err != nil {
+		t.Fatalf("scaling_mut5_per_seed.csv not found at %s: %v (run with -update to regenerate)", perSeedPath, err)
+	}
+	defer f.Close()
+	r := csv.NewReader(f)
+	header, err := r.Read()
+	if err != nil {
+		t.Fatalf("read header: %v", err)
+	}
+	k1DCGIdx := -1
+	for i, h := range header {
+		if h == "k1_dcg" {
+			k1DCGIdx = i
+			break
+		}
+	}
+	if k1DCGIdx < 0 {
+		t.Fatalf("column k1_dcg not found in header")
+	}
+	rows := 0
+	for {
+		rec, err := r.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("read row %d: %v", rows+1, err)
+		}
+		rows++
+		v, err := strconv.ParseFloat(rec[k1DCGIdx], 64)
+		if err != nil || v > 1.0 {
+			t.Fatalf("row %d: k1_dcg=%s expected <= 1.0 (DCG should always find the bug first on MUT-5)", rows, rec[k1DCGIdx])
+		}
+	}
+	if rows != 32 {
+		t.Fatalf("expected 32 data rows in scaling_mut5_per_seed.csv, got %d (run with -update to regenerate)", rows)
+	}
+	t.Logf("Validated %d rows with k1_dcg <= 1.0 in %s", rows, perSeedPath)
+}
+
 func TestScalingMUT5(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping MUT-5 scaling benchmark in short mode")
 	}
 
+	resultsDir := scalingResultsDir()
+	perSeedPath := filepath.Join(resultsDir, "scaling_mut5_per_seed.csv")
+
+	if !*updateArtifacts {
+		validateScalingCSV(t, perSeedPath)
+		return
+	}
+
+	// Generation mode: run the full scaling suite and write both CSVs.
+	runScalingSuite(t, resultsDir)
+}
+
+func runScalingSuite(t *testing.T, resultsDir string) {
+	t.Helper()
+
 	opsList := []int{120, 300, 600, 1200}
 	seeds := []uint64{42, 100, 200, 300, 400, 500, 600, 700}
-
-	resultsDir := filepath.Join("..", "..", "results")
-	if fi, err := os.Stat(resultsDir); err != nil || !fi.IsDir() {
-		resultsDir = "results"
-	}
 
 	type runRow struct {
 		ops          int

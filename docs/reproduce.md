@@ -47,7 +47,12 @@ CraConTest/
 │   ├── holdout_summary.csv    # Aggregated 32-seed holdout metrics (MUT-X1..X6)
 │   ├── holdout_per_seed.csv   # Unaggregated per-seed discovery metrics (MUT-X1..X6)
 │   ├── realbug_pebble5825_summary.csv  # Aggregated 32-seed Pebble #5825 A/B metrics
-│   └── realbug_pebble5825_per_seed.csv # Unaggregated per-seed Pebble #5825 A/B metrics
+│   ├── realbug_pebble5825_per_seed.csv # Unaggregated per-seed Pebble #5825 A/B metrics
+│   ├── realbug_checkpoint_summary.csv  # Aggregated 32-seed Checkpoint A/B metrics
+│   ├── realbug_checkpoint_per_seed.csv # Unaggregated per-seed Checkpoint A/B metrics
+│   ├── scaling_mut5_summary.csv        # MUT-5 universe-scaling summary (120..1200 ops)
+│   ├── scaling_mut5_per_seed.csv       # Per-seed scaling metrics
+│   └── null_control_multishape.csv     # 108-run multi-shape null-control verification
 ├── docs/
 │   ├── report.md              # Technical report
 │   ├── reproduce.md           # Reproduction runbook
@@ -170,13 +175,13 @@ python3 analysis/paired_stats.py results/holdout_per_seed.csv "Holdout Faults" M
 python3 analysis/paired_stats.py results/holdout_per_seed.csv "Out-of-Contract Control" MUT-X6_k2 MUT-X6_k5 MUT-X6_k9
 ```
 
-### 4.3 Pebble #5825 Real-Bug A/B Benchmark (32 Seeds, MUT-0 vs MUT-0-FIX5825)
+### 4.3 Pebble #5825 Real-Bug A/B Benchmark (32 Seeds, MUT-0 vs BARRIER-5825)
 
-To evaluate real-world crash inconsistency caused by unsynced parent directory entries under partial retention (CockroachDB Pebble #5825), the real-bug benchmark compares unfaulted `MUT-0` against the patched control `MUT-0-FIX5825` across 32 seeds under policies 0%, 50%, and 100% with manifest rotation (`-max-manifest-size 1`):
+To evaluate real-world crash inconsistency caused by unsynced parent directory entries under partial retention (CockroachDB Pebble #5825), the real-bug benchmark compares unfaulted `MUT-0` against the patched control `BARRIER-5825` (Manifest-Rotation Barrier Control) across 32 seeds under policies 0%, 50%, and 100% with manifest rotation (`-max-manifest-size 1`):
 
 ```bash
 ./cracontest benchmark \
-  -faults MUT-0,MUT-0-FIX5825 \
+  -faults MUT-0,BARRIER-5825 \
   -max-manifest-size 1 \
   -policies 0,50,100 \
   -csv results/realbug_pebble5825_summary.csv \
@@ -191,16 +196,16 @@ python3 analysis/paired_stats.py results/realbug_pebble5825_per_seed.csv "Pebble
 ```
 
 #### Results Summary:
-- **Causal Verification:** Under `MUT-0`, 69 failures occur across 32 seeds (all manifesting exclusively at 50% partial-retention candidates). Under `MUT-0-FIX5825`, which forces parent directory sync on `Create`, `OpenReadWrite`, and `Rename`, failures drop to **0 across all 32 seeds**, causally confirming the fix for Pebble #5825.
+- **Causal Verification:** Under `MUT-0`, 69 failures occur across 32 seeds (all manifesting exclusively at 50% partial-retention candidates). Under `BARRIER-5825`, which forces parent directory sync on `Create`, `OpenReadWrite`, and `Rename`, failures drop to **0 across all 32 seeds**, causally confirming the fix for Pebble #5825.
 - **Post-Hoc Partial-Retention Prior (`dcg-pr`):** Standard `dcg` prioritizes 0%-retention candidates first, requiring a median $k_1$ of **310.50** (mean 288.53) to discover the partial-retention failure. `dcg-pr` incorporates a partial-retention prior tracking `UnsyncedDirEntryCount >= 2`, discovering the first failure at median $k_1 = \mathbf{2.50}$ (mean 10.50, AUC 0.8355), compared to uniform random B0 median $k_1 = 161.00$ (mean 173.32) and state-representative B5 median $k_1 = 65.00$ (mean 64.80).
 
-### 4.4 Pebble Checkpoint Real-Bug Holdout A/B Benchmark (32 Seeds, MUT-0 vs MUT-0-FIXCKPT)
+### 4.4 Pebble Checkpoint Real-Bug Holdout A/B Benchmark (32 Seeds, MUT-0 vs BARRIER-CKPT)
 
-To evaluate real-world crash recovery failure caused by unsynced parent directory entries in checkpoint creation (CockroachDB Pebble commit `15b500fb`), the checkpoint holdout benchmark evaluates unfaulted `MUT-0` against the causal fix control `MUT-0-FIXCKPT` across 32 seeds under partial retention (0%, 50%, 100%) with `-checkpoint-at 60`:
+To evaluate real-world crash recovery failure caused by unsynced parent directory entries in checkpoint creation (CockroachDB Pebble commit `15b500fb`), the checkpoint holdout benchmark evaluates unfaulted `MUT-0` against the causal fix control `BARRIER-CKPT` (Checkpoint Directory Barrier Control) across 32 seeds under partial retention (0%, 50%, 100%) with `-checkpoint-at 60`:
 
 ```bash
 ./cracontest benchmark \
-  -faults MUT-0,MUT-0-FIXCKPT \
+  -faults MUT-0,BARRIER-CKPT \
   -checkpoint-at 60 \
   -policies 0,50,100 \
   -csv results/realbug_checkpoint_summary.csv \
@@ -215,18 +220,24 @@ python3 analysis/paired_stats.py results/realbug_checkpoint_per_seed.csv "Pebble
 ```
 
 #### Results Summary:
-- **Causal Verification:** In Pebble `db.Checkpoint("checkpoint")`, checkpoint manifest and marker pointer files (`marker.manifest.*`) are written before `dir.Sync()`. Under 50% partial retention, unsynced directory entries are dropped while marker pointers persist, causing checkpoint recovery failure (`open_error`) on 20 of 32 seeds (30 total checkpoint recovery failures). Under `MUT-0-FIXCKPT`, which forces parent directory sync when creating checkpoint manifest/marker files, checkpoint recovery failures drop to **0 across all 32 seeds**.
-- **Pre-Freeze Prior Discovery (`dcg-pr`):** The partial-retention prior (`dcg-pr`) was frozen before evaluation (tag `v1.0-dcg-pr-freeze`). `dcg-pr` discovers the checkpoint failure at median $k_1 = \mathbf{1.00}$ (mean 82.42), compared to 0%-retention-first DCG median $k_1 = 218.50$ (mean 300.08) and uniform random B0 median $k_1 = 149.00$ (mean 160.08).
+- **Causal Verification:** In Pebble `db.Checkpoint("checkpoint")`, checkpoint manifest and marker pointer files (`marker.manifest.*`) are written before `dir.Sync()`. Under 50% partial retention, unsynced directory entries are dropped while marker pointers persist, causing checkpoint recovery failure (`open_error`) on 25 of 32 seeds (median 32.5 failing states/seed). Under `BARRIER-CKPT`, which forces parent directory sync when creating checkpoint manifest/marker files, checkpoint recovery failures drop to **0 across all 32 seeds**.
+- **Pre-Freeze Prior Discovery (`dcg-pr`):** The partial-retention prior (`dcg-pr`) was frozen before evaluation (tag `v1.0-dcg-pr-freeze`). `dcg-pr` discovers the checkpoint failure at median $k_1 = \mathbf{3.00}$ (mean 121.40), compared to 0%-retention-first DCG median $k_1 = 385.00$ (mean 314.32) and uniform random B0 median $k_1 = 156.00$ (mean 193.16).
 
 ### 4.5 MUT-5 Universe-Scaling Benchmark (ops ∈ {120, 300, 600, 1200})
 
 To evaluate candidate universe scaling behavior on single-sync drop faults (`MUT-5`, single WAL sync drop), the scaling experiment evaluates 8 seeds across 4 operations scales:
 
 ```bash
-go test -count=1 -timeout 1200s -run TestScalingMUT5 ./internal/exp/...
+go test -v -count=1 -timeout 1200s -run TestScalingMUT5 ./internal/exp -update
 ```
 
 Outputs: `results/scaling_mut5_per_seed.csv` and `results/scaling_mut5_summary.csv`.
+
+> **Note:** `TestScalingMUT5` and `TestNullControlMultiShape` validate the committed CSVs in `results/` by default during `go test ./...` (read-only — no files are written). To regenerate the CSVs from scratch, pass the `-update` flag:
+> ```
+> go test -v -count=1 -timeout 1200s -run TestScalingMUT5 ./internal/exp -update
+> go test -v -count=1 -timeout 1200s -run TestNullControlMultiShape ./internal/exp -update
+> ```
 
 #### Results Summary:
 - Candidate universes scale from ~338 (120 ops) to ~2,958 (1,200 ops).
@@ -239,7 +250,7 @@ Outputs: `results/scaling_mut5_per_seed.csv` and `results/scaling_mut5_summary.c
 To establish zero false alarm rates across diverse workload geometries, the multi-shape null-control check tests 12 shapes across 9 seeds on `MUT-0` at 0%/100% policies:
 
 ```bash
-go test -count=1 -timeout 1200s -run TestNullControlMultiShape ./internal/exp/...
+go test -v -count=1 -timeout 1200s -run TestNullControlMultiShape ./internal/exp -update
 ```
 
 Outputs: `results/null_control_multishape.csv`.

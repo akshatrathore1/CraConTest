@@ -97,7 +97,7 @@ def safe_mean(seq):
 def analyse(settings, root, strategies=('dcg', 'dcg-pr', 'dcg-flag-only', 'r2', 'r1', 'b0', 'b2'), baselines_for_tests=('r2', 'r1', 'b0')):
     out = []
     if root.endswith('.csv') or (os.path.exists(root) and not os.path.isdir(root)):
-        with open(root, 'r', encoding='utf-8') as f:
+        with open(root, 'r', encoding='utf-8-sig') as f:
             reader = csv.DictReader(f)
             data_by_fault = {}
             for row in reader:

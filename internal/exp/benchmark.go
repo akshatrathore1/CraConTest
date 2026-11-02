@@ -863,7 +863,7 @@ func RunBenchmark(cfg BenchmarkConfig, progress func(string)) (*BenchmarkResult,
 	mut0AlreadyRun := false
 	for _, fid := range cfg.FaultIDs {
 		norm, _ := faults.NormalizeID(fid)
-		if norm == faults.MUT0 || norm == faults.MUT0Fix5825 {
+		if norm == faults.MUT0 || norm == faults.Barrier5825 {
 			mut0AlreadyRun = true
 			break
 		}
