@@ -587,6 +587,7 @@ func RunSingleSeedFault(seed uint64, faultID string, cfg BenchmarkConfig) (*Sing
 		{"b6", strategy.NewSyncBoundary()},
 		{"b7", strategy.NewRiskHorizon(strategy.DefaultRHGWeights)},
 		{"dcg", NewDCGStrategy()},
+		{"dcg-pr", NewDCGPartialStrategy()},
 	}
 
 	totalFailures := expRes.Summary.Violations + expRes.Summary.OpenErrors
@@ -846,7 +847,17 @@ func RunBenchmark(cfg BenchmarkConfig, progress func(string)) (*BenchmarkResult,
 
 	// MUT-0 null control check if enabled
 	mut0Violations := 0
-	if cfg.TrackMUT0 {
+	// If MUT-0 or MUT-0-FIX5825 is already in FaultIDs, extract violations from the fault summaries
+	// rather than re-running a separate control pass.
+	mut0AlreadyRun := false
+	for _, fid := range cfg.FaultIDs {
+		norm, _ := faults.NormalizeID(fid)
+		if norm == faults.MUT0 || norm == faults.MUT0Fix5825 {
+			mut0AlreadyRun = true
+			break
+		}
+	}
+	if cfg.TrackMUT0 && !mut0AlreadyRun {
 		if progress != nil {
 			progress("Verifying null control MUT-0 across workload seeds (0 false alarms check)...")
 		}
@@ -910,7 +921,7 @@ func aggregateFaultSummary(fs *FaultModelSummary) {
 	}
 
 	// 1. Aggregate strategies across runs
-	stratCodes := []string{"b0", "b1", "b2", "b3", "b4", "b5", "b6", "b7", "r1", "r2", "dcg", "dcg-flag-only"}
+	stratCodes := []string{"b0", "b1", "b2", "b3", "b4", "b5", "b6", "b7", "r1", "r2", "dcg", "dcg-pr", "dcg-flag-only"}
 	for _, code := range stratCodes {
 		var k1FailVals, k1ViolVals, bFullVals, s25Vals, s100Vals []float64
 		var sumAUCF, sumAUCB float64
@@ -1030,6 +1041,8 @@ func aggregateFaultSummary(fs *FaultModelSummary) {
 			sName = "State-Representative Random (R2)"
 		} else if code == "dcg" {
 			sName = "Durability-Contract Guided (DCG)"
+		} else if code == "dcg-pr" {
+			sName = "DCG Partial-Retention Prior (DCG-PR)"
 		} else if code == "dcg-flag-only" {
 			sName = "DCG Flag-Only (Ablation)"
 		} else if len(fs.Runs) > 0 {

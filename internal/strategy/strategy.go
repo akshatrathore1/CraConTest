@@ -446,6 +446,8 @@ func ByName(name string, seed uint64, weights Weights) (Strategy, error) {
 		return NewDCG(), nil
 	case "dcg-flag-only", "dcg_flag_only", "dcg-flagonly":
 		return NewDCGFlagOnly(seed), nil
+	case "dcg-pr", "dcg_partial", "dcg-partial":
+		return NewDCGPartial(), nil
 	}
 	return nil, fmt.Errorf("%w: %q", ErrUnknownStrategy, name)
 }

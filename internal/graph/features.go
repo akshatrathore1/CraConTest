@@ -295,6 +295,11 @@ type ContractFeatures struct {
 	// DirtyLogBytes is the total byte volume of dirty spans still present on
 	// WAL files that were closed before their data was synced.
 	DirtyLogBytes uint64 `json:"dirty_log_bytes"`
+
+	// UnsyncedDirEntryCount is the maximum count of unsynced directory entries (files with
+	// dirEntrySynced==false plus unsyncedDirs entries) coexisting in the same parent directory
+	// at this cutoff.
+	UnsyncedDirEntryCount int `json:"unsynced_dir_entry_count"`
 }
 
 type writeSpan struct {
@@ -924,6 +929,24 @@ func ComputeContractFeaturesWithWeights(events []trace.Event, weights DCGWeights
 			}
 		}
 
+		// Compute UnsyncedDirEntryCount: max unsynced dir entries in any single parentDir.
+		parentUnsyncedCount := make(map[string]int)
+		for _, f := range files {
+			if !f.dirEntrySynced {
+				parentUnsyncedCount[f.parentDir]++
+			}
+		}
+		for dirPath := range unsyncedDirs {
+			pdir := parent(dirPath)
+			parentUnsyncedCount[pdir]++
+		}
+		maxUnsyncedDirEntries := 0
+		for _, cnt := range parentUnsyncedCount {
+			if cnt > maxUnsyncedDirEntries {
+				maxUnsyncedDirEntries = cnt
+			}
+		}
+
 		cuts[event.ID] = ContractFeatures{
 			AckSyncMissing:          ackMissing,
 			UnpersistedAckOps:       unpersistedOps,
@@ -937,6 +960,7 @@ func ComputeContractFeaturesWithWeights(events []trace.Event, weights DCGWeights
 			ContractScore:           score,
 			HasClosedDirtyLog:       hasClosedDirtyLog,
 			DirtyLogBytes:           dirtyLogBytes,
+			UnsyncedDirEntryCount:   maxUnsyncedDirEntries,
 		}
 	}
 

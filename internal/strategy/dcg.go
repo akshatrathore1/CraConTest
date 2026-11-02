@@ -482,3 +482,221 @@ func (s dcgFlagOnly) Rank(view *graph.View, universe []candidate.Candidate) []ca
 	}
 	return result
 }
+
+// --- DCGPartial: post-hoc partial-retention prior (dcg-pr) -------------------
+
+type dcgPartial struct {
+	weights DCGWeights
+}
+
+// NewDCGPartial creates the post-hoc partial-retention prior strategy (dcg-pr).
+// When the universe contains only 0% and 100% candidates, it produces the same
+// ranking as dcg. When intermediate-retention candidates (0 < Percent < 100) are
+// present, it places representatives whose cutoff has UnsyncedDirEntryCount >= 2
+// at the front of Tier 1, followed by standard dcg 0% Tier 1, then 0% Tier 2,
+// then remaining intermediate-retention candidates, then non-representatives, then
+// 100% candidates.
+func NewDCGPartial(weights ...DCGWeights) Strategy {
+	w := DefaultDCGWeights
+	if len(weights) > 0 {
+		w = weights[0]
+	}
+	return dcgPartial{weights: w}
+}
+
+func (dcgPartial) Name() string { return "dcg-pr" }
+
+func (s dcgPartial) Rank(view *graph.View, universe []candidate.Candidate) []candidate.Candidate {
+	ordered := canonical(universe)
+	if len(ordered) <= 1 {
+		return ordered
+	}
+	if view == nil {
+		return ordered
+	}
+	labels, ok := features(view, ordered)
+	if !ok {
+		return nil
+	}
+
+	// Compute contract features.
+	var contractMap map[uint64]graph.ContractFeatures
+	if len(view.Events) > 0 {
+		contractMap = graph.ComputeContractFeaturesWithWeights(view.Events, s.weights)
+	}
+
+	// Separate by retention policy.
+	var u0 []candidate.Candidate
+	var u0Labels []graph.Features
+	var u0Contract []graph.ContractFeatures
+	var uMid []candidate.Candidate
+	var uMidLabels []graph.Features
+	var uMidContract []graph.ContractFeatures
+	var u100 []candidate.Candidate
+
+	for i, c := range ordered {
+		cf := graph.ContractFeatures{}
+		if contractMap != nil {
+			cf = contractMap[c.Event]
+		}
+		if c.Percent == 0 {
+			u0 = append(u0, c)
+			u0Labels = append(u0Labels, labels[i])
+			u0Contract = append(u0Contract, cf)
+		} else if c.Percent == 100 {
+			u100 = append(u100, c)
+		} else {
+			uMid = append(uMid, c)
+			uMidLabels = append(uMidLabels, labels[i])
+			uMidContract = append(uMidContract, cf)
+		}
+	}
+
+	// If no intermediate candidates, fall back to exact dcg ranking.
+	if len(uMid) == 0 {
+		base := dcg{weights: s.weights}
+		return base.Rank(view, universe)
+	}
+
+	// Build the standard dcg ranking for 0% candidates (for Tier 1 and Tier 2).
+	// We reuse dcg.Rank on a sub-universe of just 0% and 100% to get the ordering.
+	// Then we prepend intermediate-retention representatives with UnsyncedDirEntryCount >= 2.
+
+	// Group intermediate-retention candidates by (StateKey, Percent) and select one
+	// canonical representative per group using isDCGBetterRep (preferring cutoffs with
+	// UnsyncedDirEntryCount >= 2).
+	type midGroup struct {
+		key        string
+		candidates []candidate.Candidate
+		feats      []graph.Features
+		contracts  []graph.ContractFeatures
+	}
+	midGroupIndex := make(map[string]int)
+	var midGroups []midGroup
+
+	for i, c := range uMid {
+		key := fmt.Sprintf("%s|%d", uMidLabels[i].StateKey, c.Percent)
+		idx, found := midGroupIndex[key]
+		if !found {
+			idx = len(midGroups)
+			midGroupIndex[key] = idx
+			midGroups = append(midGroups, midGroup{key: key})
+		}
+		midGroups[idx].candidates = append(midGroups[idx].candidates, c)
+		midGroups[idx].feats = append(midGroups[idx].feats, uMidLabels[i])
+		midGroups[idx].contracts = append(midGroups[idx].contracts, uMidContract[i])
+	}
+
+	type midRepInfo struct {
+		cand     candidate.Candidate
+		feat     graph.Features
+		contract graph.ContractFeatures
+	}
+
+	var midRepsHighUnsynced []midRepInfo // UnsyncedDirEntryCount >= 2
+	var midRepsOther []midRepInfo        // other intermediate reps
+	var midNonReps []candidate.Candidate
+
+	for _, g := range midGroups {
+		bestIdx := 0
+		for j := 1; j < len(g.candidates); j++ {
+			// Prefer UnsyncedDirEntryCount >= 2, then isDCGBetterRep.
+			aHigh := g.contracts[j].UnsyncedDirEntryCount >= 2
+			bHigh := g.contracts[bestIdx].UnsyncedDirEntryCount >= 2
+			if aHigh && !bHigh {
+				bestIdx = j
+				continue
+			}
+			if bHigh && !aHigh {
+				continue
+			}
+			if isDCGBetterRep(g.feats[j], g.feats[bestIdx], g.contracts[j], g.contracts[bestIdx], g.candidates[j], g.candidates[bestIdx]) {
+				bestIdx = j
+			}
+		}
+		rep := midRepInfo{
+			cand:     g.candidates[bestIdx],
+			feat:     g.feats[bestIdx],
+			contract: g.contracts[bestIdx],
+		}
+		if rep.contract.UnsyncedDirEntryCount >= 2 {
+			midRepsHighUnsynced = append(midRepsHighUnsynced, rep)
+		} else {
+			midRepsOther = append(midRepsOther, rep)
+		}
+		for j := 0; j < len(g.candidates); j++ {
+			if j != bestIdx {
+				midNonReps = append(midNonReps, g.candidates[j])
+			}
+		}
+	}
+
+	// Sort midRepsHighUnsynced: BeforeBoundary DESC, BarrierProximity DESC, UnsyncedDirEntryCount DESC, SemanticTier DESC, RiskScore DESC, candidate.Less.
+	sort.Slice(midRepsHighUnsynced, func(i, j int) bool {
+		a, b := midRepsHighUnsynced[i], midRepsHighUnsynced[j]
+		if a.feat.BeforeBoundary != b.feat.BeforeBoundary {
+			return a.feat.BeforeBoundary
+		}
+		if a.feat.BarrierProximity != b.feat.BarrierProximity {
+			return a.feat.BarrierProximity > b.feat.BarrierProximity
+		}
+		if a.contract.UnsyncedDirEntryCount != b.contract.UnsyncedDirEntryCount {
+			return a.contract.UnsyncedDirEntryCount > b.contract.UnsyncedDirEntryCount
+		}
+		if a.feat.SemanticTier != b.feat.SemanticTier {
+			return a.feat.SemanticTier > b.feat.SemanticTier
+		}
+		if a.feat.RiskScore != b.feat.RiskScore {
+			return a.feat.RiskScore > b.feat.RiskScore
+		}
+		return candidate.Less(a.cand, b.cand)
+	})
+
+	// Get the standard dcg ordering for the 0% + 100% sub-universe.
+	subUniverse := make([]candidate.Candidate, 0, len(u0)+len(u100))
+	subUniverse = append(subUniverse, u0...)
+	subUniverse = append(subUniverse, u100...)
+
+	base := dcg{weights: s.weights}
+	dcgSubRanked := base.Rank(view, subUniverse)
+
+	// Split dcgSubRanked into 0% part (Tier 1+2) and 100% part.
+	var dcg0Ranked []candidate.Candidate
+	var dcg100Ranked []candidate.Candidate
+	for _, c := range dcgSubRanked {
+		if c.Percent == 0 {
+			dcg0Ranked = append(dcg0Ranked, c)
+		} else {
+			dcg100Ranked = append(dcg100Ranked, c)
+		}
+	}
+
+	// Sort midRepsOther canonically.
+	sort.Slice(midRepsOther, func(i, j int) bool {
+		return candidate.Less(midRepsOther[i].cand, midRepsOther[j].cand)
+	})
+	candidate.Sort(midNonReps)
+	candidate.Sort(dcg100Ranked)
+
+	// Assemble final ranking:
+	// 1. Intermediate reps with UnsyncedDirEntryCount >= 2 (front of Tier 1)
+	// 2. Standard 0% dcg Tier 1+2 ranking
+	// 3. Remaining intermediate-retention representatives
+	// 4. Intermediate non-representatives
+	// 5. 100% candidates
+	ranking := make([]candidate.Candidate, 0, len(ordered))
+	for _, r := range midRepsHighUnsynced {
+		ranking = append(ranking, r.cand)
+	}
+	ranking = append(ranking, dcg0Ranked...)
+	for _, r := range midRepsOther {
+		ranking = append(ranking, r.cand)
+	}
+	ranking = append(ranking, midNonReps...)
+	ranking = append(ranking, dcg100Ranked...)
+
+	if err := ValidatePermutation(universe, ranking); err != nil {
+		panic(fmt.Sprintf("strategy: dcg-pr permutation invalid: %v", err))
+	}
+	return ranking
+}

@@ -225,6 +225,12 @@ func NewDCGStrategy() strategy.Strategy {
 	return strategy.NewDCG()
 }
 
+// NewDCGPartialStrategy creates a post-hoc partial-retention prior (dcg-pr) ranking strategy
+// delegating to the canonical strategy.NewDCGPartial() implementation.
+func NewDCGPartialStrategy() strategy.Strategy {
+	return strategy.NewDCGPartial()
+}
+
 // WriteMultiSeedCSV exports the complete multi-seed aggregated metrics with 95% CIs to CSV.
 func WriteMultiSeedCSV(res *BenchmarkResult, csvPath string) error {
 	f, err := os.Create(csvPath)
@@ -278,7 +284,7 @@ func WriteMultiSeedCSV(res *BenchmarkResult, csvPath string) error {
 	sort.Strings(extraFaults)
 	allFaults := append(faultOrder, extraFaults...)
 
-	stratOrder := []string{"dcg", "dcg-flag-only", "r2", "r1", "b6", "b0", "b7", "b5", "b4", "b1", "b2", "b3"}
+	stratOrder := []string{"dcg", "dcg-pr", "dcg-flag-only", "r2", "r1", "b6", "b0", "b7", "b5", "b4", "b1", "b2", "b3"}
 
 	for _, fid := range allFaults {
 		summ, ok := res.FaultSummaries[fid]
@@ -483,7 +489,7 @@ func GenerateMultiSeedReportMarkdown(res *BenchmarkResult) string {
 		sb.WriteString("| Strategy | $k_1$ Median [95% CI] | $k_1$ Mean [95% CI] | $k_1$ $P_{10}$ | $k_1$ $P_{90}$ | $S_{25}$ Median | $S_{25}$ Mean | $S_{100}$ Median | $S_{100}$ Mean | $B_{\\text{full}}$ Median | $\\text{AUC}_{\\text{norm}}$ |\n")
 		sb.WriteString("|---|---|---|---|---|---|---|---|---|---|---|\n")
 
-		stratsToRender := []string{"dcg", "dcg-flag-only", "b7", "r2", "r1", "b2", "b6", "b0"}
+		stratsToRender := []string{"dcg", "dcg-pr", "dcg-flag-only", "b7", "r2", "r1", "b2", "b6", "b0"}
 		for _, code := range stratsToRender {
 			s, exists := summ.StrategySummaries[code]
 			if !exists {
@@ -493,6 +499,8 @@ func GenerateMultiSeedReportMarkdown(res *BenchmarkResult) string {
 			nameStr := s.StrategyName
 			if code == "dcg" {
 				nameStr = "**DCG (Guided)**"
+			} else if code == "dcg-pr" {
+				nameStr = "**DCG-PR (Partial Prior)**"
 			} else if code == "dcg-flag-only" {
 				nameStr = "**DCG-FlagOnly**"
 			} else if code == "b7" {
@@ -655,7 +663,7 @@ func WriteMultiSeedPerSeedCSV(res *BenchmarkResult, csvPath string) error {
 	sort.Strings(extraFaults)
 	allFaults := append(faultOrder, extraFaults...)
 
-	stratOrder := []string{"dcg", "dcg-flag-only", "r2", "r1", "b6", "b0", "b7", "b5", "b4", "b1", "b2", "b3"}
+	stratOrder := []string{"dcg", "dcg-pr", "dcg-flag-only", "r2", "r1", "b6", "b0", "b7", "b5", "b4", "b1", "b2", "b3"}
 
 	for _, fid := range allFaults {
 		summ, ok := res.FaultSummaries[fid]

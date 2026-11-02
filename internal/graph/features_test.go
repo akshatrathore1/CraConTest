@@ -728,3 +728,23 @@ func TestContractFeatures_PostOpenManifestAppendRequiresRetirementOrDirtyWAL(t *
 			cfRemove.DanglingTableCount)
 	}
 }
+
+func TestUnsyncedDirEntryCount(t *testing.T) {
+	// Build a trace where two files are created in the same directory before dir sync.
+	events := []trace.Event{
+		{ID: 1, Kind: trace.KindCreate, File: "db/MANIFEST-000001", Cat: "pebble-manifest", Handle: 10},
+		{ID: 2, Kind: trace.KindCreate, File: "db/marker.manifest.000002", Handle: 11},
+		{ID: 3, Kind: trace.KindSync, File: "db", Dir: true, Handle: 20},
+	}
+	cuts := graph.ComputeContractFeatures(events)
+	// After event 2 (two files created, no dir sync yet), UnsyncedDirEntryCount must be >= 2.
+	cf2 := cuts[2]
+	if cf2.UnsyncedDirEntryCount < 2 {
+		t.Errorf("UnsyncedDirEntryCount at cut 2 = %d, want >= 2", cf2.UnsyncedDirEntryCount)
+	}
+	// After event 3 (dir sync), UnsyncedDirEntryCount should drop to 0.
+	cf3 := cuts[3]
+	if cf3.UnsyncedDirEntryCount != 0 {
+		t.Errorf("UnsyncedDirEntryCount at cut 3 = %d, want 0", cf3.UnsyncedDirEntryCount)
+	}
+}

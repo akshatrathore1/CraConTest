@@ -11,7 +11,7 @@ import csv, json, glob, sys, math, random, statistics as st, os
 from scipy import stats
 
 MUT = {'Write','Create','Rename','Remove','Sync','SyncData','ReuseForWrite','Truncate','Link'}
-NAMES = {'dcg': 'DCG', 'dcg-flag-only': 'FlagOnly', 'r2': 'R2', 'r1': 'R1', 'b0': 'B0', 'b2': 'LIFO', 'b7': 'RHG'}
+NAMES = {'dcg': 'DCG', 'dcg-pr': 'DCG-PR', 'dcg-flag-only': 'FlagOnly', 'r2': 'R2', 'r1': 'R1', 'b0': 'B0', 'b2': 'LIFO', 'b7': 'RHG'}
 
 def ld(p):
     with open(p, 'r', encoding='utf-8') as f:
@@ -94,7 +94,7 @@ def safe_mean(seq):
     vals = [x for x in seq if x is not None] if seq else []
     return st.mean(vals) if vals else float('nan')
 
-def analyse(settings, root, strategies=('dcg', 'dcg-flag-only', 'r2', 'r1', 'b0', 'b2'), baselines_for_tests=('r2', 'r1', 'b0')):
+def analyse(settings, root, strategies=('dcg', 'dcg-pr', 'dcg-flag-only', 'r2', 'r1', 'b0', 'b2'), baselines_for_tests=('r2', 'r1', 'b0')):
     out = []
     if root.endswith('.csv') or (os.path.exists(root) and not os.path.isdir(root)):
         with open(root, 'r', encoding='utf-8') as f:

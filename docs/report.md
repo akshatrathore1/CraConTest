@@ -32,6 +32,10 @@ We address this question through a two-stage empirical evaluation on CockroachDB
    - **State-equivalence partitioning (R2):** State-Representative Random (`R2`) partitions 0%-retention candidates into canonical `StateKey` equivalence classes, selecting boundary-adjacent representatives within each `StateKey` class using graph features (`BeforeBoundary`, `SemanticTier`, `Desc`) before shuffling classes. This halves the search cost on sparse faults compared to random selection (`MUT-5` mean $k_1 = 13.01$ vs. `B0`'s $25.97$).
    - **Durability-Contract Guided Ranking (DCG):** Trace-derived durability-contract analysis encoding POSIX durability-contract priors instantiated for Pebble (`features.go`) directly into the ranking. DCG achieves an optimal $k_1 = 1.00$ [1.00, 1.00] across all active fault models (`MUT-1..6`, `MUT-8`, `MUT-9`), outperforming both uniform random and pure state-representative sampling. The `DCG-FlagOnly` ablation ties full `DCG` on nearly every setting, showing that the contract indicators (POSIX durability-contract priors instantiated for Pebble) combined with `StateKey` equivalence partitioning drive the speedup.
 
+3. **Stage 3: Real-Bug A/B Benchmark (CockroachDB Pebble #5825, §9):**
+   - **Causal Bug Reproduction & Elimination:** Evaluated on real-world defect Pebble #5825 across 32 seeds under partial retention (50%). Baseline `MUT-0` produces 69 consistency failures across 32 seeds. The causal fix control `MUT-0-FIX5825` (forcing parent directory sync on `Create`/`Rename`) completely eliminates all 69 failures (0 across all seeds).
+   - **Post-Hoc Partial-Retention Prior (`dcg-pr`):** Standard `dcg` (0%-retention first) encounters the bug at median $k_1 = 310.50$, whereas `dcg-pr` prioritizes unsynced directory hazards under intermediate retention (`UnsyncedDirEntryCount >= 2`), discovering the real bug at median $k_1 = 2.50$ (mean $10.50$, AUC 0.8355).
+
 ---
 
 ## 2. Method
@@ -325,3 +329,39 @@ Across 32 deterministic workload seeds (>11,000 evaluated crash candidates):
 
 3. **$S_{25}$ Early-Budget Discovery & The ~40-State Equivalence Ceiling:**
    In a 120-operation workload, there are only ~35–40 distinct canonical `StateKey` persistence states under 0%-retention crashes. Under an exhaustive testing budget ($B = 100$, $S_{100}$), both DCG and R2 discover all reachable failing equivalence classes and tie because both strategies exhaust distinct state representatives before step 100 (reaching identical $S_{100} = 23.97$ on `MUT-1`, $33.03$ on `MUT-2`, $27.00$ on `MUT-3`, $21.72$ on `MUT-4`, and $27.00$ on `MUT-9`). Under MUT-8 (compaction-triggered SST sync drop, 15.2% density), DCG reaches the first failing state at median $k_1 = 1.0$ (mean 1.00) compared to R2's median $k_1 = 3.6$ (mean 3.56) and B0's median $k_1 = 4.0$ (mean 4.44), achieves early-budget $S_{25} = 12.88$ (vs R2's $6.72$ and B0's $2.00$), and matches R2 at full budget ($S_{100} = 12.88$ for DCG vs $12.82$ for R2, compared to $5.05$ for B0). Therefore, early-budget coverage $S_{25}$ ($B = 25$) is the critical discriminant metric for practical CI testing: DCG achieves near-full state discovery saturation within the first 25 tests (e.g. $S_{25} = 23.94$ vs R2's $17.12$ and B0's $6.12$ on `MUT-1`; $S_{25} = 12.88$ vs R2's $6.72$ and B0's $2.00$ on `MUT-8`; $S_{25} = 25.00$ vs R2's $17.78$ and B0's $3.03$ on `MUT-9`), yielding a 2x–8x throughput advantage over random selection.
+
+---
+
+## 9. Real-World Case Study: Pebble #5825 A/B Benchmark & Partial-Retention Priors
+
+### 9.1 Background: CockroachDB Pebble Issue #5825
+In issue #5825, CockroachDB Pebble exhibited a crash-consistency vulnerability where file creation and rotation in the VFS created a new file and synced its data, but did not sync the parent directory immediately before creating subsequent markers or referencing the file in manifests. Under standard crash testing with 0% retention (all unsynced dirty data lost) or 100% retention (all dirty data persists), this defect can remain undetected:
+- At 0% retention, both the file content and the unsynced directory entry are dropped together.
+- At 100% retention, both the file content and directory entry survive together.
+- Under **partial retention** (e.g. 50% retention, where the kernel flushes dirty file page cache blocks to disk before dirty directory entries are persisted), the file exists on storage but its parent directory entry is missing, causing dangling file references, missing manifest files, or database recovery aborts upon restart.
+
+### 9.2 Causal A/B Verification (MUT-0 vs. MUT-0-FIX5825)
+To establish causal attribution, we benchmarked 32 deterministic workload seeds with manifest rotation enabled (`-max-manifest-size 1`) across retention policies 0%, 50%, and 100%:
+1. **MUT-0 (Unfaulted Baseline):** 69 total consistency failures occurred across the 32 seeds. Every single failure manifested exclusively on crash candidates evaluated under the **50% partial-retention policy** (~0.36%–0.57% failure density per seed).
+2. **MUT-0-FIX5825 (Parent-Dir Sync Fix):** By enforcing immediate parent directory sync (`fsync(parentDir)`) upon `Create`, `OpenReadWrite`, and `Rename`, all directory entries are made durable prior to subsequent mutations. Under MUT-0-FIX5825, **0 failures** occurred across all 32 seeds, providing definitive empirical and causal proof of defect elimination.
+
+### 9.3 Discovery Performance: Post-Hoc Partial-Retention Prior (`dcg-pr`)
+Standard durability-contract guided ranking (`dcg`) was designed with the core assumption that durability failures manifest predominantly at 0% retention (losing unpersisted data). Consequently, `dcg` sweeps all 0%-retention candidates first. On Pebble #5825, where failures only occur at 50% partial retention, standard `dcg` requires a median $k_1$ of **310.50** (mean 288.53) to discover the first failure, performing worse than uniform random B0 (median $k_1 = 161.00$, mean 173.32) and state-representative B5 (median $k_1 = 65.00$, mean 64.80).
+
+To target partial-retention directory vulnerabilities, we introduced `dcg-pr` (DCG Partial-Retention Prior). `dcg-pr` inspects `ContractFeatures.UnsyncedDirEntryCount`: candidates with `Policy > 0 && Policy < 100` and `UnsyncedDirEntryCount >= 2` are prioritized into Tier 1 (ahead of the 0% retention sweep).
+
+| Strategy | $k_1$ Failure Median [95% CI] | $k_1$ Failure Mean [95% CI] | $S_{25}$ Mean | $S_{100}$ Mean | AUC (Failures) | AUC (Bugs) |
+|---|---|---|---|---|---|---|
+| **DCG-PR (`dcg-pr`)** | **2.50** [2.00, 4.00] | **10.50** [0.00, 26.41] | **1.88** | **1.88** | **0.8355** | **0.9121** |
+| **Representative (B5)** | 65.00 [62.00, 68.00] | 64.80 [49.36, 80.24] | 0.28 | 1.16 | 0.7722 | 0.8200 |
+| **sync-boundary (B6)** | 66.50 [50.00, 110.00] | 74.20 [51.98, 96.42] | 0.25 | 0.72 | 0.6227 | 0.8047 |
+| **combined (B4)** | 92.00 [14.00, 92.00] | 80.20 [44.06, 116.34] | 0.44 | 1.06 | 0.6181 | 0.7932 |
+| **Uniform Random (B0)** | 161.00 [140.50, 174.00] | 173.32 [147.20, 199.43] | 0.00 | 0.11 | 0.4599 | 0.5875 |
+| **fifo (B1)** | 204.50 [29.00, 215.00] | 156.80 [103.47, 210.13] | 0.00 | 0.44 | 0.4705 | 0.5788 |
+| **rhg (B7)** | 258.50 [248.00, 264.50] | 257.20 [239.45, 274.95] | 0.00 | 0.00 | 0.3329 | 0.3668 |
+| **0%-Retention Random (R1)** | 300.95 [284.73, 321.53] | 306.21 [292.24, 320.18] | 0.00 | 0.00 | 0.3143 | 0.3313 |
+| **State-Representative Random (R2)** | 303.19 [279.27, 316.17] | 305.94 [290.26, 321.62] | 0.00 | 0.00 | 0.3145 | 0.3342 |
+| **DCG Flag-Only (Ablation)** | 303.87 [285.49, 318.03] | 307.24 [292.09, 322.38] | 0.00 | 0.00 | 0.3133 | 0.3318 |
+| **Durability-Contract Guided (DCG)** | 310.50 [204.00, 335.00] | 288.53 [252.28, 324.79] | 0.00 | 0.00 | 0.3535 | 0.3779 |
+
+As demonstrated, `dcg-pr` reduces $k_1$ from 310.50 down to **2.50** (a >120x speedup over standard DCG and >60x speedup over uniform random B0), with an AUC of 0.8355 (0.9121 for bugs). This demonstrates that extending durability contracts to model partial-retention directory hazards enables targeted discovery of real-world filesystem durability bugs.

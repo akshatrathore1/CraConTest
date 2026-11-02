@@ -45,7 +45,9 @@ CraConTest/
 │   ├── benchmark_summary.csv  # Aggregated 32-seed benchmark metrics (MUT-0..9)
 │   ├── benchmark_per_seed.csv # Unaggregated per-seed discovery metrics (MUT-0..9)
 │   ├── holdout_summary.csv    # Aggregated 32-seed holdout metrics (MUT-X1..X6)
-│   └── holdout_per_seed.csv   # Unaggregated per-seed discovery metrics (MUT-X1..X6)
+│   ├── holdout_per_seed.csv   # Unaggregated per-seed discovery metrics (MUT-X1..X6)
+│   ├── realbug_pebble5825_summary.csv  # Aggregated 32-seed Pebble #5825 A/B metrics
+│   └── realbug_pebble5825_per_seed.csv # Unaggregated per-seed Pebble #5825 A/B metrics
 ├── docs/
 │   ├── report.md              # Technical report
 │   ├── reproduce.md           # Reproduction runbook
@@ -167,6 +169,30 @@ python3 analysis/paired_stats.py results/holdout_per_seed.csv "Holdout Faults" M
 # Out-of-Contract Negative Control (MUT-X6)
 python3 analysis/paired_stats.py results/holdout_per_seed.csv "Out-of-Contract Control" MUT-X6_k2 MUT-X6_k5 MUT-X6_k9
 ```
+
+### 4.3 Pebble #5825 Real-Bug A/B Benchmark (32 Seeds, MUT-0 vs MUT-0-FIX5825)
+
+To evaluate real-world crash inconsistency caused by unsynced parent directory entries under partial retention (CockroachDB Pebble #5825), the real-bug benchmark compares unfaulted `MUT-0` against the patched control `MUT-0-FIX5825` across 32 seeds under policies 0%, 50%, and 100% with manifest rotation (`-max-manifest-size 1`):
+
+```bash
+./cracontest benchmark \
+  -faults MUT-0,MUT-0-FIX5825 \
+  -max-manifest-size 1 \
+  -policies 0,50,100 \
+  -csv results/realbug_pebble5825_summary.csv \
+  -per-seed-csv results/realbug_pebble5825_per_seed.csv \
+  -report ""
+```
+
+To run paired statistical comparisons on the Pebble #5825 real-bug per-seed results:
+
+```bash
+python3 analysis/paired_stats.py results/realbug_pebble5825_per_seed.csv "Pebble #5825 Real-Bug (32 seeds)" MUT-0
+```
+
+#### Results Summary:
+- **Causal Verification:** Under `MUT-0`, 69 failures occur across 32 seeds (all manifesting exclusively at 50% partial-retention candidates). Under `MUT-0-FIX5825`, which forces parent directory sync on `Create`, `OpenReadWrite`, and `Rename`, failures drop to **0 across all 32 seeds**, causally confirming the fix for Pebble #5825.
+- **Post-Hoc Partial-Retention Prior (`dcg-pr`):** Standard `dcg` prioritizes 0%-retention candidates first, requiring a median $k_1$ of **310.50** (mean 288.53) to discover the partial-retention failure. `dcg-pr` incorporates a partial-retention prior tracking `UnsyncedDirEntryCount >= 2`, discovering the first failure at median $k_1 = \mathbf{2.50}$ (mean 10.50, AUC 0.8355), compared to uniform random B0 median $k_1 = 161.00$ (mean 173.32) and state-representative B5 median $k_1 = 65.00$ (mean 64.80).
 
 ## 5. Acceptance Tests
 

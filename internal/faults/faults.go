@@ -19,16 +19,17 @@ import (
 
 // Seeded fault IDs.
 const (
-	MUT0 = "MUT-0" // Null pass-through control
-	MUT1 = "MUT-1" // Dense WAL sync drop
-	MUT2 = "MUT-2" // Dense Manifest sync drop
-	MUT3 = "MUT-3" // Dense Directory sync drop
-	MUT4 = "MUT-4" // Dense SST flush sync drop
-	MUT5 = "MUT-5" // Single k-th WAL sync drop
-	MUT6 = "MUT-6" // Single manifest-rotation sync drop
-	MUT7 = "MUT-7" // RocksDB #10573: dir sync omitted after CURRENT rename
-	MUT8 = "MUT-8" // RocksDB #10460: fsyncs omitted after trigger event
-	MUT9 = "MUT-9" // Single k-th directory sync drop
+	MUT0        = "MUT-0"         // Null pass-through control
+	MUT0Fix5825 = "MUT-0-FIX5825" // Pebble #5825 fix: pre-sync parent directory on marker creation
+	MUT1        = "MUT-1"         // Dense WAL sync drop
+	MUT2        = "MUT-2"         // Dense Manifest sync drop
+	MUT3        = "MUT-3"         // Dense Directory sync drop
+	MUT4        = "MUT-4"         // Dense SST flush sync drop
+	MUT5        = "MUT-5"         // Single k-th WAL sync drop
+	MUT6        = "MUT-6"         // Single manifest-rotation sync drop
+	MUT7        = "MUT-7"         // RocksDB #10573: dir sync omitted after CURRENT rename
+	MUT8        = "MUT-8"         // RocksDB #10460: fsyncs omitted after trigger event
+	MUT9        = "MUT-9"         // Single k-th directory sync drop
 
 	// Extended parameterized and stochastic fault models.
 	MUTX1 = "MUT-X1" // drop only the k-th WAL sync call
@@ -48,7 +49,7 @@ const (
 
 // IDs returns the list of all supported canonical fault identifiers.
 func IDs() []string {
-	return []string{MUT0, MUT1, MUT2, MUT3, MUT4, MUT5, MUT6, MUT7, MUT8, MUT9, MUTX1, MUTX2, MUTX3, MUTX4, MUTX5, MUTX6}
+	return []string{MUT0, MUT0Fix5825, MUT1, MUT2, MUT3, MUT4, MUT5, MUT6, MUT7, MUT8, MUT9, MUTX1, MUTX2, MUTX3, MUTX4, MUTX5, MUTX6}
 }
 
 // Aliases returns all supported descriptive alias fault identifiers.
@@ -95,6 +96,8 @@ func NormalizeID(id string) (string, error) {
 	switch id {
 	case MUT0:
 		return MUT0, nil
+	case MUT0Fix5825:
+		return MUT0Fix5825, nil
 	case MUT1:
 		return MUT1, nil
 	case MUT2:
@@ -127,6 +130,8 @@ func IsSparse(id string) bool {
 		return false
 	}
 	switch norm {
+	case MUT0Fix5825:
+		return false
 	case MUT2, MUT3, MUT4, MUT5, MUT6, MUT7, MUT8, MUT9:
 		return true
 	default:
@@ -406,7 +411,7 @@ func (fs *FS) shouldDropSync(f *file, op string) bool {
 	defer fs.mu.Unlock()
 
 	switch fs.cfg.ID {
-	case MUT0:
+	case MUT0, MUT0Fix5825:
 		return false
 
 	case MUT1:
@@ -531,8 +536,22 @@ func (fs *FS) shouldDropSync(f *file, op string) bool {
 	}
 }
 
+func (fs *FS) maybeSyncParentDir(path string) {
+	if fs.cfg.ID == MUT0Fix5825 && strings.Contains(path, "marker.manifest") {
+		parentDir := fs.inner.PathDir(path)
+		if parentDir == "" {
+			parentDir = "."
+		}
+		if df, err := fs.inner.OpenDir(parentDir); err == nil {
+			_ = df.Sync()
+			_ = df.Close()
+		}
+	}
+}
+
 // Create implements vfs.FS.
 func (fs *FS) Create(name string, category vfs.DiskWriteCategory) (vfs.File, error) {
+	fs.maybeSyncParentDir(name)
 	f, err := fs.inner.Create(name, category)
 	if err != nil {
 		return nil, err
@@ -572,6 +591,7 @@ func (fs *FS) Open(name string, opts ...vfs.OpenOption) (vfs.File, error) {
 
 // OpenReadWrite implements vfs.FS.
 func (fs *FS) OpenReadWrite(name string, category vfs.DiskWriteCategory, opts ...vfs.OpenOption) (vfs.File, error) {
+	fs.maybeSyncParentDir(name)
 	f, err := fs.inner.OpenReadWrite(name, category, opts...)
 	if err != nil {
 		return nil, err
@@ -609,6 +629,7 @@ func (fs *FS) RemoveAll(name string) error {
 
 // Rename implements vfs.FS.
 func (fs *FS) Rename(oldname, newname string) error {
+	fs.maybeSyncParentDir(newname)
 	fs.mu.Lock()
 	if fs.cfg.ID == MUT7 {
 		baseNew := fs.inner.PathBase(newname)

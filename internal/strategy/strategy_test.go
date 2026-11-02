@@ -1038,3 +1038,61 @@ func TestDCGTier3OrderingViolatingBeforeClean(t *testing.T) {
 		t.Fatalf("Ranks 8-9 expected 100%% retention candidates, got %+v, %+v", ranking[8], ranking[9])
 	}
 }
+
+func TestDCGPartialByNameAndRanking(t *testing.T) {
+	stratObj, err := strategy.ByName("dcg-pr", 0, strategy.DefaultWeights)
+	if err != nil {
+		t.Fatalf("ByName(\"dcg-pr\") failed: %v", err)
+	}
+	if stratObj.Name() != "dcg-pr" {
+		t.Fatalf("Name() = %q, want \"dcg-pr\"", stratObj.Name())
+	}
+
+	events := []trace.Event{
+		{ID: 1, Kind: trace.KindCreate, File: "db/MANIFEST-000001", Cat: "pebble-manifest", Handle: 1},
+		{ID: 2, Kind: trace.KindCreate, File: "db/marker.manifest.000002", Handle: 2},
+		{ID: 3, Kind: trace.KindOpenDir, File: "db", Handle: 3, Dir: true},
+		{ID: 4, Kind: trace.KindSync, File: "db", Dir: true, Handle: 3},
+	}
+
+	view, err := graph.Build(events)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	// 1. When universe has only 0% and 100%, dcg-pr produces the exact same ranking as dcg.
+	u0100 := []candidate.Candidate{
+		{Event: 2, Percent: 0, Seed: 1},
+		{Event: 4, Percent: 0, Seed: 2},
+		{Event: 4, Percent: 100, Seed: 3},
+	}
+	dcgBase := strategy.NewDCG()
+	dcgRank := dcgBase.Rank(view, u0100)
+	prRank := stratObj.Rank(view, u0100)
+	if !reflect.DeepEqual(dcgRank, prRank) {
+		t.Fatalf("dcg-pr rank for 0/100 mismatch with dcg:\n got %v\nwant %v", prRank, dcgRank)
+	}
+
+	// 2. When intermediate 50% candidate with UnsyncedDirEntryCount >= 2 is present,
+	// dcg-pr places it at position 0 (front of Tier 1), before dcg does.
+	uWithMid := []candidate.Candidate{
+		{Event: 2, Percent: 0, Seed: 1},
+		{Event: 2, Percent: 50, Seed: 2},
+		{Event: 4, Percent: 0, Seed: 3},
+		{Event: 4, Percent: 100, Seed: 4},
+	}
+	rankingPR := stratObj.Rank(view, uWithMid)
+	if err := strategy.ValidatePermutation(uWithMid, rankingPR); err != nil {
+		t.Fatalf("ValidatePermutation failed: %v", err)
+	}
+
+	if rankingPR[0].Event != 2 || rankingPR[0].Percent != 50 {
+		t.Fatalf("dcg-pr expected position 0 to be Event 2 at 50%%, got %+v", rankingPR[0])
+	}
+
+	// In contrast, base dcg ranks 0% before 50%
+	rankingDCG := dcgBase.Rank(view, uWithMid)
+	if rankingDCG[0].Percent != 0 {
+		t.Fatalf("dcg expected position 0 to be 0%% candidate, got %+v", rankingDCG[0])
+	}
+}

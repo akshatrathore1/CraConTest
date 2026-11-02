@@ -87,7 +87,7 @@ func (m *mockFS) PathBase(path string) string {
 func TestFaultIDsAndValidation(t *testing.T) {
 	ids := faults.IDs()
 	expected := []string{
-		"MUT-0", "MUT-1", "MUT-2", "MUT-3", "MUT-4", "MUT-5", "MUT-6", "MUT-7", "MUT-8", "MUT-9",
+		"MUT-0", "MUT-0-FIX5825", "MUT-1", "MUT-2", "MUT-3", "MUT-4", "MUT-5", "MUT-6", "MUT-7", "MUT-8", "MUT-9",
 		"MUT-X1", "MUT-X2", "MUT-X3", "MUT-X4", "MUT-X5", "MUT-X6",
 	}
 	if len(ids) != len(expected) {
@@ -1655,4 +1655,51 @@ func TestParameterizedFaultIDs(t *testing.T) {
 			t.Fatalf("sync 2: expected drop (xDropped=true), got false")
 		}
 	})
+}
+
+func TestMUT0Fix5825NormalizeAndParentDirSync(t *testing.T) {
+	// NormalizeID must accept MUT-0-FIX5825.
+	norm, err := faults.NormalizeID(faults.MUT0Fix5825)
+	if err != nil {
+		t.Fatalf("NormalizeID(%q) error: %v", faults.MUT0Fix5825, err)
+	}
+	if norm != faults.MUT0Fix5825 {
+		t.Fatalf("NormalizeID(%q) = %q, want %q", faults.MUT0Fix5825, norm, faults.MUT0Fix5825)
+	}
+
+	// Verify IDs() includes MUT0Fix5825.
+	found := false
+	for _, id := range faults.IDs() {
+		if id == faults.MUT0Fix5825 {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("IDs() does not contain %q", faults.MUT0Fix5825)
+	}
+
+	// Verify that Create on a marker.manifest path triggers a parent-dir sync.
+	inner := vfs.NewMem()
+	// Create the parent directory so OpenDir succeeds.
+	if err := inner.MkdirAll("db", 0755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	fs, err := faults.New(faults.MUT0Fix5825, inner)
+	if err != nil {
+		t.Fatalf("New(%q): %v", faults.MUT0Fix5825, err)
+	}
+	// Create a non-marker file first (no parent-dir sync should be forced).
+	f, err := fs.Create("db/MANIFEST-000001", vfs.WriteCategoryUnspecified)
+	if err != nil {
+		t.Fatalf("Create MANIFEST: %v", err)
+	}
+	f.Close()
+	// Create a marker.manifest file — parent dir sync should be called.
+	mf, err := fs.Create("db/marker.manifest.000002", vfs.WriteCategoryUnspecified)
+	if err != nil {
+		t.Fatalf("Create marker.manifest: %v", err)
+	}
+	mf.Close()
+	// If we reach here without panic/error, the parent-dir sync succeeded.
 }

@@ -46,6 +46,13 @@ Stage 2 stores aggregated 95%-confidence-interval summaries and unaggregated per
    - `holdout_summary.csv`: Aggregated summary statistics across 32 seeds for each strategy and fault model.
    - `holdout_per_seed.csv`: Unaggregated 32-seed per-seed discovery metrics enabling paired non-parametric statistical hypothesis testing (one-sided exact sign test and Wilcoxon signed-rank test with Holm-Bonferroni FWER adjustment) via `analysis/paired_stats.py`.
 
+3. **Pebble #5825 Real-Bug A/B Benchmark (`results/realbug_pebble5825_summary.csv`, `results/realbug_pebble5825_per_seed.csv`):**
+   - Scope: Real-world bug from CockroachDB Pebble issue #5825 evaluated across 32 deterministic seeds under partial retention policies (0%, 50%, 100%) with manifest rotation (`-max-manifest-size 1`).
+     - `MUT-0` (unfaulted baseline): Parent directory sync is not forced upon file creation or rename. In partial-retention states (50%), file data survives while the unsynced parent directory entry is dropped, reproducing Pebble #5825 (69 total failures across 32 seeds).
+     - `MUT-0-FIX5825` (causal fix control): Immediate parent directory sync is forced upon `Create`, `OpenReadWrite`, and `Rename`, making directory entries durable and causally eliminating the bug (0 failures across all 32 seeds).
+   - `realbug_pebble5825_summary.csv`: Aggregated summary statistics across 32 seeds comparing standard DCG, DCG-PR (`dcg-pr`), DCG Flag-Only, R2, R1, and baseline search heuristics.
+   - `realbug_pebble5825_per_seed.csv`: Unaggregated per-seed discovery metrics across 32 seeds. Demonstrates that while standard DCG prioritizes 0% retention first (median $k_1 = 310.50$, mean $k_1 = 288.53$), `dcg-pr` incorporates a post-hoc partial-retention prior tracking `UnsyncedDirEntryCount >= 2`, discovering the failure at median $k_1 = 2.50$ (mean $k_1 = 10.50$).
+
 ---
 
 ## Statistical Reproduction Commands
@@ -61,4 +68,7 @@ python3 analysis/paired_stats.py results/holdout_per_seed.csv "Holdout Faults" M
 
 # Out-of-Contract Control (MUT-X6)
 python3 analysis/paired_stats.py results/holdout_per_seed.csv "Out-of-Contract Control" MUT-X6_k2 MUT-X6_k5 MUT-X6_k9
+
+# Pebble #5825 Real-Bug A/B Benchmark (MUT-0)
+python3 analysis/paired_stats.py results/realbug_pebble5825_per_seed.csv "Pebble #5825 Real-Bug (32 seeds)" MUT-0
 ```

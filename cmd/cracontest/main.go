@@ -320,6 +320,7 @@ func runPlan(args []string) error {
 		{strategy.NewR1(*rankingSeed), *rankingSeed, "r1"},
 		{strategy.NewR2(*rankingSeed), *rankingSeed, "r2"},
 		{exp.NewDCGStrategy(), 0, "dcg"},
+		{exp.NewDCGPartialStrategy(), 0, "dcg-pr"},
 		{strategy.NewDCGFlagOnly(*rankingSeed), *rankingSeed, "dcg-flag-only"},
 	}
 
