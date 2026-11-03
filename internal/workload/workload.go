@@ -17,8 +17,18 @@ import (
 	"github.com/cockroachdb/pebble/v2/vfs"
 )
 
+// Workload preset identifiers for multi-distribution evaluation.
+const (
+	PresetYCSBA          = "ycsb-a"
+	PresetYCSBB          = "ycsb-b"
+	PresetYCSBF          = "ycsb-f"
+	PresetOverwriteHeavy = "overwrite-heavy"
+	PresetDeleteHeavy    = "delete-heavy"
+)
+
 // Config specifies the configuration for deterministic workload execution.
 type Config struct {
+	Preset              string `json:"preset,omitempty"`
 	Seed                uint64 `json:"seed"`
 	Operations          int    `json:"operations"`
 	KeyCount            int    `json:"key_count"`
@@ -30,6 +40,7 @@ type Config struct {
 	MaxManifestFileSize int64  `json:"max_manifest_file_size,omitempty"`
 	IngestEvery         int    `json:"ingest_every,omitempty"`
 	RatchetAt           int    `json:"ratchet_at,omitempty"`
+	BarrierIngest       bool   `json:"barrier_ingest,omitempty"`
 	FS                  vfs.FS `json:"-"`
 }
 
@@ -47,14 +58,30 @@ func DefaultConfig() Config {
 
 // Validate verifies that cfg contains valid operational parameters.
 func Validate(cfg Config) error {
+	if cfg.Preset != "" {
+		switch cfg.Preset {
+		case PresetYCSBA, PresetYCSBB, PresetYCSBF, PresetOverwriteHeavy, PresetDeleteHeavy:
+		default:
+			return fmt.Errorf("unknown workload preset %q", cfg.Preset)
+		}
+	}
 	if cfg.Operations <= 0 {
 		return fmt.Errorf("operations must be > 0, got %d", cfg.Operations)
 	}
-	if cfg.KeyCount <= 0 {
-		return fmt.Errorf("key_count must be > 0, got %d", cfg.KeyCount)
-	}
-	if cfg.ValueBytes <= 0 {
-		return fmt.Errorf("value_bytes must be > 0, got %d", cfg.ValueBytes)
+	if cfg.Preset == "" {
+		if cfg.KeyCount <= 0 {
+			return fmt.Errorf("key_count must be > 0, got %d", cfg.KeyCount)
+		}
+		if cfg.ValueBytes <= 0 {
+			return fmt.Errorf("value_bytes must be > 0, got %d", cfg.ValueBytes)
+		}
+	} else {
+		if cfg.KeyCount < 0 {
+			return fmt.Errorf("key_count must be >= 0, got %d", cfg.KeyCount)
+		}
+		if cfg.ValueBytes < 0 {
+			return fmt.Errorf("value_bytes must be >= 0, got %d", cfg.ValueBytes)
+		}
 	}
 	if cfg.SyncEvery < 0 {
 		return fmt.Errorf("sync_every must be >= 0, got %d", cfg.SyncEvery)
@@ -116,61 +143,111 @@ func Plan(cfg Config) []PlanOperation {
 	if err := Validate(cfg); err != nil {
 		return nil
 	}
+	keyCount := cfg.KeyCount
+	valueBytes := cfg.ValueBytes
+	if valueBytes <= 0 {
+		valueBytes = 64
+	}
+	checkpointAt := cfg.CheckpointAt
+	switch cfg.Preset {
+	case PresetYCSBA:
+		if keyCount <= 0 {
+			keyCount = 8
+		}
+	case PresetYCSBB:
+		if keyCount <= 0 {
+			keyCount = 12
+		}
+	case PresetYCSBF:
+		if keyCount <= 0 {
+			keyCount = 8
+		}
+	case PresetOverwriteHeavy:
+		if keyCount <= 0 {
+			keyCount = 4
+		}
+	case PresetDeleteHeavy:
+		if keyCount <= 0 {
+			keyCount = 8
+		}
+		if checkpointAt <= 0 {
+			checkpointAt = 10
+		}
+	}
+
 	rng := rand.New(rand.NewPCG(0, cfg.Seed))
 	var plan []PlanOperation
 	var opID uint64
 	var mutatingCount int
 
 	for i := 0; i < cfg.Operations; i++ {
-		roll := rng.IntN(100)
-		opID++
+		switch cfg.Preset {
+		case PresetYCSBA:
+			opID++
+			roll := rng.IntN(100)
+			if roll < 50 {
+				mutatingCount++
+				sync := (cfg.SyncEvery > 0 && mutatingCount%cfg.SyncEvery == 0)
+				kIdx := rng.IntN(keyCount)
+				k := formatKey(kIdx)
+				v := makeValue(rng, valueBytes, fmt.Sprintf("%05d", opID))
+				plan = append(plan, PlanOperation{
+					Op:       opID,
+					Kind:     "set",
+					Mutating: true,
+					Sync:     sync,
+					Key:      k,
+					Value:    v,
+				})
+			} else {
+				kIdx := rng.IntN(keyCount)
+				plan = append(plan, PlanOperation{
+					Op:       opID,
+					Kind:     "get",
+					Mutating: false,
+					Key:      formatKey(kIdx),
+				})
+			}
 
-		switch {
-		case roll < 50: // 50% set
+		case PresetYCSBB:
+			opID++
+			if i%4 == 3 {
+				mutatingCount++
+				sync := (cfg.SyncEvery > 0 && mutatingCount%cfg.SyncEvery == 0)
+				kIdx := rng.IntN(keyCount)
+				k := formatKey(kIdx)
+				v := makeValue(rng, valueBytes, fmt.Sprintf("%05d", opID))
+				plan = append(plan, PlanOperation{
+					Op:       opID,
+					Kind:     "set",
+					Mutating: true,
+					Sync:     sync,
+					Key:      k,
+					Value:    v,
+				})
+			} else {
+				kIdx := rng.IntN(keyCount)
+				plan = append(plan, PlanOperation{
+					Op:       opID,
+					Kind:     "get",
+					Mutating: false,
+					Key:      formatKey(kIdx),
+				})
+			}
+
+		case PresetYCSBF:
+			opID++
 			mutatingCount++
 			sync := (cfg.SyncEvery > 0 && mutatingCount%cfg.SyncEvery == 0)
-			kIdx := rng.IntN(cfg.KeyCount)
-			k := formatKey(kIdx)
-			v := makeValue(rng, cfg.ValueBytes, fmt.Sprintf("%05d", opID))
-			plan = append(plan, PlanOperation{
-				Op:       opID,
-				Kind:     "set",
-				Mutating: true,
-				Sync:     sync,
-				Key:      k,
-				Value:    v,
-			})
-
-		case roll < 70: // 20% get
-			kIdx := rng.IntN(cfg.KeyCount)
-			plan = append(plan, PlanOperation{
-				Op:       opID,
-				Kind:     "get",
-				Mutating: false,
-				Key:      formatKey(kIdx),
-			})
-
-		case roll < 80: // 10% delete
-			mutatingCount++
-			sync := (cfg.SyncEvery > 0 && mutatingCount%cfg.SyncEvery == 0)
-			kIdx := rng.IntN(cfg.KeyCount)
-			plan = append(plan, PlanOperation{
-				Op:       opID,
-				Kind:     "delete",
-				Mutating: true,
-				Sync:     sync,
-				Key:      formatKey(kIdx),
-			})
-
-		case roll < 90: // 10% batch of exactly two sets
-			mutatingCount++
-			sync := (cfg.SyncEvery > 0 && mutatingCount%cfg.SyncEvery == 0)
-			kIdx1 := rng.IntN(cfg.KeyCount)
-			kIdx2 := rng.IntN(cfg.KeyCount)
+			kIdx1 := rng.IntN(keyCount)
+			kIdx2 := rng.IntN(keyCount)
+			if kIdx1 == kIdx2 {
+				kIdx2 = (kIdx1 + 1) % keyCount
+			}
 			k1 := formatKey(kIdx1)
 			k2 := formatKey(kIdx2)
-			v1 := makeValue(rng, cfg.ValueBytes, fmt.Sprintf("%05da", opID))
-			v2 := makeValue(rng, cfg.ValueBytes, fmt.Sprintf("%05db", opID))
+			v1 := makeValue(rng, valueBytes, fmt.Sprintf("%05da", opID))
+			v2 := makeValue(rng, valueBytes, fmt.Sprintf("%05db", opID))
 			plan = append(plan, PlanOperation{
 				Op:       opID,
 				Kind:     "batch",
@@ -182,34 +259,160 @@ func Plan(cfg Config) []PlanOperation {
 				Value2:   v2,
 			})
 
-		case roll < 95: // 5% range_delete
+		case PresetOverwriteHeavy:
+			opID++
 			mutatingCount++
 			sync := (cfg.SyncEvery > 0 && mutatingCount%cfg.SyncEvery == 0)
-			idx1 := rng.IntN(cfg.KeyCount)
-			idx2 := rng.IntN(cfg.KeyCount)
-			if idx1 == idx2 {
-				idx2 = (idx1 + 1) % cfg.KeyCount
-			}
-			if idx1 > idx2 {
-				idx1, idx2 = idx2, idx1
-			}
-			k1 := formatKey(idx1)
-			k2 := formatKey(idx2)
+			kIdx := rng.IntN(keyCount)
+			k := formatKey(kIdx)
+			v := makeValue(rng, valueBytes, fmt.Sprintf("%05d", opID))
 			plan = append(plan, PlanOperation{
 				Op:       opID,
-				Kind:     "range_delete",
+				Kind:     "set",
 				Mutating: true,
 				Sync:     sync,
-				Key:      k1,
-				EndKey:   k2,
+				Key:      k,
+				Value:    v,
 			})
 
-		default: // 5% iterate
-			plan = append(plan, PlanOperation{
-				Op:       opID,
-				Kind:     "iterate",
-				Mutating: false,
-			})
+		case PresetDeleteHeavy:
+			opID++
+			mutatingCount++
+			sync := (cfg.SyncEvery > 0 && mutatingCount%cfg.SyncEvery == 0)
+			switch i % 3 {
+			case 0: // set
+				kIdx := rng.IntN(keyCount)
+				k := formatKey(kIdx)
+				v := makeValue(rng, valueBytes, fmt.Sprintf("%05d", opID))
+				plan = append(plan, PlanOperation{
+					Op:       opID,
+					Kind:     "set",
+					Mutating: true,
+					Sync:     sync,
+					Key:      k,
+					Value:    v,
+				})
+			case 1: // delete
+				kIdx := rng.IntN(keyCount)
+				k := formatKey(kIdx)
+				plan = append(plan, PlanOperation{
+					Op:       opID,
+					Kind:     "delete",
+					Mutating: true,
+					Sync:     sync,
+					Key:      k,
+				})
+			case 2: // range_delete
+				idx1 := rng.IntN(keyCount)
+				idx2 := rng.IntN(keyCount)
+				if idx1 == idx2 {
+					idx2 = (idx1 + 1) % keyCount
+				}
+				if idx1 > idx2 {
+					idx1, idx2 = idx2, idx1
+				}
+				k1 := formatKey(idx1)
+				k2 := formatKey(idx2)
+				plan = append(plan, PlanOperation{
+					Op:       opID,
+					Kind:     "range_delete",
+					Mutating: true,
+					Sync:     sync,
+					Key:      k1,
+					EndKey:   k2,
+				})
+			}
+
+		default:
+			roll := rng.IntN(100)
+			opID++
+
+			switch {
+			case roll < 50: // 50% set
+				mutatingCount++
+				sync := (cfg.SyncEvery > 0 && mutatingCount%cfg.SyncEvery == 0)
+				kIdx := rng.IntN(cfg.KeyCount)
+				k := formatKey(kIdx)
+				v := makeValue(rng, cfg.ValueBytes, fmt.Sprintf("%05d", opID))
+				plan = append(plan, PlanOperation{
+					Op:       opID,
+					Kind:     "set",
+					Mutating: true,
+					Sync:     sync,
+					Key:      k,
+					Value:    v,
+				})
+
+			case roll < 70: // 20% get
+				kIdx := rng.IntN(cfg.KeyCount)
+				plan = append(plan, PlanOperation{
+					Op:       opID,
+					Kind:     "get",
+					Mutating: false,
+					Key:      formatKey(kIdx),
+				})
+
+			case roll < 80: // 10% delete
+				mutatingCount++
+				sync := (cfg.SyncEvery > 0 && mutatingCount%cfg.SyncEvery == 0)
+				kIdx := rng.IntN(cfg.KeyCount)
+				plan = append(plan, PlanOperation{
+					Op:       opID,
+					Kind:     "delete",
+					Mutating: true,
+					Sync:     sync,
+					Key:      formatKey(kIdx),
+				})
+
+			case roll < 90: // 10% batch of exactly two sets
+				mutatingCount++
+				sync := (cfg.SyncEvery > 0 && mutatingCount%cfg.SyncEvery == 0)
+				kIdx1 := rng.IntN(cfg.KeyCount)
+				kIdx2 := rng.IntN(cfg.KeyCount)
+				k1 := formatKey(kIdx1)
+				k2 := formatKey(kIdx2)
+				v1 := makeValue(rng, cfg.ValueBytes, fmt.Sprintf("%05da", opID))
+				v2 := makeValue(rng, cfg.ValueBytes, fmt.Sprintf("%05db", opID))
+				plan = append(plan, PlanOperation{
+					Op:       opID,
+					Kind:     "batch",
+					Mutating: true,
+					Sync:     sync,
+					Key:      k1,
+					Value:    v1,
+					Key2:     k2,
+					Value2:   v2,
+				})
+
+			case roll < 95: // 5% range_delete
+				mutatingCount++
+				sync := (cfg.SyncEvery > 0 && mutatingCount%cfg.SyncEvery == 0)
+				idx1 := rng.IntN(cfg.KeyCount)
+				idx2 := rng.IntN(cfg.KeyCount)
+				if idx1 == idx2 {
+					idx2 = (idx1 + 1) % cfg.KeyCount
+				}
+				if idx1 > idx2 {
+					idx1, idx2 = idx2, idx1
+				}
+				k1 := formatKey(idx1)
+				k2 := formatKey(idx2)
+				plan = append(plan, PlanOperation{
+					Op:       opID,
+					Kind:     "range_delete",
+					Mutating: true,
+					Sync:     sync,
+					Key:      k1,
+					EndKey:   k2,
+				})
+
+			default: // 5% iterate
+				plan = append(plan, PlanOperation{
+					Op:       opID,
+					Kind:     "iterate",
+					Mutating: false,
+				})
+			}
 		}
 
 		if cfg.FlushEvery > 0 && (i+1)%cfg.FlushEvery == 0 {
@@ -231,7 +434,7 @@ func Plan(cfg Config) []PlanOperation {
 			})
 		}
 
-		if cfg.CheckpointAt > 0 && (i+1)%cfg.CheckpointAt == 0 {
+		if checkpointAt > 0 && (i+1)%checkpointAt == 0 {
 			opID++
 			plan = append(plan, PlanOperation{
 				Op:       opID,
@@ -244,24 +447,24 @@ func Plan(cfg Config) []PlanOperation {
 			opID++
 			multiFile := (i/cfg.IngestEvery)%2 == 1
 			var mutations []history.Mutation
-			if !multiFile || cfg.KeyCount < 4 {
+			if !multiFile || keyCount < 4 {
 				idx1 := 0
 				idx2 := 1
-				if cfg.KeyCount >= 2 {
-					idx1 = rng.IntN(cfg.KeyCount - 1)
-					idx2 = idx1 + 1 + rng.IntN(cfg.KeyCount-idx1-1)
+				if keyCount >= 2 {
+					idx1 = rng.IntN(keyCount - 1)
+					idx2 = idx1 + 1 + rng.IntN(keyCount-idx1-1)
 				}
 				k1 := formatKey(idx1)
-				v1 := makeValue(rng, cfg.ValueBytes, fmt.Sprintf("%05da", opID))
+				v1 := makeValue(rng, valueBytes, fmt.Sprintf("%05da", opID))
 				k2 := formatKey(idx2)
-				v2 := makeValue(rng, cfg.ValueBytes, fmt.Sprintf("%05db", opID))
+				v2 := makeValue(rng, valueBytes, fmt.Sprintf("%05db", opID))
 				mutations = []history.Mutation{
 					{Kind: "set", Key: k1, Value: v1},
 					{Kind: "set", Key: k2, Value: v2},
 				}
 				multiFile = false
 			} else {
-				n := cfg.KeyCount
+				n := keyCount
 				idx0 := rng.IntN(n - 3)
 				idx1 := idx0 + 1 + rng.IntN(n-2-idx0-1)
 				idx2 := idx1 + 1 + rng.IntN(n-1-idx1-1)
@@ -272,7 +475,7 @@ func Plan(cfg Config) []PlanOperation {
 					mutations[mIdx] = history.Mutation{
 						Kind:  "set",
 						Key:   formatKey(indices[mIdx]),
-						Value: makeValue(rng, cfg.ValueBytes, fmt.Sprintf("%05d_%d", opID, mIdx)),
+						Value: makeValue(rng, valueBytes, fmt.Sprintf("%05d_%d", opID, mIdx)),
 					}
 				}
 			}
@@ -350,6 +553,16 @@ func Run(db *pebble.DB, marker Marker, cfg Config) ([]history.Entry, error) {
 			opErr = db.Delete(op.Key, wo)
 
 		case "batch":
+			v1, closer1, err1 := db.Get(op.Key)
+			if err1 == nil {
+				_ = closer1.Close()
+				_ = v1
+			}
+			v2, closer2, err2 := db.Get(op.Key2)
+			if err2 == nil {
+				_ = closer2.Close()
+				_ = v2
+			}
 			b := db.NewBatch()
 			if err := b.Set(op.Key, op.Value, nil); err != nil {
 				opErr = err
@@ -391,56 +604,7 @@ func Run(db *pebble.DB, marker Marker, cfg Config) ([]history.Entry, error) {
 			_ = db.Checkpoint("checkpoint")
 
 		case "ingest":
-			if targetFS == nil {
-				opErr = errors.New("workload: ingest requires a valid VFS")
-				break
-			}
-			stagingDir := "ingest_staging"
-			if err := targetFS.MkdirAll(stagingDir, 0755); err != nil {
-				opErr = fmt.Errorf("mkdir staging: %w", err)
-				break
-			}
-			writeSST := func(path string, muts []history.Mutation) error {
-				f, err := targetFS.Create(path, vfs.WriteCategoryUnspecified)
-				if err != nil {
-					return err
-				}
-				w := sstable.NewWriter(objstorageprovider.NewFileWritable(f), sstable.WriterOptions{
-					TableFormat: db.TableFormat(),
-				})
-				for _, m := range muts {
-					if err := w.Set(m.Key, m.Value); err != nil {
-						_ = w.Close()
-						return err
-					}
-				}
-				return w.Close()
-			}
-
-			var paths []string
-			if !op.MultiFile {
-				path := fmt.Sprintf("%s/ingest_%05d.sst", stagingDir, op.Op)
-				opErr = writeSST(path, op.Mutations)
-				paths = []string{path}
-			} else {
-				path1 := fmt.Sprintf("%s/ingest_%05d_a.sst", stagingDir, op.Op)
-				path2 := fmt.Sprintf("%s/ingest_%05d_b.sst", stagingDir, op.Op)
-				if err := writeSST(path1, op.Mutations[:2]); err != nil {
-					opErr = err
-				} else if err := writeSST(path2, op.Mutations[2:]); err != nil {
-					opErr = err
-				} else {
-					paths = []string{path1, path2}
-				}
-			}
-
-			if opErr == nil {
-				if sDir, err := targetFS.OpenDir(stagingDir); err == nil {
-					_ = sDir.Sync()
-					_ = sDir.Close()
-				}
-				opErr = db.Ingest(context.Background(), paths)
-			}
+			opErr = runIngest(db, targetFS, op, cfg.BarrierIngest)
 
 		case "ratchet":
 			opErr = db.RatchetFormatMajorVersion(pebble.FormatNewest)
@@ -533,4 +697,62 @@ func Correlate(entries []history.Entry, events []trace.Event) ([]history.Entry, 
 		return nil, fmt.Errorf("correlate: %w", err)
 	}
 	return result, nil
+}
+
+func runIngest(db *pebble.DB, targetFS vfs.FS, op PlanOperation, barrierIngest bool) error {
+	if targetFS == nil {
+		return errors.New("workload: ingest requires a valid VFS")
+	}
+	stagingDir := "ingest_staging"
+	if err := targetFS.MkdirAll(stagingDir, 0755); err != nil {
+		return fmt.Errorf("mkdir staging: %w", err)
+	}
+	writeSST := func(path string, muts []history.Mutation) error {
+		f, err := targetFS.Create(path, vfs.WriteCategoryUnspecified)
+		if err != nil {
+			return err
+		}
+		w := sstable.NewWriter(objstorageprovider.NewFileWritable(f), sstable.WriterOptions{
+			TableFormat: db.TableFormat(),
+		})
+		for _, m := range muts {
+			if err := w.Set(m.Key, m.Value); err != nil {
+				_ = w.Close()
+				return err
+			}
+		}
+		return w.Close()
+	}
+
+	var paths []string
+	if !op.MultiFile {
+		path := fmt.Sprintf("%s/ingest_%05d.sst", stagingDir, op.Op)
+		if err := writeSST(path, op.Mutations); err != nil {
+			return err
+		}
+		paths = []string{path}
+	} else {
+		path1 := fmt.Sprintf("%s/ingest_%05d_a.sst", stagingDir, op.Op)
+		path2 := fmt.Sprintf("%s/ingest_%05d_b.sst", stagingDir, op.Op)
+		if err := writeSST(path1, op.Mutations[:2]); err != nil {
+			return err
+		}
+		if err := writeSST(path2, op.Mutations[2:]); err != nil {
+			return err
+		}
+		paths = []string{path1, path2}
+	}
+
+	if sDir, err := targetFS.OpenDir(stagingDir); err == nil {
+		_ = sDir.Sync()
+		_ = sDir.Close()
+	}
+
+	if barrierIngest {
+		if err := db.LogData(nil, pebble.Sync); err != nil {
+			return fmt.Errorf("barrier ingest: %w", err)
+		}
+	}
+
+	return db.Ingest(context.Background(), paths)
 }

@@ -107,6 +107,8 @@ func runRecord(args []string) error {
 	policiesFlag := fs.String("policies", "0,100", "comma-separated retention percentages in 0..100")
 	ingestEveryFlag := fs.Int("ingest-every", 0, "emit an external SSTable ingest op every N operations (0 = disabled)")
 	ratchetAtFlag := fs.Int("ratchet-at", 0, "ratchet format major version at operation N (0 = disabled)")
+	barrierIngestFlag := fs.Bool("barrier-ingest", false, "execute WAL sync barrier prior to db.Ingest")
+	presetFlag := fs.String("preset", "", "workload diversity preset (ycsb-a, ycsb-b, ycsb-f, overwrite-heavy, delete-heavy)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -153,6 +155,12 @@ func runRecord(args []string) error {
 	}
 	if *ratchetAtFlag > 0 {
 		cfg.RatchetAt = *ratchetAtFlag
+	}
+	if *barrierIngestFlag {
+		cfg.BarrierIngest = true
+	}
+	if *presetFlag != "" {
+		cfg.Preset = *presetFlag
 	}
 
 	if err := os.MkdirAll(targetDir, 0755); err != nil {
@@ -673,6 +681,8 @@ func runBenchmarkCmd(args []string) error {
 	checkpointAt := fs.Int("checkpoint-at", 0, "emit a Checkpoint op every N operations (0 = disabled)")
 	ingestEvery := fs.Int("ingest-every", 0, "emit an external SSTable ingest op every N operations (0 = disabled)")
 	ratchetAt := fs.Int("ratchet-at", 0, "ratchet format major version at operation N (0 = disabled)")
+	barrierIngestFlag := fs.Bool("barrier-ingest", false, "execute WAL sync barrier prior to db.Ingest")
+	presetFlag := fs.String("preset", "", "workload diversity preset (ycsb-a, ycsb-b, ycsb-f, overwrite-heavy, delete-heavy)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -686,6 +696,12 @@ func runBenchmarkCmd(args []string) error {
 	}
 	if *ratchetAt > 0 {
 		cfg.Workload.RatchetAt = *ratchetAt
+	}
+	if *barrierIngestFlag {
+		cfg.Workload.BarrierIngest = true
+	}
+	if *presetFlag != "" {
+		cfg.Workload.Preset = *presetFlag
 	}
 	cfg.TrackMUT0 = *controlFlag
 

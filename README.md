@@ -102,6 +102,10 @@ See [docs/architecture.md](docs/architecture.md) for full architectural details.
 │   ├── realbug_pebble5825_per_seed.csv
 │   ├── realbug_checkpoint_summary.csv # Checkpoint 15b500fb A/B benchmark summary
 │   ├── realbug_checkpoint_per_seed.csv
+│   ├── realbug_ingest_summary.csv     # Direct L0 Ingest 32-seed A/B benchmark summary
+│   ├── realbug_ingest_per_seed.csv
+│   ├── workload_diversity_summary.csv # 5-preset workload diversity summary (16 seeds)
+│   ├── workload_diversity_per_seed.csv
 │   ├── scaling_mut5_summary.csv       # MUT-5 universe-scaling summary (120..1200 ops)
 │   ├── scaling_mut5_per_seed.csv      # Per-seed scaling metrics
 │   ├── null_control_multishape.csv    # 108-run multi-shape null-control verification
@@ -226,9 +230,24 @@ To evaluate ranking strategies across both dense and sparse failure distribution
 
 With `DCG-PR` frozen at tag `v1.0-dcg-pr-freeze` before any holdout evaluation, `DCG`/`DCG-PR` achieves median $k_1 = 1$ on all 12 testable in-contract holdout settings (`MUT-X1..X5`), winning 284/284 non-tied comparisons against `R2` (0 losses, Holm-adjusted sign-test $p \le 0.002$, mean speedup $2.1\times$–$20.0\times$). On the 3 out-of-contract settings (`MUT-X6`), performance degrades gracefully to the `R2` baseline (Holm-adjusted $p = 1.0$, not significant) — confirming the contract boundary is correctly defined.
 
-### 5. Real-World Crash Bugs (Pebble #5825 & Checkpoint 15b500fb)
+### 5. Real-World Storage Engine Bug Studies (Pebble #5825, Checkpoint 15b500fb & Direct L0 Ingest)
 
-`BARRIER-5825` (Manifest-Rotation Barrier Control) eliminates all Pebble `#5825` failures (0/32 seeds under fix vs. 30/32 under `MUT-0` (69 total failures)). `BARRIER-CKPT` (Checkpoint Directory Barrier Control) eliminates all checkpoint recovery failures (0/32 seeds vs. 25/32 under `MUT-0`). Pre-frozen `DCG-PR` achieves median $k_1 = 2.50$ on the `#5825` workload and median $k_1 = 3.00$ on the checkpoint workload, outperforming all other strategies.
+CraConTest has been evaluated across three distinct real-world crash bugs and subtle persistence races discovered in CockroachDB's Pebble v2.1.7:
+
+1. **Pebble #5825 (Manifest Rotation / Multi-Entry Directory Race) & `BARRIER-5825`:**
+   - Under 50% partial retention during manifest rotation, an unsynced directory entry for the new `MANIFEST-XXXXXX` file coexists with an unsynced removal of the old manifest, resulting in 69 failures (`open_error`) across 32 seeds under unpatched `MUT-0`.
+   - Causal barrier control `BARRIER-5825` injects a parent directory sync immediately following manifest rotation, eliminating all failures (0/32 seeds).
+   - Pre-frozen `DCG-PR` promotes candidates with coexisting unsynced directory entries (`UnsyncedDirEntryCount >= 2`), discovering the bug at median $k_1 = \mathbf{2.50}$ (mean $10.50$) vs $310.50$ for 0%-first `DCG` and $161.00$ for `B0`.
+
+2. **Pebble Checkpoint Commit `15b500fb` (Checkpoint Directory Sync) & `BARRIER-CKPT`:**
+   - In Pebble's checkpoint subsystem, hard-linked SSTables, `MANIFEST`, and `OPTIONS` files were created inside the destination checkpoint directory before the destination directory entry was durably synced. Under `MUT-0` at 50% partial retention, 25 of 32 seeds experienced checkpoint recovery failures (`open_error`, median 32.5 failing states/seed).
+   - Causal barrier control `BARRIER-CKPT` forces destination directory synchronization, reducing checkpoint recovery failures to strictly 0 across all 32 seeds.
+   - Evaluated as a blind holdout on pre-frozen `DCG-PR` (`v1.0-dcg-pr-freeze`), `DCG-PR` discovers the first failure at median $k_1 = \mathbf{3.00}$ (mean $121.40$) vs $385.00$ for 0%-first `DCG` and $156.00$ for `B0`.
+
+3. **Direct L0 `db.Ingest` Cross-Channel Prefix Hole & `BARRIER-INGEST`:**
+   - When external SSTables do not overlap active memtables, Pebble bypasses the WAL (`asFlushable = false`), allocating sequence number $s_2 > s_1$ and committing via `MANIFEST` sync (`vs.manifestFile.Sync()`) while earlier un-synced WAL writes at $s_1$ remain unpersisted. Upon a 0%-retention crash, $s_2$ survives via `MANIFEST` while $s_1 < s_2$ is discarded from the unsynced WAL, causing prefix consistency violations across all 32 seeds under `MUT-0`.
+   - Causal remedy `BARRIER-INGEST` (`db.LogData(nil, pebble.Sync)`) flushes the active WAL before MANIFEST version edit, eliminating prefix violations to strictly 0 across all 32 seeds at both `ret=0.00` and `ret=0.50`.
+   - Pre-frozen `DCG-PR` achieves median $k_1 = \mathbf{15.50}$ (mean $38.04$) and `DCG` achieves $16.00$ (mean $48.50$), compared to $29.80$ for `R2` and $23.75$ for `B0`.
 
 ### 6. Candidate Universe Scaling (MUT-5, 120..1200 ops)
 
@@ -255,6 +274,21 @@ To establish whether uninvestigated Pebble v2.1.7 subsystems performing multi-fi
    - **Workload B (Live Format Ratcheting):** 100% clean recovery and atomic transitions across all policies; 0 violations, 0 panics, and 2 transient unlinked-marker open errors under 50% retention.
    - **Workload C (Combined Lifecycle Stress):** Partial-retention open errors (8 total across seeds 42, 100, 777) during manifest rotation and checkpointing prior to directory sync; zero errors under 0% and 100% retention.
    - **Verdict:** Proves that Pebble v2.1.7 has zero crash-consistency vulnerabilities under unfaulted `MUT-0` across these subsystems.
+
+### 8. Multi-Distribution Workload Diversity Suite (M18B)
+
+To evaluate robustness and generalization across non-uniform key-value access distributions, CraConTest provides 5 distinct workload presets configured via `-preset` (`internal/workload/workload.go`):
+1. `ycsb-a`: 50% update / 50% point read over 8 hot keys with periodic sync/flush.
+2. `ycsb-b`: 95% point read / 5% update over 12 keys with periodic sync/flush.
+3. `ycsb-f`: Read-modify-write multi-key batch transactions with periodic sync/flush.
+4. `overwrite-heavy`: High-contention overwrites on 4 hot keys creating deep per-key version chains.
+5. `delete-heavy`: High-frequency point deletes, range tombstones (`DeleteRange`), and periodic checkpoints.
+
+Evaluated across 16 seeds (`seed = 1..16`, 25 ops) and 4 fault models (`MUT-0`, `MUT-1`, `MUT-5`, `MUT-9`) across 5 ranking strategies (`results/workload_diversity_summary.csv`):
+- **Null Control Integrity:** Unfaulted `MUT-0` produces strictly **0 false alarms** across all 16 seeds for all 5 presets.
+- **Graph Guidance Superiority:** `DCG` demonstrates up to **$9.6\times$ speedup** over `R2` on `ycsb-f/MUT-5` (mean $k_1 = 1.00$ vs $9.63$) and maintains $k_1 = 1.00$ across all failing presets under `MUT-1`, `MUT-5`, and `MUT-9`.
+- **Early-Budget Discovery ($S_{25}$):** `DCG` expands distinct state discovery within budget $B=25$ across all failing distributions.
+- **Zero Regressions:** Strictly zero settings where `DCG` underperforms `R2` or `B0`.
 
 ---
 

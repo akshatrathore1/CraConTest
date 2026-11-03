@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/akshatrathore1/CraConTest/internal/candidate"
 	"github.com/akshatrathore1/CraConTest/internal/history"
 	"github.com/akshatrathore1/CraConTest/internal/oracle"
 	"github.com/akshatrathore1/CraConTest/internal/recovery"
+	"github.com/akshatrathore1/CraConTest/internal/replay"
 	"github.com/akshatrathore1/CraConTest/internal/trace"
 	"github.com/akshatrathore1/CraConTest/internal/vfsrec"
 	"github.com/akshatrathore1/CraConTest/internal/workload"
@@ -265,6 +267,7 @@ func TestWorkloadValidateAndPlanInvalidConfig(t *testing.T) {
 		{"negative flush every", func() workload.Config { c := valid; c.FlushEvery = -1; return c }()},
 		{"negative ingest every", func() workload.Config { c := valid; c.IngestEvery = -1; return c }()},
 		{"negative ratchet at", func() workload.Config { c := valid; c.RatchetAt = -1; return c }()},
+		{"unknown preset", func() workload.Config { c := valid; c.Preset = "unknown-xyz"; return c }()},
 	}
 
 	for _, tc := range invalidConfigs {
@@ -721,5 +724,277 @@ func TestHistoryValidationIngestAndRatchet(t *testing.T) {
 	}
 	if err := history.Validate(syncRatchet); err == nil {
 		t.Errorf("expected history.Validate to reject ratchet with Sync: true")
+	}
+}
+
+func TestWorkloadBarrierIngest(t *testing.T) {
+	// 1. Run with BarrierIngest: true
+	mem := vfs.NewCrashableMem()
+	rec := vfsrec.New(mem)
+
+	listener := rec.EventListener()
+	opts := &pebble.Options{
+		FS:                          rec,
+		Logger:                      recovery.PanicLogger{},
+		MemTableSize:                64 * 1024,
+		EventListener:               &listener,
+		DisableAutomaticCompactions: true,
+	}
+
+	db, err := pebble.Open("db_barrier", opts)
+	if err != nil {
+		t.Fatalf("pebble.Open: %v", err)
+	}
+
+	cfg := workload.Config{
+		Seed:          1,
+		Operations:    10,
+		KeyCount:      16,
+		ValueBytes:    64,
+		SyncEvery:     0,
+		FlushEvery:    5,
+		IngestEvery:   5,
+		BarrierIngest: true,
+		FS:            rec,
+	}
+
+	entries, err := workload.Run(db, rec, cfg)
+	if err != nil {
+		_ = db.Close()
+		t.Fatalf("workload.Run: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("db.Close: %v", err)
+	}
+
+	traceEvents := rec.Events()
+	if err := trace.Validate(traceEvents); err != nil {
+		t.Fatalf("trace.Validate: %v", err)
+	}
+
+	// Correlate history to find ingest op boundaries
+	correlated, err := workload.Correlate(entries, traceEvents)
+	if err != nil {
+		t.Fatalf("workload.Correlate: %v", err)
+	}
+
+	var checkedIngests int
+	for _, e := range correlated {
+		if e.Kind != "ingest" {
+			continue
+		}
+		checkedIngests++
+
+		var walSyncEv, manifestSyncEv *trace.Event
+		for i := range traceEvents {
+			ev := &traceEvents[i]
+			if ev.ID < e.BeginEvent || ev.ID > e.EndEvent {
+				continue
+			}
+			if (ev.Kind == trace.KindSyncData || ev.Kind == trace.KindSync) && strings.HasSuffix(ev.File, ".log") {
+				if walSyncEv == nil {
+					walSyncEv = ev
+				}
+			}
+			if (ev.Kind == trace.KindSyncData || ev.Kind == trace.KindSync) && strings.Contains(ev.File, "MANIFEST") {
+				if manifestSyncEv == nil {
+					manifestSyncEv = ev
+				}
+			}
+		}
+
+		if walSyncEv == nil {
+			t.Fatalf("ingest op %d: expected WAL SyncData event inside ingest window, none found", e.Op)
+		}
+		if manifestSyncEv == nil {
+			t.Fatalf("ingest op %d: expected MANIFEST sync event inside ingest window, none found", e.Op)
+		}
+		if walSyncEv.ID >= manifestSyncEv.ID {
+			t.Fatalf("ingest op %d: WAL sync event (ID %d) must precede MANIFEST sync event (ID %d)",
+				e.Op, walSyncEv.ID, manifestSyncEv.ID)
+		}
+	}
+
+	if checkedIngests == 0 {
+		t.Fatalf("no ingest operations were executed and checked")
+	}
+
+	// 2. Contrast check: Run with BarrierIngest: false to prove WAL sync is absent
+	memNoBarrier := vfs.NewCrashableMem()
+	recNoBarrier := vfsrec.New(memNoBarrier)
+	listenerNoBarrier := recNoBarrier.EventListener()
+	optsNoBarrier := &pebble.Options{
+		FS:                          recNoBarrier,
+		Logger:                      recovery.PanicLogger{},
+		MemTableSize:                64 * 1024,
+		EventListener:               &listenerNoBarrier,
+		DisableAutomaticCompactions: true,
+	}
+	dbNoBarrier, err := pebble.Open("db_nobarrier", optsNoBarrier)
+	if err != nil {
+		t.Fatalf("pebble.Open (no barrier): %v", err)
+	}
+	cfgNoBarrier := cfg
+	cfgNoBarrier.BarrierIngest = false
+	cfgNoBarrier.FS = recNoBarrier
+
+	entriesNoBarrier, err := workload.Run(dbNoBarrier, recNoBarrier, cfgNoBarrier)
+	if err != nil {
+		_ = dbNoBarrier.Close()
+		t.Fatalf("workload.Run (no barrier): %v", err)
+	}
+	_ = dbNoBarrier.Close()
+
+	eventsNoBarrier := recNoBarrier.Events()
+	corrNoBarrier, err := workload.Correlate(entriesNoBarrier, eventsNoBarrier)
+	if err != nil {
+		t.Fatalf("correlate (no barrier): %v", err)
+	}
+
+	for _, e := range corrNoBarrier {
+		if e.Kind != "ingest" {
+			continue
+		}
+		for i := range eventsNoBarrier {
+			ev := &eventsNoBarrier[i]
+			if ev.ID < e.BeginEvent || ev.ID > e.EndEvent {
+				continue
+			}
+			if (ev.Kind == trace.KindSyncData || ev.Kind == trace.KindSync) && strings.HasSuffix(ev.File, ".log") {
+				t.Fatalf("ingest op %d with BarrierIngest: false unexpectedly had WAL sync (ID %d)", e.Op, ev.ID)
+			}
+		}
+	}
+}
+
+func TestWorkloadPresets(t *testing.T) {
+	presets := []string{
+		workload.PresetYCSBA,
+		workload.PresetYCSBB,
+		workload.PresetYCSBF,
+		workload.PresetOverwriteHeavy,
+		workload.PresetDeleteHeavy,
+	}
+
+	for _, preset := range presets {
+		t.Run(preset, func(t *testing.T) {
+			mem := vfs.NewCrashableMem()
+			rec := vfsrec.New(mem)
+			listener := rec.EventListener()
+			opts := &pebble.Options{
+				FS:                          rec,
+				Logger:                      recovery.PanicLogger{},
+				MemTableSize:                64 * 1024,
+				EventListener:               &listener,
+				DisableAutomaticCompactions: true,
+			}
+			dbDir := "db_" + strings.ReplaceAll(preset, "-", "_")
+			db, err := pebble.Open(dbDir, opts)
+			if err != nil {
+				t.Fatalf("pebble.Open: %v", err)
+			}
+
+			cfg := workload.Config{
+				Preset:     preset,
+				Seed:       42,
+				Operations: 25,
+				ValueBytes: 64,
+				SyncEvery:  5,
+				FlushEvery: 10,
+				FS:         rec,
+			}
+
+			plan := workload.Plan(cfg)
+			if len(plan) == 0 {
+				_ = db.Close()
+				t.Fatalf("workload.Plan produced empty plan for preset %s", preset)
+			}
+
+			entries, err := workload.Run(db, rec, cfg)
+			if err != nil {
+				_ = db.Close()
+				t.Fatalf("workload.Run: %v", err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatalf("db.Close: %v", err)
+			}
+
+			if err := history.Validate(entries); err != nil {
+				t.Fatalf("history.Validate: %v", err)
+			}
+
+			traceEvents := rec.Events()
+			if err := trace.Validate(traceEvents); err != nil {
+				t.Fatalf("trace.Validate: %v", err)
+			}
+
+			correlated, err := workload.Correlate(entries, traceEvents)
+			if err != nil {
+				t.Fatalf("workload.Correlate: %v", err)
+			}
+			if err := history.Validate(correlated); err != nil {
+				t.Fatalf("correlated history.Validate: %v", err)
+			}
+
+			universe, err := candidate.Build(traceEvents, cfg.Seed, []int{0, 100})
+			if err != nil {
+				t.Fatalf("candidate.Build: %v", err)
+			}
+			if len(universe) == 0 {
+				t.Fatalf("candidate universe is empty")
+			}
+
+			replayer, err := replay.Build(traceEvents, 0)
+			if err != nil {
+				t.Fatalf("replay.Build: %v", err)
+			}
+			defer replayer.Close()
+
+			var currentCut uint64
+			for i, cand := range universe {
+				if cand.Event > currentCut {
+					if err := replayer.Advance(cand.Event); err != nil {
+						t.Fatalf("candidate %d cut %d: Advance: %v", i, cand.Event, err)
+					}
+					currentCut = cand.Event
+				}
+				clonedFS, err := replayer.Clone(cand.Percent, cand.Seed)
+				if err != nil {
+					t.Fatalf("candidate %d cut %d pol %d: Clone: %v", i, cand.Event, cand.Percent, err)
+				}
+				openRes := recovery.SafeOpen(clonedFS, dbDir, 5*time.Second)
+				if openRes.Panic != "" {
+					t.Fatalf("candidate %d cut %d pol %d: panic: %s", i, cand.Event, cand.Percent, openRes.Panic)
+				}
+				if openRes.Timeout {
+					t.Fatalf("candidate %d cut %d pol %d: timeout", i, cand.Event, cand.Percent)
+				}
+				if openRes.Err != nil {
+					t.Fatalf("candidate %d cut %d pol %d: open error: %v", i, cand.Event, cand.Percent, openRes.Err)
+				}
+				if openRes.DB == nil {
+					t.Fatalf("candidate %d cut %d pol %d: openRes.DB is nil", i, cand.Event, cand.Percent)
+				}
+				if err := recovery.CheckIntegrity(openRes.DB); err != nil {
+					_ = openRes.DB.Close()
+					t.Fatalf("candidate %d cut %d pol %d: CheckIntegrity: %v", i, cand.Event, cand.Percent, err)
+				}
+				dump, err := recovery.DumpContents(openRes.DB)
+				_ = openRes.DB.Close()
+				if err != nil {
+					t.Fatalf("candidate %d cut %d pol %d: DumpContents: %v", i, cand.Event, cand.Percent, err)
+				}
+				outcome := oracle.Check(oracle.Context{
+					Candidate: cand,
+					Events:    traceEvents,
+					History:   correlated,
+					Recovered: dump,
+				})
+				if outcome.Class != oracle.ClassValid {
+					t.Fatalf("candidate %d cut %d pol %d: unexpected outcome %v (rule=%s, sig=%s, detail=%s)",
+						i, cand.Event, cand.Percent, outcome.Class, outcome.Rule, outcome.Signature, outcome.Detail)
+				}
+			}
+		})
 	}
 }
