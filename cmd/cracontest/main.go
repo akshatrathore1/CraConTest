@@ -105,6 +105,8 @@ func runRecord(args []string) error {
 	runDir := fs.String("run", "", "output run directory (alias for -out)")
 	faultID := fs.String("fault", faults.MUT0, "seeded fault ID: "+strings.Join(faults.IDs(), ", "))
 	policiesFlag := fs.String("policies", "0,100", "comma-separated retention percentages in 0..100")
+	ingestEveryFlag := fs.Int("ingest-every", 0, "emit an external SSTable ingest op every N operations (0 = disabled)")
+	ratchetAtFlag := fs.Int("ratchet-at", 0, "ratchet format major version at operation N (0 = disabled)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -146,6 +148,12 @@ func runRecord(args []string) error {
 			return fmt.Errorf("parse spec: %w", err)
 		}
 	}
+	if *ingestEveryFlag > 0 {
+		cfg.IngestEvery = *ingestEveryFlag
+	}
+	if *ratchetAtFlag > 0 {
+		cfg.RatchetAt = *ratchetAtFlag
+	}
 
 	if err := os.MkdirAll(targetDir, 0755); err != nil {
 		return fmt.Errorf("create run dir: %w", err)
@@ -157,6 +165,7 @@ func runRecord(args []string) error {
 	if err != nil {
 		return fmt.Errorf("init fault %q: %w", *faultID, err)
 	}
+	cfg.FS = faultFS
 
 	if *faultID == faults.MUT8 {
 		cfg.CompactAt = 80
@@ -174,6 +183,9 @@ func runRecord(args []string) error {
 	}
 	if cfg.MaxManifestFileSize > 0 {
 		opts.MaxManifestFileSize = cfg.MaxManifestFileSize
+	}
+	if cfg.RatchetAt > 0 {
+		opts.FormatMajorVersion = pebble.FormatMinSupported
 	}
 
 	db, err := pebble.Open("db", opts)
@@ -659,6 +671,8 @@ func runBenchmarkCmd(args []string) error {
 	perSeedCSVFlag := fs.String("per-seed-csv", "", "path for per-seed CSV output (default: results/benchmark_per_seed.csv for full matrix)")
 	controlFlag := fs.Bool("control", true, "run MUT-0 null control check")
 	checkpointAt := fs.Int("checkpoint-at", 0, "emit a Checkpoint op every N operations (0 = disabled)")
+	ingestEvery := fs.Int("ingest-every", 0, "emit an external SSTable ingest op every N operations (0 = disabled)")
+	ratchetAt := fs.Int("ratchet-at", 0, "ratchet format major version at operation N (0 = disabled)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -667,6 +681,12 @@ func runBenchmarkCmd(args []string) error {
 
 	cfg.Workload.Operations = *opsFlag
 	cfg.Workload.CheckpointAt = *checkpointAt
+	if *ingestEvery > 0 {
+		cfg.Workload.IngestEvery = *ingestEvery
+	}
+	if *ratchetAt > 0 {
+		cfg.Workload.RatchetAt = *ratchetAt
+	}
 	cfg.TrackMUT0 = *controlFlag
 
 	if *policiesFlag != "" {

@@ -51,7 +51,7 @@ func (event Event) IsMutation() bool {
 }
 
 func MutatingOperation(kind string) bool {
-	return kind == "set" || kind == "delete" || kind == "range_delete" || kind == "batch"
+	return kind == "set" || kind == "delete" || kind == "range_delete" || kind == "batch" || kind == "ingest"
 }
 
 func BeforeBoundary(events []Event, cut uint64) bool {
@@ -177,7 +177,7 @@ func Validate(events []Event) error {
 					return fmt.Errorf("event %d: invalid engine annotation", event.ID)
 				}
 			} else if event.Op == 0 || (!MutatingOperation(event.OpKind) && event.OpKind != "get" &&
-				event.OpKind != "iterate" && event.OpKind != "flush" && event.OpKind != "compact" && event.OpKind != "checkpoint") {
+				event.OpKind != "iterate" && event.OpKind != "flush" && event.OpKind != "compact" && event.OpKind != "checkpoint" && event.OpKind != "ratchet") {
 				return fmt.Errorf("event %d: missing operation identity", event.ID)
 			} else if event.Kind == KindOpBegin {
 				if activeOperation != 0 || event.Op <= lastOperation || event.Err != "" {

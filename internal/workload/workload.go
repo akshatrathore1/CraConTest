@@ -5,12 +5,16 @@ package workload
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"math/rand/v2"
 
 	"github.com/akshatrathore1/CraConTest/internal/history"
 	"github.com/akshatrathore1/CraConTest/internal/trace"
 	"github.com/cockroachdb/pebble/v2"
+	"github.com/cockroachdb/pebble/v2/objstorage/objstorageprovider"
+	"github.com/cockroachdb/pebble/v2/sstable"
+	"github.com/cockroachdb/pebble/v2/vfs"
 )
 
 // Config specifies the configuration for deterministic workload execution.
@@ -24,6 +28,9 @@ type Config struct {
 	CompactAt           int    `json:"compact_at,omitempty"`
 	CheckpointAt        int    `json:"checkpoint_at,omitempty"`
 	MaxManifestFileSize int64  `json:"max_manifest_file_size,omitempty"`
+	IngestEvery         int    `json:"ingest_every,omitempty"`
+	RatchetAt           int    `json:"ratchet_at,omitempty"`
+	FS                  vfs.FS `json:"-"`
 }
 
 // DefaultConfig returns the frozen initial driver configuration (Target C2).
@@ -58,6 +65,12 @@ func Validate(cfg Config) error {
 	if cfg.CheckpointAt < 0 {
 		return fmt.Errorf("checkpoint_at must be >= 0, got %d", cfg.CheckpointAt)
 	}
+	if cfg.IngestEvery < 0 {
+		return fmt.Errorf("ingest_every must be >= 0, got %d", cfg.IngestEvery)
+	}
+	if cfg.RatchetAt < 0 {
+		return fmt.Errorf("ratchet_at must be >= 0, got %d", cfg.RatchetAt)
+	}
 	return nil
 }
 
@@ -80,6 +93,8 @@ type PlanOperation struct {
 	Key2      []byte
 	Value2    []byte
 	IsFlushOp bool
+	Mutations []history.Mutation
+	MultiFile bool
 }
 
 func formatKey(index int) []byte {
@@ -224,6 +239,61 @@ func Plan(cfg Config) []PlanOperation {
 				Mutating: false,
 			})
 		}
+
+		if cfg.IngestEvery > 0 && (i+1)%cfg.IngestEvery == 0 {
+			opID++
+			multiFile := (i/cfg.IngestEvery)%2 == 1
+			var mutations []history.Mutation
+			if !multiFile || cfg.KeyCount < 4 {
+				idx1 := 0
+				idx2 := 1
+				if cfg.KeyCount >= 2 {
+					idx1 = rng.IntN(cfg.KeyCount - 1)
+					idx2 = idx1 + 1 + rng.IntN(cfg.KeyCount-idx1-1)
+				}
+				k1 := formatKey(idx1)
+				v1 := makeValue(rng, cfg.ValueBytes, fmt.Sprintf("%05da", opID))
+				k2 := formatKey(idx2)
+				v2 := makeValue(rng, cfg.ValueBytes, fmt.Sprintf("%05db", opID))
+				mutations = []history.Mutation{
+					{Kind: "set", Key: k1, Value: v1},
+					{Kind: "set", Key: k2, Value: v2},
+				}
+				multiFile = false
+			} else {
+				n := cfg.KeyCount
+				idx0 := rng.IntN(n - 3)
+				idx1 := idx0 + 1 + rng.IntN(n-2-idx0-1)
+				idx2 := idx1 + 1 + rng.IntN(n-1-idx1-1)
+				idx3 := idx2 + 1 + rng.IntN(n-idx2-1)
+				indices := []int{idx0, idx1, idx2, idx3}
+				mutations = make([]history.Mutation, 4)
+				for mIdx := 0; mIdx < 4; mIdx++ {
+					mutations[mIdx] = history.Mutation{
+						Kind:  "set",
+						Key:   formatKey(indices[mIdx]),
+						Value: makeValue(rng, cfg.ValueBytes, fmt.Sprintf("%05d_%d", opID, mIdx)),
+					}
+				}
+			}
+			plan = append(plan, PlanOperation{
+				Op:        opID,
+				Kind:      "ingest",
+				Mutating:  true,
+				Sync:      true,
+				Mutations: mutations,
+				MultiFile: multiFile,
+			})
+		}
+
+		if cfg.RatchetAt > 0 && (i+1) == cfg.RatchetAt {
+			opID++
+			plan = append(plan, PlanOperation{
+				Op:       opID,
+				Kind:     "ratchet",
+				Mutating: false,
+			})
+		}
 	}
 
 	return plan
@@ -237,6 +307,16 @@ func Run(db *pebble.DB, marker Marker, cfg Config) ([]history.Entry, error) {
 	}
 	plan := Plan(cfg)
 	historyEntries := make([]history.Entry, 0, len(plan))
+
+	var targetFS vfs.FS
+	if cfg.FS != nil {
+		targetFS = cfg.FS
+	} else if fsMarker, ok := marker.(vfs.FS); ok {
+		targetFS = fsMarker
+	}
+	if targetFS == nil && cfg.IngestEvery > 0 {
+		return nil, errors.New("workload: ingest requires a valid VFS")
+	}
 
 	var eventTracker uint64
 
@@ -309,6 +389,61 @@ func Run(db *pebble.DB, marker Marker, cfg Config) ([]history.Entry, error) {
 
 		case "checkpoint":
 			_ = db.Checkpoint("checkpoint")
+
+		case "ingest":
+			if targetFS == nil {
+				opErr = errors.New("workload: ingest requires a valid VFS")
+				break
+			}
+			stagingDir := "ingest_staging"
+			if err := targetFS.MkdirAll(stagingDir, 0755); err != nil {
+				opErr = fmt.Errorf("mkdir staging: %w", err)
+				break
+			}
+			writeSST := func(path string, muts []history.Mutation) error {
+				f, err := targetFS.Create(path, vfs.WriteCategoryUnspecified)
+				if err != nil {
+					return err
+				}
+				w := sstable.NewWriter(objstorageprovider.NewFileWritable(f), sstable.WriterOptions{
+					TableFormat: db.TableFormat(),
+				})
+				for _, m := range muts {
+					if err := w.Set(m.Key, m.Value); err != nil {
+						_ = w.Close()
+						return err
+					}
+				}
+				return w.Close()
+			}
+
+			var paths []string
+			if !op.MultiFile {
+				path := fmt.Sprintf("%s/ingest_%05d.sst", stagingDir, op.Op)
+				opErr = writeSST(path, op.Mutations)
+				paths = []string{path}
+			} else {
+				path1 := fmt.Sprintf("%s/ingest_%05d_a.sst", stagingDir, op.Op)
+				path2 := fmt.Sprintf("%s/ingest_%05d_b.sst", stagingDir, op.Op)
+				if err := writeSST(path1, op.Mutations[:2]); err != nil {
+					opErr = err
+				} else if err := writeSST(path2, op.Mutations[2:]); err != nil {
+					opErr = err
+				} else {
+					paths = []string{path1, path2}
+				}
+			}
+
+			if opErr == nil {
+				if sDir, err := targetFS.OpenDir(stagingDir); err == nil {
+					_ = sDir.Sync()
+					_ = sDir.Close()
+				}
+				opErr = db.Ingest(context.Background(), paths)
+			}
+
+		case "ratchet":
+			opErr = db.RatchetFormatMajorVersion(pebble.FormatNewest)
 		}
 
 		eventTracker++
@@ -348,6 +483,15 @@ func Run(db *pebble.DB, marker Marker, cfg Config) ([]history.Entry, error) {
 			entry.Mutations = []history.Mutation{
 				{Kind: "set", Key: bytes.Clone(op.Key), Value: bytes.Clone(op.Value)},
 				{Kind: "set", Key: bytes.Clone(op.Key2), Value: bytes.Clone(op.Value2)},
+			}
+		case "ingest":
+			entry.Mutations = make([]history.Mutation, len(op.Mutations))
+			for j, m := range op.Mutations {
+				entry.Mutations[j] = history.Mutation{
+					Kind:  m.Kind,
+					Key:   bytes.Clone(m.Key),
+					Value: bytes.Clone(m.Value),
+				}
 			}
 		}
 

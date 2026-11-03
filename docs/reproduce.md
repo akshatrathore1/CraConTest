@@ -27,11 +27,11 @@ The CLI has five subcommands. Flags use a single dash:
 
 | Command | Flags |
 |---|---|
-| `record` | `-spec <config.json> -out <run-dir> [-fault <MUT-0 … MUT-9, MUT-X1 … MUT-X6>] [-policies 0,100]` |
+| `record` | `-spec <config.json> -out <run-dir> [-fault <MUT-0 … MUT-9, MUT-X1 … MUT-X6>] [-policies 0,100] [-ingest-every <N>] [-ratchet-at <N>]` |
 | `plan` | `-run <run-dir> [-seed <ranking seed>]` |
 | `explore` | `-run <run-dir> [-timeout <duration>]` |
 | `evaluate` | `-run <run-dir> [-budgets 0,1,5,...] [-discovery <csv> -plot <svg>]` |
-| `benchmark` | `[-seeds 42,100,...] [-faults MUT-1,...] [-ops 120] [-report <md>] [-csv <csv>] [-per-seed-csv <csv>]` |
+| `benchmark` | `[-seeds 42,100,...] [-faults MUT-1,...] [-ops 120] [-report <md>] [-csv <csv>] [-per-seed-csv <csv>] [-ingest-every <N>] [-ratchet-at <N>]` |
 
 ### Directory Structure for Reproduction Artifacts
 
@@ -52,7 +52,8 @@ CraConTest/
 │   ├── realbug_checkpoint_per_seed.csv # Unaggregated per-seed Checkpoint A/B metrics
 │   ├── scaling_mut5_summary.csv        # MUT-5 universe-scaling summary (120..1200 ops)
 │   ├── scaling_mut5_per_seed.csv       # Per-seed scaling metrics
-│   └── null_control_multishape.csv     # 108-run multi-shape null-control verification
+│   ├── null_control_multishape.csv     # 108-run multi-shape null-control verification
+│   └── subsystem_discovery.csv         # Pebble subsystem empirical discovery (Workloads A, B, C)
 ├── docs/
 │   ├── report.md              # Technical report
 │   ├── reproduce.md           # Reproduction runbook
@@ -256,6 +257,39 @@ go test -v -count=1 -timeout 1200s -run TestNullControlMultiShape ./internal/exp
 Outputs: `results/null_control_multishape.csv`.
 Result: Exactly 0 violations, 0 open errors, 0 panics, and 0 hangs across all 108 runs (>50,000 crash states explored).
 
+### 4.7 Pebble Subsystem Discovery Benchmark (Workloads A, B, C under MUT-0)
+
+To evaluate whether unfaulted Pebble v2.1.7 (`MUT-0`) exhibits crash-consistency vulnerabilities during multi-file and directory-marker mutations, the subsystem discovery suite executes Workload A (External SSTable Ingestion), Workload B (Live Format-Version Ratcheting), and Workload C (Combined Lifecycle Stress) across seeds `42, 100, 777` under intermediate retention policies `[0, 50, 100]`:
+
+```bash
+# Read-only validation of committed artifact:
+go test -v -run TestSubsystemDiscovery ./internal/exp
+
+# Full regeneration of discovery CSV:
+go test -v -run TestSubsystemDiscovery ./internal/exp -update
+```
+
+Outputs: `results/subsystem_discovery.csv` (9 data rows).
+
+To execute the CLI benchmark commands directly:
+```bash
+# Workload A: External SSTable Ingestion
+go run ./cmd/cracontest benchmark -faults MUT-0 -seeds 42,100,777 -ops 80 -ingest-every 25 -policies 0,50,100
+
+# Workload B: Live Format-Version Ratcheting
+go run ./cmd/cracontest benchmark -faults MUT-0 -seeds 42,100,777 -ops 80 -ratchet-at 50 -policies 0,50,100
+
+# Workload C: Combined Lifecycle Stress
+go run ./cmd/cracontest benchmark -faults MUT-0 -seeds 42,100,777 -ops 80 -ingest-every 30 -ratchet-at 40 -checkpoint-at 60 -max-manifest-size 1 -policies 0,50,100
+```
+
+#### Results Summary:
+- **0 lost durably-committed keys** across all 9 runs (5,394 candidate states), proving 100% synchronous durability via `d.objProvider.Sync()` (`ingest.go:1490`) and `atomicfs.Marker.Move` (`marker.go:189`).
+- **0 engine recovery panics or hangs**.
+- **Workload A (External SSTable Ingestion):** 0 lost committed keys. 40 prefix violations across seeds 42 (15) and 777 (25) reveal a cross-channel commit-order hole on direct L0 ingest: when `db.Ingest` takes the non-overlapping direct L0 shortcut (`asFlushable = false`), Pebble allocates sequence number $s_2 > s_1$ (`ingest.go:1703`) and syncs `MANIFEST` (`version_set.go:649`) without syncing the active `.log` WAL containing preceding `NoSync` writes at sequence number $s_1 < s_2$. Upon a 0%-retention crash, $s_2$ survives via `MANIFEST` while $s_1$ is lost from the unsynced `WAL`, creating a cross-channel sequence hole (whereas overlapping flushable ingest syncs the shared WAL at `commit.go:289` and preserves strict prefix order).
+- **Workload B (Live Format-Version Ratcheting):** 100% clean recovery and atomic transitions across all policies; 0 violations, 0 panics, and 2 transient unlinked-marker open errors under 50% retention (1 on seed 42, 1 on seed 777).
+- **Workload C (Combined Lifecycle Stress):** 0 lost committed keys, 0 panics. 8 open errors occur exclusively under 50% partial retention during manifest rotation and checkpointing prior to directory sync (4 on seed 42, 2 on seed 100, 2 on seed 777).
+
 ## 5. Acceptance Tests
 
 | Check | Command | Measured result | Runtime |
@@ -265,6 +299,7 @@ Result: Exactly 0 violations, 0 open errors, 0 panics, and 0 hangs across all 10
 | G3 graph labels | `go test -v -run 'TestGateG3$' ./internal/graph` | ≈2,510 events, ≈1,073 cutoffs, ≈173 distinct state keys, Semantic=1 on 96% of cutoffs, build time ≈12 ms | 0.05 s |
 | G4 discovery curves | `go test -v -run 'TestGateG4$\|TestMainRunArtifacts' ./internal/exp` | curves recomputed from the stored smoke and main tables match the committed `results/discovery_*.csv`; nothing re-executed | 0.5 s |
 | Real-disk recovery | `go test -v -run TestRealDisk ./internal/recovery` | 200 synced keys survive a clean close and an abrupt child-process exit on `vfs.Default` | 1.6 s |
+| Subsystem discovery | `go test -v -run TestSubsystemDiscovery ./internal/exp` | 9 rows validated in `results/subsystem_discovery.csv`; 0 durably committed violations, 0 panics | <0.01 s |
 
 G1, G2 and G3 record a fresh trace, so their counts vary by a few events between runs
 (see Determinism above).

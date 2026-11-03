@@ -1,0 +1,10 @@
+workload,seed,operations,ingest_every,ratchet_at,checkpoint_at,max_manifest_file_size,policies,universe_size,violations,durably_committed,prefix_violations,structural_violations,open_errors,panics,hangs,git_commit
+Workload A: External SSTable Ingestion,42,80,25,0,0,0,[0 50 100],552,15,0,15,0,2,0,0,0db16e2d062e
+Workload A: External SSTable Ingestion,100,80,25,0,0,0,[0 50 100],597,0,0,0,0,0,0,0,0db16e2d062e
+Workload A: External SSTable Ingestion,777,80,25,0,0,0,[0 50 100],576,25,0,25,0,0,0,0,0db16e2d062e
+Workload B: Live Format-Version Ratcheting,42,80,0,50,0,0,[0 50 100],462,0,0,0,0,1,0,0,0db16e2d062e
+Workload B: Live Format-Version Ratcheting,100,80,0,50,0,0,[0 50 100],465,0,0,0,0,0,0,0,0db16e2d062e
+Workload B: Live Format-Version Ratcheting,777,80,0,50,0,0,[0 50 100],405,0,0,0,0,1,0,0,0db16e2d062e
+Workload C: Combined Lifecycle Stress,42,80,30,40,60,1,[0 50 100],801,0,0,0,0,4,0,0,0db16e2d062e
+Workload C: Combined Lifecycle Stress,100,80,30,40,60,1,[0 50 100],774,0,0,0,0,2,0,0,0db16e2d062e
+Workload C: Combined Lifecycle Stress,777,80,30,40,60,1,[0 50 100],762,0,0,0,0,2,0,0,0db16e2d062e

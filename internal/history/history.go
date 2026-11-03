@@ -65,7 +65,7 @@ func Clone(entries []Entry) []Entry {
 
 func isValidKind(kind string) bool {
 	switch kind {
-	case "set", "delete", "range_delete", "batch", "get", "iterate", "flush", "compact", "checkpoint":
+	case "set", "delete", "range_delete", "batch", "get", "iterate", "flush", "compact", "checkpoint", "ingest", "ratchet":
 		return true
 	default:
 		return false
@@ -73,7 +73,7 @@ func isValidKind(kind string) bool {
 }
 
 func isMutatingKind(kind string) bool {
-	return kind == "set" || kind == "delete" || kind == "range_delete" || kind == "batch"
+	return kind == "set" || kind == "delete" || kind == "range_delete" || kind == "batch" || kind == "ingest"
 }
 
 // Validate validates that entries form a strictly well-formed history ledger.
@@ -192,6 +192,16 @@ func Validate(entries []Entry) error {
 					}
 				default:
 					return fmt.Errorf("entry %d (op %d) mutation %d: unsupported batch mutation kind %q", i, e.Op, j, m.Kind)
+				}
+			}
+
+		case "ingest":
+			for j, m := range e.Mutations {
+				if m.Kind != "set" {
+					return fmt.Errorf("entry %d (op %d) mutation %d: ingest mutation kind must be set", i, e.Op, j)
+				}
+				if len(m.End) != 0 {
+					return fmt.Errorf("entry %d (op %d) mutation %d: ingest set cannot have end", i, e.Op, j)
 				}
 			}
 		}

@@ -364,6 +364,10 @@ func RunSingleSeedFault(seed uint64, faultID string, cfg BenchmarkConfig) (*Sing
 	if cfg.Workload.MaxManifestFileSize > 0 {
 		opts.MaxManifestFileSize = cfg.Workload.MaxManifestFileSize
 	}
+	if wCfg.RatchetAt > 0 {
+		opts.FormatMajorVersion = pebble.FormatMinSupported
+	}
+	wCfg.FS = faultFS
 
 	db, err := pebble.Open("db", opts)
 	if err != nil {
@@ -863,7 +867,7 @@ func RunBenchmark(cfg BenchmarkConfig, progress func(string)) (*BenchmarkResult,
 	mut0AlreadyRun := false
 	for _, fid := range cfg.FaultIDs {
 		norm, _ := faults.NormalizeID(fid)
-		if norm == faults.MUT0 || norm == faults.Barrier5825 {
+		if norm == faults.MUT0 || norm == faults.Barrier5825 || norm == faults.BarrierCkpt {
 			mut0AlreadyRun = true
 			break
 		}

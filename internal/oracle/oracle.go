@@ -68,7 +68,7 @@ func stateEqual(a, b State) bool {
 }
 
 func isMutating(kind string) bool {
-	return kind == "set" || kind == "delete" || kind == "range_delete" || kind == "batch"
+	return kind == "set" || kind == "delete" || kind == "range_delete" || kind == "batch" || kind == "ingest"
 }
 
 // FormatSignature computes the canonical lower-case hex SHA-256 signature
