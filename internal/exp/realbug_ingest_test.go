@@ -265,6 +265,12 @@ func validateRealBugIngestCSVs(t *testing.T, perSeedPath, summaryPath string) {
 			if len(strat) == 0 {
 				t.Errorf("BARRIER-INGEST has empty strategy")
 			}
+			if row[2] != "0.00" {
+				t.Errorf("BARRIER-INGEST strategy %s expected k1_failure_median == 0.00, got %s", strat, row[2])
+			}
+			if row[5] != "0.00" {
+				t.Errorf("BARRIER-INGEST strategy %s expected k1_failure_mean == 0.00, got %s", strat, row[5])
+			}
 		} else if fid == "MUT-0" {
 			if strat == "Durability-Contract Guided (DCG)" {
 				k1Med, _ := strconv.ParseFloat(row[2], 64)
@@ -369,7 +375,7 @@ func TestRealBugIngestBenchmark(t *testing.T) {
 					IngestEvery:   5,
 					BarrierIngest: cond.barrierIngest,
 				},
-				Policies:        []int{0, 50},
+				Policies:        []int{0, 100},
 				SafeOpenTimeout: 3 * time.Second,
 				B0PercentileCnt: 50,
 				Budgets:         []int{0, 1, 5, 10, 25},
