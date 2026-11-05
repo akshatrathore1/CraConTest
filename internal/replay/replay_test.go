@@ -2,7 +2,11 @@ package replay_test
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
 	"io"
+	"sort"
 	"testing"
 	"time"
 
@@ -392,3 +396,179 @@ func TestReplayUnsupportedPolicy(t *testing.T) {
 		t.Fatalf("expected success for 50%% retention, got: %v", err)
 	}
 }
+
+func computeFSSHA256(t *testing.T, fs vfs.FS) string {
+	t.Helper()
+	var walk func(dir string) (map[string][]byte, error)
+	walk = func(dir string) (map[string][]byte, error) {
+		res := make(map[string][]byte)
+		entries, err := fs.List(dir)
+		if err != nil {
+			return nil, err
+		}
+		for _, e := range entries {
+			p := e
+			if dir != "" {
+				p = dir + "/" + e
+			}
+			info, err := fs.Stat(p)
+			if err != nil {
+				return nil, err
+			}
+			if info.IsDir() {
+				sub, err := walk(p)
+				if err != nil {
+					return nil, err
+				}
+				for k, v := range sub {
+					res[k] = v
+				}
+			} else {
+				f, err := fs.Open(p)
+				if err != nil {
+					return nil, err
+				}
+				content, err := io.ReadAll(f)
+				_ = f.Close()
+				if err != nil {
+					return nil, err
+				}
+				h := sha256.Sum256(content)
+				res[p] = h[:]
+			}
+		}
+		return res, nil
+	}
+
+	files, err := walk("")
+	if err != nil {
+		t.Fatalf("computeFSSHA256 walk: %v", err)
+	}
+
+	keys := make([]string, 0, len(files))
+	for k := range files {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	topH := sha256.New()
+	for _, k := range keys {
+		topH.Write([]byte(k))
+		topH.Write(files[k])
+	}
+	return hex.EncodeToString(topH.Sum(nil))
+}
+
+func TestReplayClonePartialRetentionSeedDeterminism(t *testing.T) {
+	mem := vfs.NewCrashableMem()
+	rec := vfsrec.New(mem)
+
+	// Step 1: Synced base state with initial manifest and marker
+	rec.Begin(1, "set")
+	mf, err := rec.Create("MANIFEST-000001", "unspecified")
+	if err != nil {
+		t.Fatalf("Create base manifest: %v", err)
+	}
+	if _, err := mf.Write([]byte("synced manifest header")); err != nil {
+		t.Fatalf("Write base manifest: %v", err)
+	}
+	if err := mf.Sync(); err != nil {
+		t.Fatalf("Sync base manifest: %v", err)
+	}
+	if err := mf.Close(); err != nil {
+		t.Fatalf("Close base manifest: %v", err)
+	}
+
+	df, err := rec.OpenDir("")
+	if err != nil {
+		t.Fatalf("OpenDir: %v", err)
+	}
+	if err := df.Sync(); err != nil {
+		t.Fatalf("Sync dir: %v", err)
+	}
+	if err := df.Close(); err != nil {
+		t.Fatalf("Close dir: %v", err)
+	}
+	rec.End(1, "set", "")
+
+	// Step 2: Create 20 files with unsynced directory entries (MANIFEST-*, marker.manifest.*, SSTs)
+	// and unsynced multi-block writes (> 4096 bytes).
+	rec.Begin(2, "set")
+	for i := 0; i < 20; i++ {
+		var fname string
+		switch i % 3 {
+		case 0:
+			fname = fmt.Sprintf("0000%02d.sst", i)
+		case 1:
+			fname = fmt.Sprintf("MANIFEST-%06d", i)
+		case 2:
+			fname = fmt.Sprintf("marker.manifest.%06d", i)
+		}
+
+		f, err := rec.Create(fname, "unspecified")
+		if err != nil {
+			t.Fatalf("Create %s: %v", fname, err)
+		}
+		// Multi-block payload: 10KB (spanning multiple 4096-byte blocks)
+		payload := bytes.Repeat([]byte{byte('A' + (i % 26))}, 10240)
+		if _, err := f.Write(payload); err != nil {
+			t.Fatalf("Write %s: %v", fname, err)
+		}
+		// Some files sync their data, but directory entries remain unsynced
+		if i%2 == 0 {
+			if err := f.Sync(); err != nil {
+				t.Fatalf("Sync %s: %v", fname, err)
+			}
+		}
+		// Unsynced multi-block append on some files
+		if i%3 == 0 {
+			if _, err := f.Write(bytes.Repeat([]byte{0xFF}, 4096)); err != nil {
+				t.Fatalf("Write append %s: %v", fname, err)
+			}
+		}
+		if err := f.Close(); err != nil {
+			t.Fatalf("Close %s: %v", fname, err)
+		}
+	}
+	rec.End(2, "set", "")
+
+	events := rec.Events()
+	if err := trace.Validate(events); err != nil {
+		t.Fatalf("trace.Validate: %v", err)
+	}
+
+	state, err := replay.Build(events, uint64(len(events)))
+	if err != nil {
+		t.Fatalf("replay.Build: %v", err)
+	}
+	defer state.Close()
+
+	// Clone 32 times with seed 42 and percent 50
+	digests := make(map[string]int)
+	for r := 0; r < 32; r++ {
+		cloned, err := state.Clone(50, 42)
+		if err != nil {
+			t.Fatalf("Clone(50, 42) round %d: %v", r, err)
+		}
+		digest := computeFSSHA256(t, cloned)
+		digests[digest]++
+	}
+
+	if len(digests) != 1 {
+		t.Fatalf("expected exactly 1 identical digest across 32 repeats of seed 42, got %d distinct digests: %v", len(digests), digests)
+	}
+
+	// Clone with a different seed (43) and verify distinct digest
+	cloned43, err := state.Clone(50, 43)
+	if err != nil {
+		t.Fatalf("Clone(50, 43): %v", err)
+	}
+	digest43 := computeFSSHA256(t, cloned43)
+
+	for d42 := range digests {
+		if digest43 == d42 {
+			t.Fatalf("expected seed 43 to produce a distinct digest from seed 42, but both produced %s", d42)
+		}
+	}
+}
+
