@@ -698,7 +698,7 @@ Evaluated strategies: `DCG`, `DCG-PR`, `R2`, `Sync-Boundary (B6)`, and `Uniform 
 
 **Hydra** (SOSP '19) provided an extensible framework for finding crash-consistency and file-system bugs via bounded fuzzing and symbolic execution. CraConTest operates above the file system, utilizing graph reachability and POSIX contract priors to guide bounded crash budgets without symbolic execution.
 
-**Witcher** (SOSP '21) targets persistent-memory (NVM) key-value stores and persistent indices, tracing memory load/store instructions and cacheline flushes/fences (`clwb`, `clflushopt`, `sfence`), rather than file-system VFS operations. CraConTest's fault model is VFS-layer sync omission, which is orthogonal to PM cache-line persistence.
+**Witcher** (SOSP '21) targets persistent-memory (NVM) key-value stores and persistent indices (inferring likely invariants over NVM load/store instruction traces and `clwb`/`sfence` ordering), not PM file systems. Witcher is the closest prior work in targeting user-space key-value stores via heuristic crash state selection, whereas CraConTest operates at the POSIX VFS syscall layer using closed-form POSIX durability-contract flags rather than inferred NVM store invariants.
 
 **Vinter** (OSDI '22) performed targeted crash-consistency verification of NVM data structures under hardware memory reordering.
 
