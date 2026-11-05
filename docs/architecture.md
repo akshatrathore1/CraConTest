@@ -78,11 +78,7 @@ crash candidates, and rank them by strategy.
     version-one SHA-256 encoding.
 - **Rankings**: one ordered list of candidates per strategy.
 
-The initial execution profile uses 0% and 100% retention. Pinned CrashClone
-does not reproduce intermediate-retention images from a seed alone because
-map traversal affects RNG consumption. The tuple can represent 0..100, but
-intermediate policies require a separately validated sampler or saved image.
-The complete tuple, not a truncated hash, identifies a candidate and outcome.
+While upstream `MemFS.CrashClone` iterates over unsorted Go maps (`f.children`) when `0 < UnsyncedDataPercent < 100`, `replay.State.Clone` (`internal/replay/replay.go`) implements `deterministicPartialClone`: it takes the deterministic `0%` synced snapshot (`base0`) and deterministic `100%` unsynced snapshot (`full100`) and traverses all directory entries and 4,096-byte file blocks in strictly sorted lexicographical order (`sort.Strings`) using the candidate's derived PCG seed (`rand.NewPCG(0, seed)`). Consequently, all retention policies `0..100%` (including `50%`) are **100% bit-for-bit seed-deterministic** (`TestReplayClonePartialRetentionSeedDeterminism` and `TestExplorePartialRetentionFiveRepeatZeroFlips`). The complete tuple, not a truncated hash, identifies a candidate and outcome.
 
 **Strategies** rank *U* using only trace-derived features. They cannot observe
 outcomes, history, or recovery results. The `internal/strategy` package implements
@@ -107,8 +103,11 @@ outcome table.
   Preserve open resource handles and cursor/alias behavior. Do not close
   or synchronize those handles before the snapshot.
 
-2. **Clone**: call `CrashClone(CrashCloneCfg{UnsyncedDataPercent: p, RNG: rng})`
-   on the replayed filesystem to produce the post-crash state.
+2. **Clone**: call `State.Clone(p, seed)` (`internal/replay/replay.go`) on the
+   replayed filesystem to produce the post-crash state. For endpoint policies
+   (`0%` and `100%`), it delegates directly to `MemFS.CrashClone`; for
+   intermediate retention (e.g., `50%`), it executes `deterministicPartialClone`
+   to ensure 100% bit-for-bit seed-reproducible crash sampling.
 
 3. **Recover**: open Pebble on the cloned filesystem with:
    - An `Options.Logger` whose `Fatalf` panics instead of calling `os.Exit(1)`

@@ -60,6 +60,12 @@ works as follows:
     blocks and randomly include each with probability `UnsyncedDataPercent`.
     Gaps between included unsynced blocks are zero-filled.
 
+#### Intermediate Retention Determinism via `deterministicPartialClone`
+
+While raw upstream `MemFS.CrashClone` provides fast in-memory snapshots, Go's randomized map iteration order over `f.children` causes `CrashClone` to consume pseudo-random numbers in an unstable order whenever `1 <= UnsyncedDataPercent <= 99`. Consequently, invoking raw `MemFS.CrashClone` repeatedly with the exact same seed produces multiple distinct filesystem images (demonstrated in `internal/trace/event_test.go:TestCrashCloneSeedReproducibility`).
+
+To eliminate this nondeterminism and guarantee bit-for-bit reproducibility across all retention policies, CraConTest wraps replay snapshots in `replay.State.Clone` (`internal/replay/replay.go`). For intermediate retention (such as 50%), `State.Clone` executes `deterministicPartialClone`: it takes the deterministic 0% synced snapshot (`base0`) and 100% unsynced snapshot (`full100`), traverses directory entries in strictly sorted lexicographical order (`sort.Strings`), and samples 4,096-byte dirty blocks in ascending offset order using a candidate-derived PCG random number generator (`rand.NewPCG(0, seed)`). This ensures 100% seed determinism for any retention policy from 0% to 100% (`TestReplayClonePartialRetentionSeedDeterminism`).
+
 ## Pebble's Durability Contract
 
 Pebble provides the following persistence guarantees:
@@ -158,7 +164,7 @@ replays WAL files to reconstruct in-memory state:
 Invalid or zeroed chunks (from WAL preallocation or recycling) trigger a
 read-ahead check in `record.Reader`. The WAL format includes sync-offset
 headers in sync chunks: if a subsequent chunk has a `syncedOffset` greater than
-the offset of the invalid data, this proves a **hole** in the durable log —
+the offset of the invalid data, this demonstrates a **hole** in the durable log —
 data was synced past the point of corruption, confirming real corruption rather
 than a torn tail. This directly enforces the no-hole invariant at the WAL level.
 
