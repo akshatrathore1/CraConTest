@@ -9,6 +9,7 @@ import (
 	"io"
 	"math/rand/v2"
 	"os"
+	"sort"
 
 	"github.com/akshatrathore1/CraConTest/internal/trace"
 	"github.com/cockroachdb/pebble/v2/vfs"
@@ -72,17 +73,183 @@ func (s *State) Advance(cut uint64) error {
 
 // Clone clones the filesystem using CrashClone with the given unsynced retention
 // percentage (0..100) and RNG seed. Outstanding handles remain open during clone.
+// For percent == 0 and percent == 100, it delegates directly to MemFS.CrashClone.
+// For 0 < percent < 100, it executes deterministicPartialClone to guarantee 100%
+// deterministic, seed-reproducible crash sampling regardless of map iteration order.
 func (s *State) Clone(percent int, seed uint64) (vfs.FS, error) {
 	if percent < 0 || percent > 100 {
 		return nil, fmt.Errorf("replay: retention percent %d outside 0..100", percent)
 	}
 
+	if percent == 0 {
+		return s.memFS.CrashClone(vfs.CrashCloneCfg{UnsyncedDataPercent: 0}), nil
+	}
+	if percent == 100 {
+		return s.memFS.CrashClone(vfs.CrashCloneCfg{
+			UnsyncedDataPercent: 100,
+			RNG:                 rand.New(rand.NewPCG(0, seed)),
+		}), nil
+	}
+
 	rng := rand.New(rand.NewPCG(0, seed))
-	cloned := s.memFS.CrashClone(vfs.CrashCloneCfg{
-		UnsyncedDataPercent: percent,
-		RNG:                 rng,
+	base0 := s.memFS.CrashClone(vfs.CrashCloneCfg{UnsyncedDataPercent: 0})
+	full100 := s.memFS.CrashClone(vfs.CrashCloneCfg{
+		UnsyncedDataPercent: 100,
+		RNG:                 rand.New(rand.NewPCG(0, 0)),
 	})
-	return cloned, nil
+	return deterministicPartialClone(base0, full100, percent, rng)
+}
+
+// deterministicPartialClone constructs a 100% deterministic, seed-reproducible partial-retention
+// crash image from base0 (exact synced state) and full100 (exact unsynced state).
+// Traversal and RNG consumption are executed in strictly sorted lexicographical order.
+func deterministicPartialClone(base0, full100 vfs.FS, percent int, rng *rand.Rand) (vfs.FS, error) {
+	detFS := vfs.NewCrashableMem()
+	dirsToSync := []string{""}
+
+	var traverse func(dir string) error
+	traverse = func(dir string) error {
+		syncedSet := make(map[string]bool)
+		if entries, err := base0.List(dir); err == nil {
+			for _, e := range entries {
+				syncedSet[e] = true
+			}
+		}
+
+		currSet := make(map[string]bool)
+		if entries, err := full100.List(dir); err == nil {
+			for _, e := range entries {
+				currSet[e] = true
+			}
+		}
+
+		nameMap := make(map[string]bool, len(syncedSet)+len(currSet))
+		for e := range syncedSet {
+			nameMap[e] = true
+		}
+		for e := range currSet {
+			nameMap[e] = true
+		}
+
+		allNames := make([]string, 0, len(nameMap))
+		for name := range nameMap {
+			allNames = append(allNames, name)
+		}
+		sort.Strings(allNames)
+
+		for _, name := range allNames {
+			childPath := name
+			if dir != "" {
+				childPath = dir + "/" + name
+			}
+
+			var isDir bool
+			if fi, err := full100.Stat(childPath); err == nil {
+				isDir = fi.IsDir()
+			} else if fi, err := base0.Stat(childPath); err == nil {
+				isDir = fi.IsDir()
+			}
+
+			// Retention rule for directory entry childPath:
+			// If syncedSet[name] is true: durably synced entry, retain unconditionally without consuming RNG.
+			// If syncedSet[name] is false: unsynced entry present only in full100, consume one roll:
+			// if rng.IntN(100) >= percent { continue } (skip entry and subtree).
+			if !syncedSet[name] {
+				if rng.IntN(100) >= percent {
+					continue
+				}
+			}
+
+			if isDir {
+				if childPath != "" {
+					if err := detFS.MkdirAll(childPath, 0755); err != nil {
+						return err
+					}
+					dirsToSync = append(dirsToSync, childPath)
+				}
+				if err := traverse(childPath); err != nil {
+					return err
+				}
+			} else {
+				var syncedBytes []byte
+				if syncedSet[name] {
+					if f, err := base0.Open(childPath); err == nil {
+						syncedBytes, _ = io.ReadAll(f)
+						_ = f.Close()
+					}
+				}
+
+				currBytes := syncedBytes
+				if currSet[name] {
+					if f, err := full100.Open(childPath); err == nil {
+						currBytes, _ = io.ReadAll(f)
+						_ = f.Close()
+					}
+				}
+
+				out := bytes.Clone(syncedBytes)
+				if currSet[name] && !bytes.Equal(syncedBytes, currBytes) {
+					for offset := 0; offset < len(currBytes); offset += 4096 {
+						end := offset + 4096
+						if end > len(currBytes) {
+							end = len(currBytes)
+						}
+						differs := false
+						if offset >= len(syncedBytes) || end > len(syncedBytes) {
+							differs = true
+						} else if !bytes.Equal(syncedBytes[offset:end], currBytes[offset:end]) {
+							differs = true
+						}
+						if differs {
+							if rng.IntN(100) < percent {
+								if len(out) < end {
+									out = append(out, make([]byte, end-len(out))...)
+								}
+								copy(out[offset:end], currBytes[offset:end])
+							}
+						}
+					}
+				}
+
+				f, err := detFS.Create(childPath, vfs.WriteCategoryUnspecified)
+				if err != nil {
+					return err
+				}
+				if len(out) > 0 {
+					if _, err := f.Write(out); err != nil {
+						_ = f.Close()
+						return err
+					}
+				}
+				if err := f.Sync(); err != nil {
+					_ = f.Close()
+					return err
+				}
+				if err := f.Close(); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+
+	if err := traverse(""); err != nil {
+		return nil, err
+	}
+
+	// Sync all created directories in detFS (including "") so the constructed crash image is quiescent and ready for pebble.Open.
+	sort.Strings(dirsToSync)
+	for i, d := range dirsToSync {
+		if i > 0 && d == dirsToSync[i-1] {
+			continue
+		}
+		if df, err := detFS.OpenDir(d); err == nil {
+			_ = df.Sync()
+			_ = df.Close()
+		}
+	}
+
+	return detFS, nil
 }
 
 // Close closes all outstanding file and lock handles. Safe to call multiple times.

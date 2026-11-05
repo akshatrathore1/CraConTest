@@ -31,21 +31,22 @@ We address this question through an eight-stage empirical evaluation on Cockroac
    - Across 32 deterministic seeds (>11,000 crash states), `DCG` achieves optimal $k_1 = 1.00$ [1.00, 1.00] across all active fault models (`MUT-1..6`, `MUT-8`, `MUT-9`), with 0 false alarms on `MUT-0`.
    - The `DCG-FlagOnly` ablation ties full `DCG` on `113 wins / 0 losses / 124 ties` vs `R2`, showing that binary POSIX durability-contract priors combined with `StateKey` equivalence partitioning drive the speedup.
 
-3. **Stage 3 — Pre-Frozen Holdout Fault Generalization (`MUT-X1..X5`) & Non-Contractual Control (`MUT-X6`) (§8.4):**
-   - With ranking code frozen at tag `v1.0-dcg-pr-freeze` (`67bbe7d`), `DCG` / `DCG-PR` beats `R2` across all 12 testable in-contract holdout settings (**284 wins / 0 losses / 46 ties**, mean $k_1$ speedup $2.1\times\text{--}20.0\times$, Holm-adjusted sign-test $p \le 0.002$) and degrades gracefully to `R2` on non-contractual silent write drops (`MUT-X6`, Holm $p = 1.0$).
+3. **Stage 3 — Parameterized & Stochastic Fault Generalization (`MUT-X1..X5`) and Out-of-Contract Control (`MUT-X6`) (§8.4):**
+   - The parameterized $k$-index (`MUT-X1..X3`), stochastic probability-$p$ (`MUT-X4..X5`), and out-of-contract silent write-loss (`MUT-X6`) fault families were committed to `internal/faults/faults.go` on `2026-11-01` (`c67a44a`, prior to tag `v1.0-dcg-pr-freeze`) to evaluate whether the four binary POSIX durability-contract flags generalize across arbitrary sync-drop indices $k$ and drop probabilities $p$ without re-tuning (**284 wins / 0 losses / 46 ties** vs. `R2`, mean $k_1$ speedup $2.1\times\text{--}20.0\times$, Holm-adjusted sign-test $p \le 0.002$) and degrade gracefully to `R2` on non-contractual silent write drops (`MUT-X6`, Holm $p = 1.0$).
+   - Subsequently, `internal/strategy/dcg.go` and `internal/graph/features.go` were frozen at Git tag **`v1.0-dcg-pr-freeze` (`67bbe7d`)**, and **three strictly post-freeze evaluations** were designed and executed with 0 bytes of modification to the ranking or feature code: (1) Post-Freeze Holdout 1 (Real Bug — Checkpoint `15b500fb`, §10), (2) Post-Freeze Holdout 2 (Real Bug — Direct L0 `db.Ingest`, §13.5), and (3) Post-Freeze Holdout 3 (Multi-Distribution Workload Suite, §14).
 
 4. **Stage 4 — Real-World Case Study 1: CockroachDB Pebble Issue `#5825` (`MUT-0` vs. `BARRIER-5825`) & Partial-Retention Prior (`DCG-PR`) (§9):**
-   - Reproduces Pebble `#5825` under 50% partial retention with manifest rotation (69 failures across 32 seeds under unpatched `MUT-0`, reduced to **0 failures** under causal barrier control `BARRIER-5825`). `DCG-PR` (`UnsyncedDirEntryCount >= 2`) reduces median $k_1$ from $310.50$ (0%-first `DCG`) and $161.00$ (`B0`) down to **2.50** (mean $10.50$).
+   - Reproduces Pebble `#5825` under deterministic 50% partial retention with manifest rotation (99 failures across 31 failing seeds under unpatched `MUT-0`, reduced to **0 failures** under causal barrier control `BARRIER-5825`). `DCG-PR` (`UnsyncedDirEntryCount >= 2`) reduces median $k_1$ from $205.00$ (0%-first `DCG`, mean $253.52$) and $104.50$ (`B0`, mean $134.63$) down to **2.00** [1.00, 3.00] (mean **2.65** [1.97, 3.33], $S_{25} = 2.53$, $S_{100} = 2.53$, AUC Failures = $0.8455$, AUC Bugs = $0.9212$).
 
 5. **Stage 5 — Held-Out Real-World Case Study 2: CockroachDB Pebble Checkpoint Commit `15b500fb` (`MUT-0` vs. `BARRIER-CKPT`) (§10):**
-   - Evaluated with pre-frozen `DCG-PR` (`v1.0-dcg-pr-freeze`), reproducing 25/32 failing seeds under unpatched `MUT-0` and **0/32 failing seeds** under causal barrier control `BARRIER-CKPT`. Pre-frozen `DCG-PR` discovers the failure at median $k_1 = \mathbf{3.00}$ (mean $121.40$) vs. $385.00$ for 0%-first `DCG` and $156.00$ for `B0`.
+   - Evaluated with pre-frozen `DCG-PR` (`v1.0-dcg-pr-freeze`), reproducing 67 failures across 30 of 32 failing seeds under unpatched `MUT-0` and **0/32 failing seeds** under causal barrier control `BARRIER-CKPT`. Pre-frozen `DCG-PR` discovers the failure at median $k_1 = \mathbf{2.00}$ [1.00, 125.50] (mean **93.17** [43.44, 142.89], $S_{25} = 0.84$, $S_{100} = 0.84$, AUC Failures = $0.5414$, AUC Bugs = $0.6739$) vs. $215.00$ for 0%-first `DCG` (mean $262.97$) and $168.75$ for `B0` (mean $175.40$).
 
 6. **Stage 6 — Candidate Universe Scaling (`120..1,200` ops) & Multi-Shape Null Control (`108` runs) (§11–§12):**
    - On `MUT-5`, as candidate universes grow from ~338 to ~2,958 states, `DCG` maintains constant $O(1)$ discovery ($k_1 = 1.00$, planning time $\le 56.1\text{ ms}$) while `R2`, `R1`, `B0`, and `LIFO` scale linearly. Across 108 unfaulted runs spanning 12 workload shapes (>50,000 crash states), the harness exhibits a **0.00% false-alarm rate** (0 violations, 0 open errors, 0 panics, 0 hangs).
 
 7. **Stage 7 — Pebble Subsystem Source Audit, Workload Extension & Empirical Crash-Consistency Proofs under Unfaulted MUT-0 (§13.1–§13.4):**
    - Exhaustive source audit of Pebble v2.1.7 (`ingest.go:1490`, `version_set.go:649`, `commit.go:289`, `format_major_version.go:486`, `vfs/atomicfs/marker.go:189`, and `checkpoint.go` lines 287, 596, 448).
-   - Evaluated Workload A (Ingestion), Workload B (Format Ratcheting), and Workload C (Combined Stress) under `MUT-0` across policies `[0, 50, 100]` (5,394 candidate states in `results/subsystem_discovery.csv`). Across all 5,394 candidate states, Pebble v2.1.7 exhibits **0 `durably_committed` data-loss violations and 0 recovery panics**, confirming that `d.objProvider.Sync()` (`ingest.go:1490`) and `atomicfs.Marker.Move` (`marker.go:189`) protect acknowledged ingest and format-ratchet operations from losing committed data. Simultaneously, the audit exposed two distinct recovery hazards under `MUT-0`: (1) an **input-dependent cross-channel `prefix` monotonicity hole** during non-overlapping Direct L0 `db.Ingest` (`40` prefix violations in Workload A, analyzed across 32 seeds in §13.5), and (2) **50%-retention intra-operation directory races (`open_error`)** when a crash occurs inside the multi-entry window between `MANIFEST-*`/`.sst` creation and `dirFD.Sync()`.
+   - Evaluated Workload A (Ingestion), Workload B (Format Ratcheting), and Workload C (Combined Stress) under `MUT-0` across policies `[0, 50, 100]` (5,409 candidate states in `results/subsystem_discovery.csv`). Across all 5,409 candidate states, Pebble v2.1.7 exhibits **0 `durably_committed` data-loss violations and 0 recovery panics**, confirming that `d.objProvider.Sync()` (`ingest.go:1490`) and `atomicfs.Marker.Move` (`marker.go:189`) protect acknowledged ingest and format-ratchet operations from losing committed data. Simultaneously, the audit exposed two distinct recovery hazards under `MUT-0`: (1) an **input-dependent cross-channel `prefix` monotonicity hole** during non-overlapping Direct L0 `db.Ingest` (`40` prefix violations in Workload A, analyzed across 32 seeds in §13.5), and (2) **50%-retention intra-operation directory races (`open_error`)** when a crash occurs inside the multi-entry window between `MANIFEST-*`/`.sst` creation and `dirFD.Sync()` (31 total open errors).
 
 8. **Stage 8 — Direct L0 `db.Ingest` 32-Seed Case Study, Causal Remedy (`BARRIER-INGEST`) & Multi-Distribution Workload Generalization (`M18A` / `M18B`) (§13.5, §14):**
    - **Cross-Channel Prefix Hole (M18A):** Under unpatched `MUT-0` (`BarrierIngest: false`), direct L0 ingest bypasses WAL, incrementing sequence number $s_2 > s_1$ and committing via MANIFEST fsync while earlier un-synced WAL writes at $s_1$ remain unpersisted. Across 32 seeds, **26 of 32 seeds** exhibit prefix violations under `MUT-0` (seeds 3, 5, 7, 20, 26, 29 have 0 failures because on those seeds randomly generated ingest keys overlapped the active memtable and therefore executed the `asFlushable = true` branch, which synchronously flushes the WAL via `commit.directWrite` at `commit.go:289`; under endpoint retention, 22 of 32 seeds fail with seeds 8, 9, 16, 23 also taking flushable ingest). Pre-frozen `DCG-PR` achieves median $k_1 = \mathbf{13.50}$ (mean $16.50$) and `DCG` achieves $13.50$ (mean $16.50$), compared to $28.68$ (mean $27.63$) for `R2` and $22.25$ (mean $26.20$) for uniform random `B0`.
@@ -346,9 +347,16 @@ Across 32 deterministic workload seeds (>11,000 evaluated crash candidates):
 3. **$S_{25}$ Early-Budget Discovery & The ~40-State Equivalence Ceiling:**
    In a 120-operation workload, there are only ~35–40 distinct canonical `StateKey` persistence states under 0%-retention crashes. Under an exhaustive testing budget ($B = 100$, $S_{100}$), both DCG and R2 discover all reachable failing equivalence classes and tie because both strategies exhaust distinct state representatives before step 100 (reaching identical $S_{100} = 23.97$ on `MUT-1`, $33.03$ on `MUT-2`, $27.00$ on `MUT-3`, $21.72$ on `MUT-4`, and $27.00$ on `MUT-9`). Under MUT-8 (compaction-triggered SST sync drop, 15.2% density), DCG reaches the first failing state at median $k_1 = 1.0$ (mean 1.00) compared to R2's median $k_1 = 3.6$ (mean 3.56) and B0's median $k_1 = 4.0$ (mean 4.44), achieves early-budget $S_{25} = 12.88$ (vs R2's $6.72$ and B0's $2.00$), and matches R2 at full budget ($S_{100} = 12.88$ for DCG vs $12.82$ for R2, compared to $5.05$ for B0). Therefore, early-budget coverage $S_{25}$ ($B = 25$) is the critical discriminant metric for practical CI testing: DCG achieves near-full state discovery saturation within the first 25 tests (e.g. $S_{25} = 23.94$ vs R2's $17.12$ and B0's $6.12$ on `MUT-1`; $S_{25} = 12.88$ vs R2's $6.72$ and B0's $2.00$ on `MUT-8`; $S_{25} = 25.00$ vs R2's $17.78$ and B0's $3.03$ on `MUT-9`), yielding a 2x–8x throughput advantage over random selection.
 
-### 8.4 Holdout Fault Generalization (`MUT-X1..X5`) and Out-of-Contract Control (`MUT-X6`)
+### 8.4 Parameterized & Stochastic Fault Generalization (`MUT-X1..X5`) and Out-of-Contract Control (`MUT-X6`)
 
-Prior to evaluating any holdout faults, the `DCG-PR` implementation (`internal/strategy/dcg.go` and `internal/graph/features.go`) was frozen at Git tag `v1.0-dcg-pr-freeze` (`67bbe7d`) and never modified afterward, ensuring zero methodological leakage from holdout results into the ranking algorithm. Because all holdout faults involve only 0%- and 100%-retention crash states (no partial-retention intermediates), `dcg-pr` produces an identical ranking to `dcg` on these settings; the table therefore reports `DCG / DCG-PR` as a single column.
+The parameterized $k$-index (`MUT-X1..X3`), stochastic probability-$p$ (`MUT-X4..X5`), and out-of-contract silent write-loss (`MUT-X6`) fault families were committed to `internal/faults/faults.go` on `2026-11-01` (`c67a44a`, prior to tag `v1.0-dcg-pr-freeze`) to evaluate whether the four binary POSIX durability-contract flags generalize across arbitrary sync-drop indices $k$ and drop probabilities $p$ without re-tuning (**284 wins / 0 losses / 46 ties** vs. `R2`, mean $k_1$ speedup $2.1\times\text{--}20.0\times$, Holm-adjusted sign-test $p \le 0.002$).
+
+Subsequently, `internal/strategy/dcg.go` and `internal/graph/features.go` were frozen at Git tag **`v1.0-dcg-pr-freeze` (`67bbe7d`)**, and **three strictly post-freeze evaluations** were designed and executed with 0 bytes of modification to the ranking or feature code:
+1. **Post-Freeze Holdout 1 (Real Bug — Checkpoint `15b500fb`, §10)**: Evaluated across 32 seeds (`MUT-0` vs. `BARRIER-CKPT`).
+2. **Post-Freeze Holdout 2 (Real Bug — Direct L0 `db.Ingest` Cross-Channel Commit-Order Hole, §13.5)**: Evaluated across 32 seeds (`MUT-0` vs. `BARRIER-INGEST`).
+3. **Post-Freeze Holdout 3 (Multi-Distribution Workload Suite, §14)**: 5 workload presets (`ycsb-a`, `ycsb-b`, `ycsb-f`, `overwrite-heavy`, `delete-heavy`) evaluated across 16 seeds and 4 fault models.
+
+Because all parameterized and stochastic fault settings in Table 8.4 involve only 0%- and 100%-retention crash states (no partial-retention intermediates), `dcg-pr` produces an identical ranking to `dcg` on these settings; the table therefore reports `DCG / DCG-PR` as a single column.
 
 | Fault | Fault Family | Seeds Fail (Density) | DCG / DCG-PR — Median $k_1$ [95% CI] | DCG / DCG-PR — Mean $k_1$ | Sync-Boundary (B6) — Median [Mean] | State-Representative (B5) — Median [Mean] | Uniform Random (B0) — Median [Mean] | R2 — Median [Mean] | R1 — Median [Mean] |
 |---|---|---|---|---|---|---|---|---|---|
@@ -393,29 +401,29 @@ During manifest rotation, Pebble creates a new `MANIFEST-*` file and then update
 
 ### 9.2 Causal A/B Verification (MUT-0 vs. BARRIER-5825)
 To establish causal attribution, we benchmarked 32 deterministic workload seeds with manifest rotation enabled (`-max-manifest-size 1`) across retention policies 0%, 50%, and 100%:
-1. **MUT-0 (Unfaulted Baseline):** 69 total consistency failures occurred across the 32 seeds. Every single failure manifested exclusively on crash candidates evaluated under the **50% partial-retention policy** (~0.36%–0.57% failure density per seed).
+1. **MUT-0 (Unfaulted Baseline):** 99 total consistency failures occurred across 31 of the 32 seeds (seed 42 has 0 failures under partial retention; seeds 100..1022 have 1–5 failures). Every single failure manifested exclusively on crash candidates evaluated under the **50% partial-retention policy** (~0.36%–0.57% failure density per seed).
 2. **BARRIER-5825 (Manifest-Rotation Barrier Control):** By enforcing immediate parent directory sync (`fsync(parentDir)`) upon `Create`, `OpenReadWrite`, and `Rename`, all directory entries are made durable prior to subsequent mutations. Under BARRIER-5825, **0 failures** occurred across all 32 seeds, providing definitive empirical and causal proof of defect elimination.
 
 ### 9.3 Discovery Performance: Post-Hoc Partial-Retention Prior (`dcg-pr`)
-Standard durability-contract guided ranking (`dcg`) was designed with the core assumption that durability failures manifest predominantly at 0% retention (losing unpersisted data). Consequently, `dcg` sweeps all 0%-retention candidates first. On Pebble #5825, where failures only occur at 50% partial retention, standard `dcg` requires a median $k_1$ of **310.50** (mean 288.53) to discover the first failure, performing worse than uniform random B0 (median $k_1 = 161.00$, mean 173.32) and state-representative B5 (median $k_1 = 65.00$, mean 64.80).
+Standard durability-contract guided ranking (`dcg`) was designed with the core assumption that durability failures manifest predominantly at 0% retention (losing unpersisted data). Consequently, `dcg` sweeps all 0%-retention candidates first. On Pebble #5825, where failures only occur at 50% partial retention, standard `dcg` requires a median $k_1$ of **205.00** [203.00, 210.00] (mean 253.52) to discover the first failure, performing worse than uniform random B0 (median $k_1 = 104.50$, mean 134.63) and state-representative B5 (median $k_1 = 17.00$, mean 45.26).
 
 To target partial-retention directory vulnerabilities, we introduced `dcg-pr` (DCG Partial-Retention Prior). `dcg-pr` inspects `ContractFeatures.UnsyncedDirEntryCount`: candidates with `Policy > 0 && Policy < 100` and `UnsyncedDirEntryCount >= 2` are prioritized into Tier 1 (ahead of the 0% retention sweep).
 
 | Strategy | $k_1$ Failure Median [95% CI] | $k_1$ Failure Mean [95% CI] | $S_{25}$ Mean | $S_{100}$ Mean | AUC (Failures) | AUC (Bugs) |
 |---|---|---|---|---|---|---|
-| **DCG-PR (`dcg-pr`)** | **2.50** [2.00, 4.00] | **10.50** [0.00, 26.41] | **1.88** | **1.88** | **0.8355** | **0.9121** |
-| **Representative (B5)** | 65.00 [62.00, 68.00] | 64.80 [49.36, 80.24] | 0.28 | 1.16 | 0.7722 | 0.8200 |
-| **sync-boundary (B6)** | 66.50 [50.00, 110.00] | 74.20 [51.98, 96.42] | 0.25 | 0.72 | 0.6227 | 0.8047 |
-| **combined (B4)** | 92.00 [14.00, 92.00] | 80.20 [44.06, 116.34] | 0.44 | 1.06 | 0.6181 | 0.7932 |
-| **Uniform Random (B0)** | 161.00 [140.50, 174.00] | 173.32 [147.20, 199.43] | 0.00 | 0.11 | 0.4599 | 0.5875 |
-| **fifo (B1)** | 204.50 [29.00, 215.00] | 156.80 [103.47, 210.13] | 0.00 | 0.44 | 0.4705 | 0.5788 |
-| **rhg (B7)** | 258.50 [248.00, 264.50] | 257.20 [239.45, 274.95] | 0.00 | 0.00 | 0.3329 | 0.3668 |
-| **0%-Retention Random (R1)** | 300.95 [284.73, 321.53] | 306.21 [292.24, 320.18] | 0.00 | 0.00 | 0.3143 | 0.3313 |
-| **State-Representative Random (R2)** | 303.19 [279.27, 316.17] | 305.94 [290.26, 321.62] | 0.00 | 0.00 | 0.3145 | 0.3342 |
-| **DCG Flag-Only (Ablation)** | 303.87 [285.49, 318.03] | 307.24 [292.09, 322.38] | 0.00 | 0.00 | 0.3133 | 0.3318 |
-| **Durability-Contract Guided (DCG)** | 310.50 [204.00, 335.00] | 288.53 [252.28, 324.79] | 0.00 | 0.00 | 0.3535 | 0.3779 |
+| **DCG-PR (`dcg-pr`)** | **2.00** [1.00, 3.00] | **2.65** [1.97, 3.33] | **2.53** | **2.53** | **0.8455** | **0.9212** |
+| **Representative (B5)** | 17.00 [17.00, 62.00] | 45.26 [31.60, 58.91] | 0.56 | 1.69 | 0.8073 | 0.8525 |
+| **sync-boundary (B6)** | 50.00 [8.00, 83.00] | 67.61 [39.35, 95.87] | 0.38 | 0.91 | 0.6268 | 0.7401 |
+| **combined (B4)** | 8.00 [8.00, 14.00] | 54.26 [23.28, 85.24] | 0.69 | 1.41 | 0.6217 | 0.7224 |
+| **Uniform Random (B0)** | 104.50 [90.00, 140.00] | 134.63 [107.25, 162.00] | 0.00 | 0.44 | 0.4789 | 0.5844 |
+| **fifo (B1)** | 26.00 [26.00, 29.00] | 103.23 [55.37, 151.08] | 0.00 | 0.69 | 0.4790 | 0.5969 |
+| **rhg (B7)** | 256.00 [202.00, 264.00] | 248.35 [231.51, 265.20] | 0.00 | 0.00 | 0.3323 | 0.3605 |
+| **0%-Retention Random (R1)** | 273.63 [259.09, 298.21] | 285.15 [269.93, 300.38] | 0.00 | 0.00 | 0.3231 | 0.3362 |
+| **State-Representative Random (R2)** | 274.60 [262.14, 293.63] | 287.48 [271.78, 303.18] | 0.00 | 0.00 | 0.3231 | 0.3364 |
+| **DCG Flag-Only (Ablation)** | 274.03 [263.56, 293.38] | 284.28 [269.50, 299.05] | 0.00 | 0.00 | 0.3240 | 0.3383 |
+| **Durability-Contract Guided (DCG)** | 205.00 [203.00, 210.00] | 253.52 [221.27, 285.76] | 0.00 | 0.00 | 0.3434 | 0.3604 |
 
-As demonstrated, `dcg-pr` reduces $k_1$ from 310.50 down to **2.50** (a >120x speedup over standard DCG and >60x speedup over uniform random B0), with an AUC of 0.8355 (0.9121 for bugs). This demonstrates that extending durability contracts to model partial-retention directory hazards enables targeted discovery of real-world filesystem durability bugs.
+As demonstrated, `dcg-pr` reduces median $k_1$ from 205.00 down to **2.00** (mean 2.65, a >95x speedup over standard DCG and >50x speedup over uniform random B0), with an AUC of 0.8455 (0.9212 for bugs). This demonstrates that extending durability contracts to model partial-retention directory hazards enables targeted discovery of real-world filesystem durability bugs.
 
 ---
 
@@ -429,23 +437,23 @@ To guard against methodological overfitting, all prioritization algorithms—inc
 
 Across 32 deterministic seeds (`42, 100..900, 1001..1022`) under policies 0%, 50%, and 100% ($N = 17{,}975$ crash candidates total):
 
-1. **MUT-0 (Baseline):** 25 of 32 seeds exhibited checkpoint or manifest recovery failure under 50% partial retention (median 32.5 failing states/seed, mean 40.38). Every failure manifested as `open_error` at 50% partial retention where `marker.manifest.*` directory entries survived while linked `MANIFEST-*` or SSTable entries were dropped.
+1. **MUT-0 (Baseline):** 30 of 32 seeds exhibited checkpoint or manifest recovery failure under 50% partial retention (67 total failures across seeds; seeds 42 and 500 had 0 failures). Every failure manifested as `open_error` at 50% partial retention where `marker.manifest.*` directory entries survived while linked `MANIFEST-*` or SSTable entries were dropped.
 2. **BARRIER-CKPT (Checkpoint Directory Barrier Control):** Injecting a `parentDir.Sync()` barrier on any `Create`, `OpenReadWrite`, `Link`, or `Rename` targeting `marker.manifest.*` or `CURRENT` files completely eliminates all failures — **0 failures across all 32 seeds** (confirmed across every strategy row in `results/realbug_checkpoint_summary.csv`).
 
 ### 10.3 Pre-Frozen Strategy Discovery Performance
 
 | Strategy | $k_1$ Failure Median [95% CI] | $k_1$ Failure Mean [95% CI] | $S_{25}$ Mean | $S_{100}$ Mean | AUC (Failures) | AUC (Bugs) |
 |---|---|---|---|---|---|---|
-| **DCG-PR (`dcg-pr`, frozen)** | **3.00** [1.00, 255.00] | **121.40** [58.78, 184.02] | **0.56** | **0.56** | **0.4222** | **0.5711** |
-| **sync-boundary** | 71.00 [71.00, 74.00] | 76.40 [45.74, 107.06] | 0.19 | 0.84 | 0.5864 | 0.6754 |
-| **Representative** | 86.00 [17.00, 155.00] | 152.12 [89.93, 214.31] | 0.25 | 0.62 | 0.4601 | 0.5766 |
-| **Uniform Random (B0)** | 156.00 [130.50, 274.50] | 193.16 [157.38, 228.94] | 0.00 | 0.08 | 0.3981 | 0.4808 |
-| **Durability-Contract Guided (DCG)** | 385.00 [214.00, 408.00] | 314.32 [272.47, 356.17] | 0.00 | 0.00 | 0.2593 | 0.2684 |
-| **State-Representative Random (R2)** | 324.86 [304.50, 384.52] | 341.08 [319.62, 362.54] | 0.00 | 0.00 | 0.2612 | 0.2666 |
-| **0%-Retention-First Random (R1)** | 333.03 [296.53, 380.73] | 339.74 [318.52, 360.96] | 0.00 | 0.00 | 0.2606 | 0.2653 |
+| **DCG-PR (`dcg-pr`, frozen)** | **2.00** [1.00, 125.50] | **93.17** [43.44, 142.89] | **0.84** | **0.84** | **0.5414** | **0.6739** |
+| **sync-boundary** | 71.00 [8.00, 74.00] | 67.20 [39.88, 94.52] | 0.38 | 1.00 | 0.6881 | 0.8009 |
+| **Representative** | 17.00 [17.00, 86.00] | 84.80 [40.17, 129.43] | 0.56 | 1.03 | 0.6444 | 0.7558 |
+| **Uniform Random (B0)** | 168.75 [146.00, 178.25] | 175.40 [150.60, 200.20] | 0.00 | 0.09 | 0.4759 | 0.5475 |
+| **Durability-Contract Guided (DCG)** | 215.00 [212.50, 218.50] | 262.97 [230.86, 295.07] | 0.00 | 0.00 | 0.3107 | 0.3136 |
+| **State-Representative Random (R2)** | 326.11 [308.55, 335.14] | 326.05 [311.66, 340.44] | 0.00 | 0.00 | 0.3136 | 0.3164 |
+| **0%-Retention-First Random (R1)** | 323.00 [305.32, 330.72] | 324.43 [310.23, 338.63] | 0.00 | 0.00 | 0.3128 | 0.3160 |
 | **BARRIER-CKPT (all strategies)** | 0.00 [0.00, 0.00] | 0.00 [0.00, 0.00] | 0.00 | 0.00 | 0.0000 | 0.0000 |
 
-The pre-frozen `dcg-pr` ranking prioritizes unsynced directory hazards under partial retention, finding the checkpoint bug at median $k_1 = \mathbf{3.00}$—outperforming 0%-retention DCG (median $k_1 = 385.00$), uniform random B0 (median $k_1 = 156.00$), and all other heuristics.
+The pre-frozen `dcg-pr` ranking prioritizes unsynced directory hazards under partial retention, finding the checkpoint bug at median $k_1 = \mathbf{2.00}$ (mean 93.17)—outperforming 0%-retention DCG (median $k_1 = 215.00$, mean 262.97), uniform random B0 (median $k_1 = 168.75$, mean 175.40), and all other heuristics.
 
 ---
 
@@ -536,27 +544,27 @@ To exercise these subsystems during crash testing:
 
 ### 13.3 Systematic Unfaulted Discovery Results (results/subsystem_discovery.csv)
 
-The dedicated discovery test `TestSubsystemDiscovery` (`internal/exp/subsystem_discovery_test.go`) evaluated Workloads A, B, and C under `MUT-0` across seeds `42, 100, 777` with retention policies `[0, 50, 100]` (5,394 candidate states evaluated):
+The dedicated discovery test `TestSubsystemDiscovery` (`internal/exp/subsystem_discovery_test.go`) evaluated Workloads A, B, and C under `MUT-0` across seeds `42, 100, 777` with retention policies `[0, 50, 100]` (5,409 candidate states evaluated):
 
 | Workload | Seed | Operations | IngestEvery | RatchetAt | CheckpointAt | MaxManifestSize | Policies | Universe | Violations | Durably Committed | Prefix Violations | Open Errors | Panics | Hangs |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| **Workload A (Ingestion)** | 42 | 80 | 25 | 0 | 0 | 0 | [0 50 100] | 552 | 15 | 0 | 15 | 2 | 0 | 0 |
-| **Workload A (Ingestion)** | 100 | 80 | 25 | 0 | 0 | 0 | [0 50 100] | 597 | 0 | 0 | 0 | 0 | 0 | 0 |
-| **Workload A (Ingestion)** | 777 | 80 | 25 | 0 | 0 | 0 | [0 50 100] | 576 | 25 | 0 | 25 | 0 | 0 | 0 |
+| **Workload A (Ingestion)** | 42 | 80 | 25 | 0 | 0 | 0 | [0 50 100] | 555 | 15 | 0 | 15 | 1 | 0 | 0 |
+| **Workload A (Ingestion)** | 100 | 80 | 25 | 0 | 0 | 0 | [0 50 100] | 621 | 0 | 0 | 0 | 2 | 0 | 0 |
+| **Workload A (Ingestion)** | 777 | 80 | 25 | 0 | 0 | 0 | [0 50 100] | 573 | 25 | 0 | 25 | 1 | 0 | 0 |
 | **Workload B (Ratchet)** | 42 | 80 | 0 | 50 | 0 | 0 | [0 50 100] | 462 | 0 | 0 | 0 | 1 | 0 | 0 |
-| **Workload B (Ratchet)** | 100 | 80 | 0 | 50 | 0 | 0 | [0 50 100] | 465 | 0 | 0 | 0 | 0 | 0 | 0 |
+| **Workload B (Ratchet)** | 100 | 80 | 0 | 50 | 0 | 0 | [0 50 100] | 465 | 0 | 0 | 0 | 2 | 0 | 0 |
 | **Workload B (Ratchet)** | 777 | 80 | 0 | 50 | 0 | 0 | [0 50 100] | 405 | 0 | 0 | 0 | 1 | 0 | 0 |
-| **Workload C (Combined)** | 42 | 80 | 30 | 40 | 60 | 1 | [0 50 100] | 801 | 0 | 0 | 0 | 4 | 0 | 0 |
-| **Workload C (Combined)** | 100 | 80 | 30 | 40 | 60 | 1 | [0 50 100] | 774 | 0 | 0 | 0 | 2 | 0 | 0 |
-| **Workload C (Combined)** | 777 | 80 | 30 | 40 | 60 | 1 | [0 50 100] | 762 | 0 | 0 | 0 | 2 | 0 | 0 |
+| **Workload C (Combined)** | 42 | 80 | 30 | 40 | 60 | 1 | [0 50 100] | 801 | 0 | 0 | 0 | 6 | 0 | 0 |
+| **Workload C (Combined)** | 100 | 80 | 30 | 40 | 60 | 1 | [0 50 100] | 765 | 0 | 0 | 0 | 10 | 0 | 0 |
+| **Workload C (Combined)** | 777 | 80 | 30 | 40 | 60 | 1 | [0 50 100] | 762 | 0 | 0 | 0 | 7 | 0 | 0 |
 
 ### 13.4 Empirical Proof and Recovery Hazard Verdict
 
-1. **100% Synchronous Durability (`0` `durably_committed` violations, `0` panics):** Across all 5,394 candidate states in Workloads A, B, and C under `MUT-0`, Pebble v2.1.7 exhibits **0 `durably_committed` data-loss violations and 0 recovery panics**, confirming that `d.objProvider.Sync()` (`ingest.go:1490`) and `atomicfs.Marker.Move` (`marker.go:189`) protect acknowledged ingest and format-ratchet operations from losing committed data.
+1. **100% Synchronous Durability (`0` `durably_committed` violations, `0` panics):** Across all 5,409 candidate states in Workloads A, B, and C under `MUT-0`, Pebble v2.1.7 exhibits **0 `durably_committed` data-loss violations and 0 recovery panics**, confirming that `d.objProvider.Sync()` (`ingest.go:1490`) and `atomicfs.Marker.Move` (`marker.go:189`) protect acknowledged ingest and format-ratchet operations from losing committed data.
 2. **Cross-Channel Commit-Order Hole on Direct L0 `Ingest` (`40` `prefix` violations across Seeds 42 and 777):** When `db.Ingest` takes the non-overlapping Direct L0 shortcut (`asFlushable = false`), Pebble allocates a global sequence number $s_2 > s_1$ (`ingest.go:1703`) and syncs `MANIFEST` (`version_set.go:649`) without syncing the active `.log` WAL containing preceding `NoSync` writes at sequence number $s_1 < s_2$. Upon a 0%-retention crash, $s_2$ survives via `MANIFEST` while $s_1 < s_2$ is lost from the unsynced `WAL`, creating a cross-channel sequence-number hole (whereas overlapping Flushable Ingest syncs the shared `WAL` via `commit.directWrite` at `commit.go:289` and preserves strict prefix order).
-3. **Workload B (Live Format Ratcheting):** 100% clean recovery. Zero violations, zero database corruptions. Coexisting format version markers under 50% partial retention are resolved deterministically by `atomicfs.LocateMarker` selecting the highest iteration index; the 2 open errors (Seeds 42 and 777) represent expected transient crash states where marker creation was unlinked prior to directory sync.
-4. **Workload C (Combined Lifecycle Stress):** Open errors under 50% retention (8 total: 4 on Seed 42, 2 on Seed 100, 2 on Seed 777) reproduced the expected multi-entry directory race on unsynced `MANIFEST-*` files and checkpoint directories prior to directory sync. All 0% and 100% retention cutoffs recovered cleanly with zero errors.
-5. **Verdict:** Across all 5,394 candidate states in Workloads A, B, and C under `MUT-0`, Pebble v2.1.7 exhibits **0 `durably_committed` data-loss violations and 0 recovery panics**, confirming that `d.objProvider.Sync()` (`ingest.go:1490`) and `atomicfs.Marker.Move` (`marker.go:189`) protect acknowledged ingest and format-ratchet operations from losing committed data. Simultaneously, the audit exposed two distinct recovery hazards under `MUT-0`: (1) an **input-dependent cross-channel `prefix` monotonicity hole** during non-overlapping Direct L0 `db.Ingest` (`40` prefix violations in Workload A, analyzed across 32 seeds in §13.5), and (2) **50%-retention intra-operation directory races (`open_error`)** when a crash occurs inside the multi-entry window between `MANIFEST-*`/`.sst` creation and `dirFD.Sync()`.
+3. **Workload B (Live Format Ratcheting):** 100% clean recovery. Zero violations, zero database corruptions. Coexisting format version markers under 50% partial retention are resolved deterministically by `atomicfs.LocateMarker` selecting the highest iteration index; the 4 open errors (Seed 42: 1, Seed 100: 2, Seed 777: 1) represent expected transient crash states where marker creation was unlinked prior to directory sync.
+4. **Workload C (Combined Lifecycle Stress):** Open errors under 50% retention (23 total: 6 on Seed 42, 10 on Seed 100, 7 on Seed 777) reproduced the expected multi-entry directory race on unsynced `MANIFEST-*` files and checkpoint directories prior to directory sync. All 0% and 100% retention cutoffs recovered cleanly with zero errors.
+5. **Verdict:** Across all 5,409 candidate states in Workloads A, B, and C under `MUT-0`, Pebble v2.1.7 exhibits **0 `durably_committed` data-loss violations and 0 recovery panics**, confirming that `d.objProvider.Sync()` (`ingest.go:1490`) and `atomicfs.Marker.Move` (`marker.go:189`) protect acknowledged ingest and format-ratchet operations from losing committed data. Simultaneously, the audit exposed two distinct recovery hazards under `MUT-0`: (1) an **input-dependent cross-channel `prefix` monotonicity hole** during non-overlapping Direct L0 `db.Ingest` (`40` prefix violations in Workload A, analyzed across 32 seeds in §13.5), and (2) **50%-retention intra-operation directory races (`open_error`)** when a crash occurs inside the multi-entry window between `MANIFEST-*`/`.sst` creation and `dirFD.Sync()` (31 total open errors).
 
 ### 13.5 Direct L0 db.Ingest 32-Seed Case Study and Causal Remedy (BARRIER-INGEST)
 
@@ -676,11 +684,19 @@ Evaluated strategies: `DCG`, `DCG-PR`, `R2`, `Sync-Boundary (B6)`, and `Uniform 
 
 **Pathfinder** (OOPSLA '25) constructs persistence graphs from execution traces and groups correlated update behaviors for representative crash-state reduction and model checking. CraConTest addresses the complementary problem of **budgeted crash-candidate prioritization** ($k_1$): combining trace-derived POSIX durability-contract priors (`HasUnsyncedCreation`, drop impacts `CURRENT`, unflushed parent rename) with `StateKey` equivalence-class partitioning (`DCG-PR`), so equivalence classes with active contract violations are tested at rank 1 before uniform round-robin exploration.
 
-### 15.2 Empirical Scope Boundaries
+### 15.2 Evaluation Chronology and Empirical Scope Boundaries
 
-The following boundaries are established empirically across 32 seeds:
+To ensure complete methodological transparency, we explicitly document the commit chronology of all evaluation suites relative to the code freeze tag **`v1.0-dcg-pr-freeze` (`67bbe7d`)**:
+- **Pre-Freeze Fault Development (`c67a44a`, 2026-11-01):** The parameterized $k$-index (`MUT-X1..X3`), stochastic probability-$p$ (`MUT-X4..X5`), and out-of-contract silent write-loss (`MUT-X6`) fault models were committed to evaluate whether the binary POSIX durability-contract flags generalize across arbitrary sync-drop indices and probabilities without re-tuning.
+- **Code Freeze at Tag `v1.0-dcg-pr-freeze` (`67bbe7d`, 2026-11-02):** The ranking logic in `internal/strategy/dcg.go` and the feature extractor in `internal/graph/features.go` were frozen.
+- **Strictly Post-Freeze Evaluations (0 bytes changed to ranking/feature code):**
+  1. *Post-Freeze Holdout 1 (Pebble Checkpoint Commit `15b500fb`, §10):* 32 seeds, `MUT-0` vs. `BARRIER-CKPT`.
+  2. *Post-Freeze Holdout 2 (Direct L0 `db.Ingest` Cross-Channel Prefix Hole, §13.5):* 32 seeds, `MUT-0` vs. `BARRIER-INGEST`.
+  3. *Post-Freeze Holdout 3 (Multi-Distribution Workload Suite, §14):* 5 workload presets across 16 seeds and 4 fault models.
 
-1. **Where DCG beats R2:** Single-resource sync-omission faults (`MUT-1..9` and held-out `MUT-X1..X5`) on first-failure cost $k_1$ and early-budget state discovery $S_{25}$. Median speedup 2.1×–20.0×, Holm-adjusted $p \le 0.002$ across 12 holdout settings.
+The following scope boundaries are established empirically across 32 seeds:
+
+1. **Where DCG beats R2:** Single-resource sync-omission faults (`MUT-1..9` and parameterized/stochastic `MUT-X1..X5`) on first-failure cost $k_1$ and early-budget state discovery $S_{25}$. Median speedup 2.1×–20.0×, Holm-adjusted $p \le 0.002$ across 12 parameterized/stochastic settings.
 
 2. **Where DCG-FlagOnly ties DCG:** Across almost all settings (`113 wins / 0 losses / 124 ties` on `MUT-1..9`), demonstrating that binary POSIX durability-contract flags combined with `StateKey` equivalence partitioning drive the speedup rather than continuous tier weights.
 
@@ -708,4 +724,4 @@ Every quantitative claim in this report is reproducible from the committed sourc
 | Direct L0 `db.Ingest` 32-seed benchmark (M18A) | `go test -v -count=1 -run TestRealBugIngestBenchmark ./internal/exp -update-artifacts` | `results/realbug_ingest_summary.csv`, `results/realbug_ingest_per_seed.csv` |
 | Workload diversity benchmark 5 presets (M18B) | `go test -v -count=1 -run TestWorkloadDiversityBenchmark ./internal/exp -update-artifacts` | `results/workload_diversity_summary.csv`, `results/workload_diversity_per_seed.csv` |
 
-> **Note:** Tag `v1.0-dcg-pr-freeze` pins the `dcg` and `dcg-pr` algorithms (`internal/strategy/dcg.go`) and the feature extractor (`internal/graph/features.go`) prior to all holdout and real-bug evaluations, guaranteeing zero data leakage.
+> **Note on Code Freeze & Pre vs. Post-Freeze Chronology:** Tag `v1.0-dcg-pr-freeze` (`67bbe7ded57d`) pins `internal/strategy/dcg.go` and `internal/graph/features.go`. Parameterized and stochastic fault models (`MUT-X1..X5`) and out-of-contract control (`MUT-X6`) were committed prior to freeze at `c67a44a` (2026-11-01). The three subsequent evaluations—Checkpoint Holdout (`15b500fb`, §10), Direct L0 Ingest Cross-Channel Hole (§13.5), and Multi-Distribution Workload Suite (§14)—were designed and executed strictly post-freeze with 0 bytes of change to the frozen ranking and feature code.

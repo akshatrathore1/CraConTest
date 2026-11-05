@@ -252,3 +252,97 @@ func TestRunExploreCorruptJournalReturnsError(t *testing.T) {
 		t.Fatalf("expected 'runner read journal' error, got: %v", err)
 	}
 }
+
+func TestExplorePartialRetentionFiveRepeatZeroFlips(t *testing.T) {
+	mem := vfs.NewCrashableMem()
+	rec := vfsrec.New(mem)
+
+	listener := rec.EventListener()
+	opts := &pebble.Options{
+		FS:                  rec,
+		Logger:              recovery.PanicLogger{},
+		MemTableSize:        64 * 1024,
+		MaxManifestFileSize: 1, // trigger manifest roll-over and unsynced directory entries
+		EventListener:       &listener,
+	}
+
+	db, err := pebble.Open("db", opts)
+	if err != nil {
+		t.Fatalf("pebble.Open: %v", err)
+	}
+
+	cfg := workload.Config{
+		Seed:       42,
+		Operations: 25,
+		KeyCount:   8,
+		ValueBytes: 32,
+		SyncEvery:  5,
+		FlushEvery: 10,
+	}
+
+	rawHist, err := workload.Run(db, rec, cfg)
+	if err != nil {
+		t.Fatalf("workload.Run: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("db.Close: %v", err)
+	}
+
+	events := rec.Events()
+	if err := trace.Validate(events); err != nil {
+		t.Fatalf("trace.Validate: %v", err)
+	}
+
+	correlated, err := workload.Correlate(rawHist, events)
+	if err != nil {
+		t.Fatalf("workload.Correlate: %v", err)
+	}
+	if err := history.Validate(correlated); err != nil {
+		t.Fatalf("history.Validate: %v", err)
+	}
+
+	universe, err := candidate.Build(events, 42, []int{0, 50, 100})
+	if err != nil {
+		t.Fatalf("candidate.Build: %v", err)
+	}
+	if len(universe) == 0 {
+		t.Fatalf("empty universe")
+	}
+
+	// Verify that 5 full independent RunExplore repeats produce 0 flips across all candidates.
+	var baselineOutcomes []oracle.Outcome
+	for repeat := 0; repeat < 5; repeat++ {
+		res, err := exp.RunExplore(exp.RunnerConfig{
+			Universe: universe,
+			Events:   events,
+			History:  correlated,
+			Timeout:  3 * time.Second,
+		})
+		if err != nil {
+			t.Fatalf("RunExplore repeat %d: %v", repeat, err)
+		}
+
+		if repeat == 0 {
+			baselineOutcomes = res.Outcomes
+			continue
+		}
+
+		if len(res.Outcomes) != len(baselineOutcomes) {
+			t.Fatalf("repeat %d: outcomes count mismatch %d vs %d", repeat, len(res.Outcomes), len(baselineOutcomes))
+		}
+
+		mismatches := 0
+		for i := range res.Outcomes {
+			b := baselineOutcomes[i]
+			c := res.Outcomes[i]
+			if b.Candidate != c.Candidate || b.Class != c.Class || b.Rule != c.Rule || b.Detail != c.Detail {
+				mismatches++
+				t.Errorf("repeat %d candidate %v flipped: base=(%s, %s, %s) vs curr=(%s, %s, %s)",
+					repeat, b.Candidate, b.Class, b.Rule, b.Detail, c.Class, c.Rule, c.Detail)
+			}
+		}
+		if mismatches > 0 {
+			t.Fatalf("repeat %d: detected %d outcome flips out of %d candidates", repeat, mismatches, len(universe))
+		}
+	}
+}
