@@ -752,18 +752,27 @@ func runBenchmarkCmd(args []string) error {
 	}
 
 	targetReport := *reportFlag
-	if targetReport == "" {
+	if targetReport == "" && *seedsFlag == "" && *faultsFlag == "" {
 		targetReport = "docs/benchmark-report.md"
+	}
+	if targetReport == "none" {
+		targetReport = ""
 	}
 
 	targetCSV := *csvFlag
-	if targetCSV == "" {
+	if targetCSV == "" && *seedsFlag == "" && *faultsFlag == "" {
 		targetCSV = "results/benchmark_summary.csv"
+	}
+	if targetCSV == "none" {
+		targetCSV = ""
 	}
 
 	targetPerSeedCSV := *perSeedCSVFlag
 	if targetPerSeedCSV == "" && *seedsFlag == "" && *faultsFlag == "" {
 		targetPerSeedCSV = "results/benchmark_per_seed.csv"
+	}
+	if targetPerSeedCSV == "none" {
+		targetPerSeedCSV = ""
 	}
 
 	fmt.Printf("Starting Multi-Seed Benchmark across %d seeds and %d faults (%d ops/run)...\n",

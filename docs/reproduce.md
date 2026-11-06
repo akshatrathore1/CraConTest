@@ -46,10 +46,14 @@ CraConTest/
 │   ├── benchmark_per_seed.csv # Unaggregated per-seed discovery metrics (MUT-0..9)
 │   ├── holdout_summary.csv    # Aggregated 32-seed holdout metrics (MUT-X1..X6)
 │   ├── holdout_per_seed.csv   # Unaggregated per-seed discovery metrics (MUT-X1..X6)
-│   ├── realbug_pebble5825_summary.csv  # Aggregated 32-seed Pebble #5825 A/B metrics
-│   ├── realbug_pebble5825_per_seed.csv # Unaggregated per-seed Pebble #5825 A/B metrics
-│   ├── realbug_checkpoint_summary.csv  # Aggregated 32-seed Checkpoint A/B metrics
-│   ├── realbug_checkpoint_per_seed.csv # Unaggregated per-seed Checkpoint A/B metrics
+│   ├── casestudy_pebble5825_summary.csv  # Aggregated 32-seed Pebble #5825 A/B metrics
+│   ├── casestudy_pebble5825_per_seed.csv # Unaggregated per-seed Pebble #5825 A/B metrics
+│   ├── casestudy_checkpoint_summary.csv  # Aggregated 32-seed Checkpoint A/B metrics
+│   ├── casestudy_checkpoint_per_seed.csv # Unaggregated per-seed Checkpoint A/B metrics
+│   ├── casestudy_ingest_summary.csv      # Direct L0 Ingest 32-seed A/B benchmark summary
+│   ├── casestudy_ingest_per_seed.csv     # Unaggregated per-seed Ingest A/B metrics
+│   ├── workload_diversity_summary.csv    # 5-preset workload diversity summary (16 seeds)
+│   ├── workload_diversity_per_seed.csv   # Unaggregated per-seed workload diversity metrics
 │   ├── scaling_mut5_summary.csv        # MUT-5 universe-scaling summary (120..1200 ops)
 │   ├── scaling_mut5_per_seed.csv       # Per-seed scaling metrics
 │   ├── null_control_multishape.csv     # 108-run multi-shape null-control verification
@@ -185,22 +189,21 @@ To evaluate real-world crash inconsistency caused by unsynced parent directory e
   -faults MUT-0,BARRIER-5825 \
   -max-manifest-size 1 \
   -policies 0,50,100 \
-  -csv results/realbug_pebble5825_summary.csv \
-  -per-seed-csv results/realbug_pebble5825_per_seed.csv \
+  -csv results/casestudy_pebble5825_summary.csv \
+  -per-seed-csv results/casestudy_pebble5825_per_seed.csv \
   -report ""
 ```
 
-To run paired statistical comparisons on the Pebble #5825 real-bug per-seed results:
+To run paired statistical comparisons on the Pebble #5825 case study per-seed results:
 
 ```bash
-python3 analysis/paired_stats.py results/realbug_pebble5825_per_seed.csv "Pebble #5825 Real-Bug (32 seeds)" MUT-0
+python3 analysis/paired_stats.py results/casestudy_pebble5825_per_seed.csv "Pebble #5825 Case Study (32 seeds)" MUT-0
 ```
 
-#### Results Summary:
-- **Causal Verification:** Under `MUT-0`, 99 failures occur across 31 failing seeds (all manifesting exclusively at 50% partial-retention candidates). Under `BARRIER-5825`, which forces parent directory sync on `Create`, `OpenReadWrite`, and `Rename`, failures drop to **0 across all 32 seeds**, causally confirming the fix for Pebble #5825.
-- **Post-Hoc Partial-Retention Prior (`dcg-pr`):** Standard `dcg` prioritizes 0%-retention candidates first, requiring a median $k_1$ of **205.00** [203.00, 210.00] (mean 253.52) to discover the partial-retention failure. `dcg-pr` incorporates a partial-retention prior tracking `UnsyncedDirEntryCount >= 2`, discovering the first failure at median $k_1 = \mathbf{2.00}$ [1.00, 3.00] (mean 2.65, AUC Failures = 0.8455, AUC Bugs = 0.9212), compared to uniform random B0 median $k_1 = 104.50$ (mean 134.63) and state-representative B5 median $k_1 = 17.00$ (mean 45.26).
+- **Causal Verification:** Under `MUT-0`, 98 failures occur across 31 failing seeds (all manifesting exclusively at 50% partial-retention candidates). Under `BARRIER-5825`, which executes parent directory sync (`maybeSyncParentDir`) *before* `fs.inner.Create` when writing marker files to commit the pending `MANIFEST-xxxxxx` entry, failures drop to **0 across all 32 seeds**, causally confirming the fix for Pebble #5825.
+- **Post-Hoc Partial-Retention Prior (`dcg-pr`):** Standard `dcg` prioritizes 0%-retention candidates first, requiring a median $k_1$ of **205.00** [203.00, 210.00] (mean 253.45) to discover the partial-retention failure. `dcg-pr` incorporates a partial-retention prior tracking `UnsyncedDirEntryCount >= 2`, discovering the first failure at median $k_1 = \mathbf{2.00}$ [1.00, 3.00] (mean 2.65, S25 = 2.50, S100 = 2.50, AUC Failures = 0.8455, AUC Bugs = 0.9212), compared to uniform random B0 median $k_1 = 112.00$ (mean 136.23) and state-representative B5 median $k_1 = 17.00$ (mean 45.26).
 
-### 4.4 Pebble Checkpoint Real-Bug Holdout A/B Benchmark (32 Seeds, MUT-0 vs BARRIER-CKPT)
+### 4.4 Intra-Class Subsystem Transfer Case Study: Pebble Checkpoint Directory Race (`15b500fb`) (32 Seeds, MUT-0 vs BARRIER-CKPT)
 
 To evaluate real-world crash recovery failure caused by unsynced parent directory entries in checkpoint creation (CockroachDB Pebble commit `15b500fb`), the checkpoint holdout benchmark evaluates unfaulted `MUT-0` against the causal fix control `BARRIER-CKPT` (Checkpoint Directory Barrier Control) across 32 seeds under partial retention (0%, 50%, 100%) with `-checkpoint-at 60`:
 
@@ -209,20 +212,20 @@ To evaluate real-world crash recovery failure caused by unsynced parent director
   -faults MUT-0,BARRIER-CKPT \
   -checkpoint-at 60 \
   -policies 0,50,100 \
-  -csv results/realbug_checkpoint_summary.csv \
-  -per-seed-csv results/realbug_checkpoint_per_seed.csv \
+  -csv results/casestudy_checkpoint_summary.csv \
+  -per-seed-csv results/casestudy_checkpoint_per_seed.csv \
   -report ""
 ```
 
 To run paired statistical comparisons on the Pebble Checkpoint per-seed results:
 
 ```bash
-python3 analysis/paired_stats.py results/realbug_checkpoint_per_seed.csv "Pebble Checkpoint Real-Bug (32 seeds)" MUT-0
+python3 analysis/paired_stats.py results/casestudy_checkpoint_per_seed.csv "Pebble Checkpoint Case Study (32 seeds)" MUT-0
 ```
 
 #### Results Summary:
 - **Causal Verification:** In Pebble `db.Checkpoint("checkpoint")`, checkpoint manifest and marker pointer files (`marker.manifest.*`) are written before `dir.Sync()`. Under 50% partial retention, unsynced directory entries are dropped while marker pointers persist, causing checkpoint recovery failure (`open_error`) on 30 of 32 seeds (67 total failures across seeds). Under `BARRIER-CKPT`, which forces parent directory sync when creating checkpoint manifest/marker files, checkpoint recovery failures drop to **0 across all 32 seeds**.
-- **Pre-Freeze Prior Discovery (`dcg-pr`):** The partial-retention prior (`dcg-pr`) was frozen before evaluation (tag `v1.0-dcg-pr-freeze`). `dcg-pr` discovers the checkpoint failure at median $k_1 = \mathbf{2.00}$ [1.00, 125.50] (mean 93.17, AUC Failures = 0.5414, AUC Bugs = 0.6739), compared to 0%-retention-first DCG median $k_1 = 215.00$ (mean 262.97) and uniform random B0 median $k_1 = 168.75$ (mean 175.40).
+- **Pre-Freeze Prior Discovery (`dcg-pr`):** The partial-retention prior (`dcg-pr`) was frozen before evaluation (tag `v1.0-dcg-pr-freeze`). `dcg-pr` discovers the checkpoint failure at median $k_1 = \mathbf{2.00}$ [1.00, 125.50] (mean 93.03, AUC Failures = 0.5414, AUC Bugs = 0.6739), compared to 0%-retention-first DCG median $k_1 = 215.00$ (mean 262.93), R2 median $k_1 = 323.56$ (mean 325.80), and uniform random B0 median $k_1 = 162.50$ (mean 175.35).
 
 ### 4.5 MUT-5 Universe-Scaling Benchmark (ops ∈ {120, 300, 600, 1200})
 
@@ -284,11 +287,11 @@ go run ./cmd/cracontest benchmark -faults MUT-0 -seeds 42,100,777 -ops 80 -inges
 ```
 
 #### Results Summary:
-- **0 lost durably-committed keys** across all 9 runs (5,409 candidate states), confirming 100% synchronous durability via `d.objProvider.Sync()` (`ingest.go:1490`) and `atomicfs.Marker.Move` (`marker.go:189`).
+- **0 lost durably-committed keys** across all 9 runs (5,424 candidate states), confirming 100% synchronous durability via `d.objProvider.Sync()` (`ingest.go:1490`) and `atomicfs.Marker.Move` (`marker.go:189`).
 - **0 engine recovery panics or hangs**.
 - **Workload A (External SSTable Ingestion):** 0 lost committed keys. 40 prefix violations across seeds 42 (15) and 777 (25) reveal a cross-channel commit-order hole on direct L0 ingest: when `db.Ingest` takes the non-overlapping direct L0 shortcut (`asFlushable = false`), Pebble allocates sequence number $s_2 > s_1$ (`ingest.go:1703`) and syncs `MANIFEST` (`version_set.go:649`) without syncing the active `.log` WAL containing preceding `NoSync` writes at sequence number $s_1 < s_2$. Upon a 0%-retention crash, $s_2$ survives via `MANIFEST` while $s_1$ is lost from the unsynced `WAL`, creating a cross-channel sequence hole (whereas overlapping flushable ingest syncs the shared WAL at `commit.go:289` and preserves strict prefix order).
 - **Workload B (Live Format-Version Ratcheting):** 100% clean recovery and atomic transitions across all policies; 0 violations, 0 panics, and 4 transient unlinked-marker open errors under 50% retention (1 on seed 42, 2 on seed 100, 1 on seed 777).
-- **Workload C (Combined Lifecycle Stress):** 0 lost committed keys, 0 panics. 23 open errors occur exclusively under 50% partial retention during manifest rotation and checkpointing prior to directory sync (6 on seed 42, 10 on seed 100, 7 on seed 777).
+- **Workload C (Combined Lifecycle Stress):** 0 lost committed keys, 0 panics. 17 open errors occur exclusively under 50% partial retention during manifest rotation and checkpointing prior to directory sync (5 on seed 42, 8 on seed 100, 4 on seed 777).
 
 ## 5. Acceptance Tests
 

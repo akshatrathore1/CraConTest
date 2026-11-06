@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -30,7 +31,7 @@ func init() {
 	}
 }
 
-func realbugIngestResultsDir() string {
+func caseStudyIngestResultsDir() string {
 	dir := filepath.Join("..", "..", "results")
 	if fi, err := os.Stat(dir); err == nil && fi.IsDir() {
 		return dir
@@ -138,11 +139,51 @@ func runIngestTrial(t *testing.T, seed uint64, barrierIngest bool, policies []in
 	return view, universe, expRes.Outcomes, normOutcomes, prefixViols, traceEvents
 }
 
-// TestRealBugIngestABSmoke verifies the Direct L0 Ingest prefix-hole failure on Seed 1 at ret=0.00
+func assertDirectL0IngestPath(t *testing.T, events []trace.Event) int {
+	t.Helper()
+	inIngest := false
+	var curEvents []trace.Event
+	directL0Count := 0
+
+	for _, e := range events {
+		if e.Kind == trace.KindOpBegin && e.OpKind == "ingest" {
+			inIngest = true
+			curEvents = nil
+			continue
+		}
+		if e.Kind == trace.KindOpEnd && e.OpKind == "ingest" {
+			inIngest = false
+			hasLink := false
+			hasManifestSync := false
+			hasFlush := false
+			for _, ce := range curEvents {
+				if ce.Kind == trace.KindLink && (strings.HasPrefix(ce.File2, "db/") || strings.Contains(ce.File2, ".sst")) {
+					hasLink = true
+				}
+				if ce.Kind == trace.KindSync && strings.Contains(ce.File, "MANIFEST") {
+					hasManifestSync = true
+				}
+				if ce.Kind == trace.KindEngineEvent && (ce.Note == "FlushBegin" || strings.Contains(ce.Note, "Flush")) {
+					hasFlush = true
+				}
+			}
+			if hasLink && hasManifestSync && !hasFlush {
+				directL0Count++
+			}
+			continue
+		}
+		if inIngest {
+			curEvents = append(curEvents, e)
+		}
+	}
+	return directL0Count
+}
+
+// TestCaseStudyIngestABSmoke verifies the Direct L0 Ingest prefix-hole failure on Seed 1 at ret=0.00
 // under MUT-0 (BarrierIngest: false), and asserts 0 violations under BARRIER-INGEST (BarrierIngest: true).
-func TestRealBugIngestABSmoke(t *testing.T) {
+func TestCaseStudyIngestABSmoke(t *testing.T) {
 	// Condition A: MUT-0 (BarrierIngest: false), ret=0.00
-	viewA, universeA, _, normOutcomesA, prefixViolsA, _ := runIngestTrial(t, 1, false, []int{0})
+	viewA, universeA, _, normOutcomesA, prefixViolsA, eventsA := runIngestTrial(t, 1, false, []int{0})
 	if prefixViolsA == 0 {
 		t.Fatalf("Condition A (MUT-0): expected prefix violations > 0, got 0")
 	}
@@ -159,7 +200,7 @@ func TestRealBugIngestABSmoke(t *testing.T) {
 	t.Logf("Condition A (MUT-0): prefix violations=%d, DCG k1=%d (PASS)", prefixViolsA, k1A)
 
 	// Condition B: BARRIER-INGEST (BarrierIngest: true), ret=0.00
-	_, _, rawOutcomesB, _, prefixViolsB, _ := runIngestTrial(t, 1, true, []int{0})
+	_, _, rawOutcomesB, _, prefixViolsB, eventsB := runIngestTrial(t, 1, true, []int{0})
 	totalFailuresB := 0
 	for _, o := range rawOutcomesB {
 		if o.Class != oracle.ClassValid {
@@ -170,6 +211,14 @@ func TestRealBugIngestABSmoke(t *testing.T) {
 		t.Fatalf("Condition B (BARRIER-INGEST): expected 0 violations, got totalFailures=%d, prefixViols=%d", totalFailuresB, prefixViolsB)
 	}
 	t.Logf("Condition B (BARRIER-INGEST): totalFailures=%d, prefix violations=%d (PASS)", totalFailuresB, prefixViolsB)
+
+	// Assert that Condition A and Condition B execute the exact same number of Direct L0 (asFlushable == false) ingests.
+	directL0CountA := assertDirectL0IngestPath(t, eventsA)
+	directL0CountB := assertDirectL0IngestPath(t, eventsB)
+	if directL0CountA != directL0CountB || directL0CountB <= 0 {
+		t.Fatalf("expected identical direct L0 ingest counts > 0, got Condition A=%d, Condition B=%d", directL0CountA, directL0CountB)
+	}
+	t.Logf("Direct L0 ingest operations executed: Condition A=%d, Condition B=%d (PASS)", directL0CountA, directL0CountB)
 }
 
 type ingestStratSpec struct {
@@ -193,7 +242,7 @@ var ingestStratSpecs = []ingestStratSpec{
 	{"b3", "b3", "stride", "stride"},
 }
 
-func validateRealBugIngestCSVs(t *testing.T, perSeedPath, summaryPath string) {
+func validateCaseStudyIngestCSVs(t *testing.T, perSeedPath, summaryPath string) {
 	t.Helper()
 
 	f1, err := os.Open(perSeedPath)
@@ -283,15 +332,15 @@ func validateRealBugIngestCSVs(t *testing.T, perSeedPath, summaryPath string) {
 	t.Logf("Validated %s (%d rows) and %s (%d rows) successfully", perSeedPath, len(rows1), summaryPath, len(rows2))
 }
 
-// TestRealBugIngestBenchmark evaluates the Direct L0 Ingest prefix race across 32 canonical seeds (1..32)
+// TestCaseStudyIngestBenchmark evaluates the Direct L0 Ingest prefix race across 32 canonical seeds (1..32)
 // under MUT-0 (BarrierIngest: false) and BARRIER-INGEST (BarrierIngest: true) across 11 strategies.
 // When -update-artifacts is false, it performs fast read-only validation of committed CSVs.
-func TestRealBugIngestBenchmark(t *testing.T) {
-	perSeedPath := filepath.Join(realbugIngestResultsDir(), "realbug_ingest_per_seed.csv")
-	summaryPath := filepath.Join(realbugIngestResultsDir(), "realbug_ingest_summary.csv")
+func TestCaseStudyIngestBenchmark(t *testing.T) {
+	perSeedPath := filepath.Join(caseStudyIngestResultsDir(), "casestudy_ingest_per_seed.csv")
+	summaryPath := filepath.Join(caseStudyIngestResultsDir(), "casestudy_ingest_summary.csv")
 
 	if !*updateArtifacts {
-		validateRealBugIngestCSVs(t, perSeedPath, summaryPath)
+		validateCaseStudyIngestCSVs(t, perSeedPath, summaryPath)
 		return
 	}
 
@@ -309,7 +358,7 @@ func TestRealBugIngestBenchmark(t *testing.T) {
 		{"BARRIER-INGEST", true},
 	}
 
-	if err := os.MkdirAll(realbugIngestResultsDir(), 0755); err != nil {
+	if err := os.MkdirAll(caseStudyIngestResultsDir(), 0755); err != nil {
 		t.Fatalf("mkdir results dir: %v", err)
 	}
 

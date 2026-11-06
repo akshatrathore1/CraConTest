@@ -1,6 +1,9 @@
 package vfsrec
 
 import (
+	"sync"
+	"time"
+
 	"github.com/akshatrathore1/CraConTest/internal/trace"
 	"github.com/cockroachdb/pebble/v2"
 )
@@ -70,6 +73,54 @@ func (fs *FS) EventListener() pebble.EventListener {
 			fs.recordEngineEvent("DiskSlow", 0, nil, nil)
 		},
 		FlushBegin: func(info pebble.FlushInfo) {
+			fs.mu.Lock()
+			if fs.inIngestSection {
+				if fs.ingestCond == nil {
+					fs.ingestCond = sync.NewCond(&fs.mu)
+				}
+				var timedOut bool
+				done := make(chan struct{})
+				go func() {
+					select {
+					case <-done:
+					case <-time.After(500 * time.Millisecond):
+						fs.mu.Lock()
+						timedOut = true
+						if fs.ingestCond != nil {
+							fs.ingestCond.Broadcast()
+						}
+						fs.mu.Unlock()
+					}
+				}()
+				for fs.inIngestSection && !timedOut {
+					fs.ingestCond.Wait()
+				}
+				close(done)
+			}
+			if fs.pendingManifestDeletions > 0 {
+				if fs.manifestCond == nil {
+					fs.manifestCond = sync.NewCond(&fs.mu)
+				}
+				var timedOut bool
+				done := make(chan struct{})
+				go func() {
+					select {
+					case <-done:
+					case <-time.After(200 * time.Millisecond):
+						fs.mu.Lock()
+						timedOut = true
+						if fs.manifestCond != nil {
+							fs.manifestCond.Broadcast()
+						}
+						fs.mu.Unlock()
+					}
+				}()
+				for fs.pendingManifestDeletions > 0 && !timedOut {
+					fs.manifestCond.Wait()
+				}
+				close(done)
+			}
+			fs.mu.Unlock()
 			fs.recordEngineEvent("FlushBegin", jobID(info.JobID), nil, nil)
 		},
 		FlushEnd: func(info pebble.FlushInfo) {
@@ -85,9 +136,22 @@ func (fs *FS) EventListener() pebble.EventListener {
 			fs.recordEngineEvent("FormatUpgrade", 0, nil, nil)
 		},
 		ManifestCreated: func(info pebble.ManifestCreateInfo) {
+			fs.mu.Lock()
+			if info.JobID > 0 {
+				fs.pendingManifestDeletions++
+			}
+			fs.mu.Unlock()
 			fs.recordEngineEvent("ManifestCreated", jobID(info.JobID), nil, pathSlice(info.Path))
 		},
 		ManifestDeleted: func(info pebble.ManifestDeleteInfo) {
+			fs.mu.Lock()
+			if fs.pendingManifestDeletions > 0 {
+				fs.pendingManifestDeletions--
+				if fs.manifestCond != nil {
+					fs.manifestCond.Broadcast()
+				}
+			}
+			fs.mu.Unlock()
 			fs.recordEngineEvent("ManifestDeleted", jobID(info.JobID), pathSlice(info.Path), nil)
 		},
 		TableCreated: func(info pebble.TableCreateInfo) {

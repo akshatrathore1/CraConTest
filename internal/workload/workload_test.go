@@ -3,6 +3,8 @@ package workload_test
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -993,6 +995,138 @@ func TestWorkloadPresets(t *testing.T) {
 				if outcome.Class != oracle.ClassValid {
 					t.Fatalf("candidate %d cut %d pol %d: unexpected outcome %v (rule=%s, sig=%s, detail=%s)",
 						i, cand.Event, cand.Percent, outcome.Class, outcome.Rule, outcome.Signature, outcome.Detail)
+				}
+			}
+		})
+	}
+}
+
+func sameEventSequence(a, b []trace.Event) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		e1, e2 := a[i], b[i]
+		if e1.Kind != e2.Kind || e1.File != e2.File || e1.File2 != e2.File2 ||
+			e1.Off != e2.Off || e1.Len != e2.Len || e1.Cat != e2.Cat ||
+			e1.Dir != e2.Dir || e1.Op != e2.Op || e1.OpKind != e2.OpKind ||
+			e1.Note != e2.Note || e1.Created != e2.Created ||
+			!reflect.DeepEqual(e1.Inputs, e2.Inputs) || !reflect.DeepEqual(e1.Outputs, e2.Outputs) {
+			return false
+		}
+	}
+	return true
+}
+
+func TestWorkloadIngestAndCheckpointTraceDeterminism(t *testing.T) {
+	seeds := []uint64{1, 6, 18, 42}
+	for _, seed := range seeds {
+		seed := seed
+		t.Run(fmt.Sprintf("Seed_%d", seed), func(t *testing.T) {
+			var baseEvents []trace.Event
+			var baseUniverse []candidate.Candidate
+			for round := 0; round < 5; round++ {
+				mem := vfs.NewCrashableMem()
+				rec := vfsrec.New(mem)
+				listener := rec.EventListener()
+				opts := &pebble.Options{
+					FS:                          rec,
+					Logger:                      recovery.PanicLogger{},
+					MemTableSize:                64 * 1024,
+					EventListener:               &listener,
+					MaxManifestFileSize:         1,
+					DisableAutomaticCompactions: true,
+					DisableTableStats:           true,
+					L0CompactionThreshold:       1000,
+					L0StopWritesThreshold:       1000,
+				}
+				db, err := pebble.Open("db", opts)
+				if err != nil {
+					t.Fatalf("round %d pebble.Open: %v", round, err)
+				}
+				cfg := workload.Config{
+					Seed:                seed,
+					Operations:          25,
+					KeyCount:            16,
+					ValueBytes:          64,
+					SyncEvery:           4,
+					FlushEvery:          12,
+					IngestEvery:         5,
+					CheckpointAt:        10,
+					MaxManifestFileSize: 1,
+					FS:                  rec,
+				}
+				t.Logf("round %d starting", round)
+				start := time.Now()
+				entries, err := workload.Run(db, rec, cfg)
+				if err != nil {
+					_ = db.Close()
+					t.Fatalf("round %d workload.Run: %v", round, err)
+				}
+				if err := db.Close(); err != nil {
+					t.Fatalf("round %d db.Close: %v", round, err)
+				}
+				if err := history.Validate(entries); err != nil {
+					t.Fatalf("round %d history.Validate: %v", round, err)
+				}
+				events := rec.Events()
+				if err := trace.Validate(events); err != nil {
+					t.Fatalf("round %d trace.Validate: %v", round, err)
+				}
+				universe, err := candidate.Build(events, seed, []int{0, 50, 100})
+				if err != nil {
+					t.Fatalf("round %d candidate.Build: %v", round, err)
+				}
+				t.Logf("round %d finished in %v: len(events)=%d, len(universe)=%d", round, time.Since(start), len(events), len(universe))
+				if round == 0 {
+					baseEvents = events
+					baseUniverse = universe
+				} else {
+					if len(events) != len(baseEvents) || !sameEventSequence(events, baseEvents) {
+						minLen := len(events)
+						if len(baseEvents) < minLen {
+							minLen = len(baseEvents)
+						}
+						diffIdx := -1
+						for idx := 0; idx < minLen; idx++ {
+							e1, e2 := events[idx], baseEvents[idx]
+							if e1.Kind != e2.Kind || e1.File != e2.File || e1.File2 != e2.File2 ||
+								e1.Off != e2.Off || e1.Len != e2.Len || e1.Cat != e2.Cat ||
+								e1.Dir != e2.Dir || e1.Op != e2.Op || e1.OpKind != e2.OpKind ||
+								e1.Note != e2.Note || e1.Created != e2.Created ||
+								!reflect.DeepEqual(e1.Inputs, e2.Inputs) || !reflect.DeepEqual(e1.Outputs, e2.Outputs) {
+								diffIdx = idx
+								break
+							}
+						}
+						if diffIdx == -1 {
+							diffIdx = minLen
+						}
+						t.Logf("round %d mismatch at idx %d (len got=%d, want=%d)", round, diffIdx, len(events), len(baseEvents))
+						if diffIdx < len(events) {
+							t.Logf("got[%d]:  %+v", diffIdx, events[diffIdx])
+						}
+						if diffIdx < len(baseEvents) {
+							t.Logf("want[%d]: %+v", diffIdx, baseEvents[diffIdx])
+						}
+						// Print the events around diffIdx
+						for j := diffIdx - 2; j <= diffIdx+4; j++ {
+							if j >= 0 && j < len(events) {
+								t.Logf("  got[%d]:  Kind=%v, Op=%d, File=%s, Note=%s, Job=%d", j, events[j].Kind, events[j].Op, events[j].File, events[j].Note, events[j].Job)
+							}
+							if j >= 0 && j < len(baseEvents) {
+								t.Logf("  want[%d]: Kind=%v, Op=%d, File=%s, Note=%s, Job=%d", j, baseEvents[j].Kind, baseEvents[j].Op, baseEvents[j].File, baseEvents[j].Note, baseEvents[j].Job)
+							}
+						}
+						t.Logf("candidate.Build match: %v", reflect.DeepEqual(universe, baseUniverse))
+						t.Fatalf("round %d: mismatch against round 0", round)
+					}
+					if len(universe) != len(baseUniverse) {
+						t.Fatalf("round %d: universe size mismatch: got %d, want %d", round, len(universe), len(baseUniverse))
+					}
+					if !reflect.DeepEqual(universe, baseUniverse) {
+						t.Fatalf("round %d: candidate slice mismatch against round 0", round)
+					}
 				}
 			}
 		})

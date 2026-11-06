@@ -9,6 +9,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/akshatrathore1/CraConTest/internal/trace"
 	"github.com/cockroachdb/pebble/v2/vfs"
@@ -17,11 +18,17 @@ import (
 // FS wraps a vfs.FS implementation and records mutating filesystem calls,
 // operation markers, and engine events into a trace.
 type FS struct {
-	mu         sync.Mutex
-	inner      vfs.FS
-	nextHandle uint64
-	events     []trace.Event
-	hook       func(id uint64)
+	mu                       sync.Mutex
+	inner                    vfs.FS
+	nextHandle               uint64
+	events                   []trace.Event
+	hook                     func(id uint64)
+	walWrites                uint64
+	walCond                  *sync.Cond
+	inIngestSection          bool
+	ingestCond               *sync.Cond
+	pendingManifestDeletions int
+	manifestCond             *sync.Cond
 }
 
 // Compile-time interface checks.
@@ -81,9 +88,82 @@ func (fs *FS) SetHook(hook func(id uint64)) {
 func (fs *FS) appendEventLocked(event trace.Event) {
 	event.ID = uint64(len(fs.events) + 1)
 	fs.events = append(fs.events, event)
+	if event.Kind == trace.KindWrite && (strings.HasSuffix(event.File, ".log") || event.Cat == "pebble-wal") {
+		fs.walWrites++
+		if fs.walCond != nil {
+			fs.walCond.Broadcast()
+		}
+	}
 	if fs.hook != nil {
 		fs.hook(event.ID)
 	}
+}
+
+// WALWriteCount returns the current count of WAL write events.
+func (fs *FS) WALWriteCount() uint64 {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	return fs.walWrites
+}
+
+// NotifyDroppedWALWrite increments the WAL write counter and broadcasts to waiting
+// goroutines, allowing dropped WAL writes (such as MUT-X6) to advance synchronization.
+func (fs *FS) NotifyDroppedWALWrite() {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	fs.walWrites++
+	if fs.walCond != nil {
+		fs.walCond.Broadcast()
+	}
+}
+
+// WaitForWALWrite waits until fs.walWrites >= target (with a 200ms safety timeout goroutine
+// or deadline so synthetic unit tests without a background WAL flusher never block forever).
+func (fs *FS) WaitForWALWrite(target uint64) {
+	fs.mu.Lock()
+	if fs.walWrites >= target {
+		fs.mu.Unlock()
+		return
+	}
+	if fs.walCond == nil {
+		fs.walCond = sync.NewCond(&fs.mu)
+	}
+	var timedOut bool
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-done:
+		case <-time.After(200 * time.Millisecond):
+			fs.mu.Lock()
+			timedOut = true
+			if fs.walCond != nil {
+				fs.walCond.Broadcast()
+			}
+			fs.mu.Unlock()
+		}
+	}()
+	for fs.walWrites < target && !timedOut {
+		fs.walCond.Wait()
+	}
+	fs.mu.Unlock()
+}
+
+// BeginIngestSection marks the start of an ingest section, pausing background flushes.
+func (fs *FS) BeginIngestSection() {
+	fs.mu.Lock()
+	fs.inIngestSection = true
+	fs.mu.Unlock()
+}
+
+// EndIngestSection marks the end of an ingest section and unpauses background flushes.
+func (fs *FS) EndIngestSection() {
+	fs.mu.Lock()
+	fs.inIngestSection = false
+	if fs.ingestCond != nil {
+		fs.ingestCond.Broadcast()
+	}
+	fs.mu.Unlock()
 }
 
 // ErrUnrepresentablePath is returned, without calling the wrapped filesystem,
@@ -290,6 +370,31 @@ func (fs *FS) Remove(name string) error {
 	if err != nil {
 		return err
 	}
+
+	if fs.inIngestSection && !strings.Contains(canon, "ingest_staging") && !strings.Contains(canon, "ingest_") {
+		if fs.ingestCond == nil {
+			fs.ingestCond = sync.NewCond(&fs.mu)
+		}
+		var timedOut bool
+		done := make(chan struct{})
+		go func() {
+			select {
+			case <-done:
+			case <-time.After(500 * time.Millisecond):
+				fs.mu.Lock()
+				timedOut = true
+				if fs.ingestCond != nil {
+					fs.ingestCond.Broadcast()
+				}
+				fs.mu.Unlock()
+			}
+		}()
+		for fs.inIngestSection && !timedOut {
+			fs.ingestCond.Wait()
+		}
+		close(done)
+	}
+
 	err = fs.inner.Remove(name)
 	event := trace.Event{
 		Kind: trace.KindRemove,

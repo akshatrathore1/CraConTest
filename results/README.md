@@ -46,19 +46,19 @@ Stage 2 stores aggregated 95%-confidence-interval summaries and unaggregated per
    - `holdout_summary.csv`: Aggregated summary statistics across 32 seeds for each strategy and fault model.
    - `holdout_per_seed.csv`: Unaggregated 32-seed per-seed discovery metrics enabling paired non-parametric statistical hypothesis testing (one-sided exact sign test and Wilcoxon signed-rank test with Holm-Bonferroni FWER adjustment) via `analysis/paired_stats.py`.
 
-3. **Pebble #5825 Real-Bug A/B Benchmark (`results/realbug_pebble5825_summary.csv`, `results/realbug_pebble5825_per_seed.csv`):**
+3. **Pebble #5825 Case Study Benchmark (`results/casestudy_pebble5825_summary.csv`, `results/casestudy_pebble5825_per_seed.csv`):**
    - Scope: Real-world bug from CockroachDB Pebble issue #5825 evaluated across 32 deterministic seeds under partial retention policies (0%, 50%, 100%) with manifest rotation (`-max-manifest-size 1`).
-     - `MUT-0` (unfaulted baseline): Parent directory sync is not forced upon file creation or rename. In partial-retention states (50%), file data survives while the unsynced parent directory entry is dropped, reproducing Pebble #5825 (99 total failures across 31 failing seeds).
-     - `BARRIER-5825` (Manifest-Rotation Barrier Control): Immediate parent directory sync is forced upon `Create`, `OpenReadWrite`, and `Rename`, making directory entries durable and causally eliminating the bug (0 failures across all 32 seeds).
-   - `realbug_pebble5825_summary.csv`: Aggregated summary statistics across 32 seeds comparing standard DCG, DCG-PR (`dcg-pr`), DCG Flag-Only, R2, R1, and baseline search heuristics.
-   - `realbug_pebble5825_per_seed.csv`: Unaggregated per-seed discovery metrics across 32 seeds. Demonstrates that while standard DCG prioritizes 0% retention first (median $k_1 = 205.00$ [203.00, 210.00], mean $k_1 = 253.52$), `dcg-pr` incorporates a post-hoc partial-retention prior tracking `UnsyncedDirEntryCount >= 2`, discovering the failure at median $k_1 = \mathbf{2.00}$ [1.00, 3.00] (mean $k_1 = 2.65$, AUC Failures = $0.8455$, AUC Bugs = $0.9212$), compared to uniform random B0 median $k_1 = 104.50$ (mean $134.63$) and state-representative B5 median $k_1 = 17.00$ (mean $45.26$).
+     - `MUT-0` (unfaulted baseline): Parent directory sync is not forced upon file creation or rename. In partial-retention states (50%), file data survives while the unsynced parent directory entry is dropped, reproducing Pebble #5825 (98 total failures across 31 failing seeds).
+     - `BARRIER-5825` (Manifest-Rotation Barrier Control): Enforces a parent directory sync (`fsync("db")`) invoked *before* `fs.inner.Create` when creating any `marker.manifest.*` file. Because this executes before creating the new marker entry, the unsynced directory entry flushed to durability at that exact moment is the pending `MANIFEST-xxxxxx` entry (created earlier in `createManifest`), ensuring the target manifest is durable before the marker pointing to it exists. This causally eliminates the bug (0 failures across all 32 seeds).
+   - `casestudy_pebble5825_summary.csv`: Aggregated summary statistics across 32 seeds comparing standard DCG, DCG-PR (`dcg-pr`), DCG Flag-Only, R2, R1, and baseline search heuristics.
+   - `casestudy_pebble5825_per_seed.csv`: Unaggregated per-seed discovery metrics across 32 seeds. Demonstrates that while standard DCG prioritizes 0% retention first (median $k_1 = 205.00$ [203.00, 210.00], mean $k_1 = 253.45$), `dcg-pr` incorporates a post-hoc partial-retention prior tracking `UnsyncedDirEntryCount >= 2`, discovering the failure at median $k_1 = \mathbf{2.00}$ [1.00, 3.00] (mean $k_1 = 2.65$, AUC Failures = $0.8455$, AUC Bugs = $0.9212$), compared to uniform random B0 median $k_1 = 112.00$ (mean $136.23$) and state-representative B5 median $k_1 = 17.00$ (mean $45.26$).
 
-4. **Pebble Checkpoint Real-Bug Holdout A/B Benchmark (`results/realbug_checkpoint_summary.csv`, `results/realbug_checkpoint_per_seed.csv`):**
+4. **Intra-Class Subsystem Transfer Case Study: Pebble Checkpoint Directory Race (`15b500fb`) (`results/casestudy_checkpoint_summary.csv`, `results/casestudy_checkpoint_per_seed.csv`):**
    - Scope: Real-world holdout bug from CockroachDB Pebble commit `15b500fb` (`checkpoint.go` directory sync omission) evaluated across 32 deterministic seeds (`42, 100..900, 1001..1022`) under partial retention policies (0%, 50%, 100%) with `-checkpoint-at 60`.
    - `MUT-0` (unfaulted baseline): Pebble `db.Checkpoint("checkpoint")` writes checkpoint manifest and marker pointer files (`marker.manifest.*`) before `dir.Sync()`. Under 50% partial retention, unsynced directory entries are dropped while marker pointers survive, causing checkpoint recovery failure (`open_error`) on 30 of 32 seeds (67 total failures across seeds).
    - `BARRIER-CKPT` (Checkpoint Directory Barrier Control): Forces immediate parent directory sync when writing checkpoint manifests and markers inside `checkpoint`. Completely eliminates checkpoint recovery failures across all 32 seeds (0 checkpoint failures).
-   - `realbug_checkpoint_summary.csv`: Aggregated summary statistics across 32 seeds comparing standard DCG, DCG-PR (`dcg-pr`), DCG Flag-Only, R2, R1, and baseline search heuristics. Demonstrates that `dcg-pr` (prior frozen before evaluation) discovers checkpoint failures at median $k_1 = \mathbf{2.00}$ [1.00, 125.50] (mean $k_1 = 93.17$, AUC Failures = $0.5414$, AUC Bugs = $0.6739$), whereas 0%-retention-first DCG has median $k_1 = 215.00$ (mean $k_1 = 262.97$), and random B0 has median $k_1 = 168.75$ (mean $175.40$).
-   - `realbug_checkpoint_per_seed.csv`: Unaggregated per-seed discovery metrics across all 32 seeds.
+   - `casestudy_checkpoint_summary.csv`: Aggregated summary statistics across 32 seeds comparing standard DCG, DCG-PR (`dcg-pr`), DCG Flag-Only, R2, R1, and baseline search heuristics. Demonstrates that `dcg-pr` (prior frozen before evaluation) discovers checkpoint failures at median $k_1 = \mathbf{2.00}$ [1.00, 125.50] (mean $k_1 = 93.03$, AUC Failures = $0.5414$, AUC Bugs = $0.6739$), whereas 0%-retention-first DCG has median $k_1 = 215.00$ (mean $k_1 = 262.93$), R2 has median $k_1 = 323.56$ (mean $k_1 = 325.80$), and random B0 has median $k_1 = 162.50$ (mean $175.35$).
+   - `casestudy_checkpoint_per_seed.csv`: Unaggregated per-seed discovery metrics across all 32 seeds.
 
 5. **MUT-5 Universe-Scaling Benchmark (`results/scaling_mut5_summary.csv`, `results/scaling_mut5_per_seed.csv`):**
    - Scope: Scaling behavior of prioritization strategies on `MUT-5` (single WAL sync drop) across operations $\in \{120, 300, 600, 1200\}$ and 8 seeds ($\in \{42, 100, 200, 300, 400, 500, 600, 700\}$), generating candidate universes from ~338 to ~2,958 candidates.
@@ -71,25 +71,25 @@ Stage 2 stores aggregated 95%-confidence-interval summaries and unaggregated per
    - Findings: Exactly 0 violations, 0 open errors, 0 panics, and 0 hangs across all 108 runs (>50,000 crash candidates evaluated), verifying a 0.00% false-alarm rate across diverse workload topologies.
 
 7. **Pebble Subsystem Discovery Benchmark (`results/subsystem_discovery.csv`):**
-   - Scope: Systematic empirical discovery across Pebble v2.1.7 subsystems performing multi-file and directory-marker mutations (Workload A: External SSTable Ingestion, Workload B: Live Format-Version Ratcheting, Workload C: Combined Lifecycle Stress) under unfaulted `MUT-0` across intermediate retention policies `[0, 50, 100]` and seeds `42, 100, 777` (5,409 candidate states evaluated).
+   - Scope: Systematic empirical discovery across Pebble v2.1.7 subsystems performing multi-file and directory-marker mutations (Workload A: External SSTable Ingestion, Workload B: Live Format-Version Ratcheting, Workload C: Combined Lifecycle Stress) under unfaulted `MUT-0` across intermediate retention policies `[0, 50, 100]` and seeds `42, 100, 777` (5,424 candidate states evaluated).
    - `subsystem_discovery.csv`: 9 data rows recording workload, seed, ops, maintenance parameters (`ingest_every`, `ratchet_at`, `checkpoint_at`, `max_manifest_file_size`), policies, universe size, violations, durably committed violations, prefix violations, structural violations, open errors, panics, hangs, and git commit hash.
    - Findings & Empirical Crash-Consistency Evaluation:
      - **0 lost durably-committed keys** across all 9 runs. Once `db.Ingest` returns `nil`, ingested keys are permanently durable and recovered 100% of the time, confirming 100% synchronous durability via `d.objProvider.Sync()` (`ingest.go:1490`) and `atomicfs.Marker.Move` (`marker.go:189`).
      - **0 engine recovery panics or hangs**.
      - **Workload A (External SSTable Ingestion):** 0 lost committed keys. 40 prefix violations across seeds 42 (15) and 777 (25) reveal a cross-channel commit-order hole on direct L0 ingest: when `db.Ingest` takes the non-overlapping direct L0 shortcut (`asFlushable = false`), Pebble allocates sequence number $s_2 > s_1$ (`ingest.go:1703`) and syncs `MANIFEST` (`version_set.go:649`) without syncing the active `.log` WAL containing preceding `NoSync` writes at sequence number $s_1 < s_2$. Upon a 0%-retention crash, $s_2$ survives via `MANIFEST` while $s_1$ is lost from the unsynced `WAL`, creating a cross-channel sequence hole (whereas overlapping flushable ingest syncs the shared WAL at `commit.go:289` and preserves strict prefix order).
      - **Workload B (Live Format Ratcheting):** 100% clean recovery and atomic transitions across all policies; 0 violations, 0 panics, and 4 transient unlinked-marker open errors under 50% retention (1 on seed 42, 2 on seed 100, 1 on seed 777). `atomicfs.LocateMarker` deterministically selects the latest valid format marker iteration under both full and partial retention.
-     - **Workload C (Combined Stress):** 0 lost committed keys, 0 panics. 23 open errors occur exclusively under 50% partial retention during manifest rotation and checkpointing prior to directory sync (6 on seed 42, 10 on seed 100, 7 on seed 777).
+     - **Workload C (Combined Stress):** 0 lost committed keys, 0 panics. 17 open errors occur exclusively under 50% partial retention during manifest rotation and checkpointing prior to directory sync (5 on seed 42, 8 on seed 100, 4 on seed 777).
    - Reproduction & Validation Commands:
      - Read-only validation: `go test -v -run TestSubsystemDiscovery ./internal/exp`
      - CSV regeneration: `go test -v -run TestSubsystemDiscovery ./internal/exp -update`
 
-8. **Direct L0 `db.Ingest` 32-Seed Benchmark (`results/realbug_ingest_summary.csv`, `results/realbug_ingest_per_seed.csv`):**
+8. **Direct L0 `db.Ingest` 32-Seed Benchmark (`results/casestudy_ingest_summary.csv`, `results/casestudy_ingest_per_seed.csv`):**
    - Scope: Real-world bug from direct L0 external SSTable ingestion (`asFlushable = false`) where sequence numbers advance and MANIFEST is synced without syncing preceding un-flushed WAL writes, evaluated across 32 seeds (`seed = 1..32`, 25 ops) under endpoint `[0, 100]` retention (>13,000 candidate crash states).
-   - Findings: Under unfaulted `MUT-0`, prefix violations manifest on 26 of 32 seeds under partial retention and 22 of 32 under endpoint retention. Under causal remedy `BARRIER-INGEST` (`db.LogData(nil, pebble.Sync)`), prefix violations drop to **0 across all 32 seeds**. Pre-frozen `DCG-PR` and `DCG` achieve median $k_1 = \mathbf{13.50}$ [7.50, 18.50] (mean $16.50$), compared to $28.68$ (mean $27.63$) for `R2` and $22.25$ (mean $26.20$) for uniform random `B0`.
+   - Findings: Under unfaulted `MUT-0`, prefix violations manifest on 26 of 32 seeds under partial retention and 22 of 32 under endpoint retention. Under causal remedy `BARRIER-INGEST` (`db.LogData(nil, pebble.Sync)`), prefix violations drop to **0 across all 32 seeds**. Pre-frozen `DCG-PR` and `DCG` achieve median $k_1 = \mathbf{9.00}$ [9.00, 19.00] (mean $15.32$), compared to $27.88$ (mean $27.64$) for `R2`, $28.60$ (mean $30.61$) for `R1`, $28.18$ (mean $29.88$) for `DCG Flag-Only`, $81.00$ (mean $80.18$) for `sync-boundary`, and $21.50$ (mean $24.73$) for uniform random `B0`.
 
 9. **Multi-Distribution Workload Diversity Suite (`results/workload_diversity_summary.csv`, `results/workload_diversity_per_seed.csv`):**
    - Scope: Generalization evaluation across 5 standardized access distributions (`ycsb-a`, `ycsb-b`, `ycsb-f`, `overwrite-heavy`, `delete-heavy`) evaluated across 16 seeds (`seed = 1..16`, 25 ops) and 4 fault models (`MUT-0`, `MUT-1`, `MUT-5`, `MUT-9`).
-   - Findings: Exactly 0 false alarms on unfaulted control `MUT-0` across all 16 seeds for all 5 presets (80 complete trials). `DCG` achieves up to **$9.4\times$ speedup** over `R2` on `overwrite-heavy/MUT-5` (mean $k_1 = 1.00$ vs $9.41$, and **$20.3\times$** over `B0`'s $20.34$) and **$9.3\times$** on `ycsb-f/MUT-5` (mean $k_1 = 1.00$ vs $9.30$, and **$20.5\times$** over `B0`'s $20.50$), maintaining $k_1 = 1.00$ across all failing presets on `ycsb-a`, `ycsb-b`, `ycsb-f`, and `overwrite-heavy`.
+   - Findings: Exactly 0 false alarms on unfaulted control `MUT-0` across all 16 seeds for all 5 presets (80 complete trials). `DCG` achieves up to **$9.3\times$ speedup** over `R2` on `overwrite-heavy/MUT-5` (mean $k_1 = 1.00$ vs $9.30$, and **$20.5\times$** over `B0`'s $20.50$) and **$9.3\times$** on `ycsb-f/MUT-5` (mean $k_1 = 1.00$ vs $9.30$, and **$20.5\times$** over `B0`'s $20.50$), maintaining $k_1 = 1.00$ across all failing presets on `ycsb-a`, `ycsb-b`, `ycsb-f`, and `overwrite-heavy`.
 
 ---
 
@@ -107,9 +107,9 @@ python3 analysis/paired_stats.py results/holdout_per_seed.csv "Holdout Faults" M
 # Out-of-Contract Control (MUT-X6)
 python3 analysis/paired_stats.py results/holdout_per_seed.csv "Out-of-Contract Control" MUT-X6_k2 MUT-X6_k5 MUT-X6_k9
 
-# Pebble #5825 Real-Bug A/B Benchmark (MUT-0)
-python3 analysis/paired_stats.py results/realbug_pebble5825_per_seed.csv "Pebble #5825 Real-Bug (32 seeds)" MUT-0
+# Pebble #5825 Case Study Benchmark (MUT-0)
+python3 analysis/paired_stats.py results/casestudy_pebble5825_per_seed.csv "Pebble #5825 Case Study (32 seeds)" MUT-0
 
-# Pebble Checkpoint Real-Bug Holdout Benchmark (MUT-0)
-python3 analysis/paired_stats.py results/realbug_checkpoint_per_seed.csv "Pebble Checkpoint Real-Bug (32 seeds)" MUT-0
+# Pebble Checkpoint Case Study Benchmark (MUT-0)
+python3 analysis/paired_stats.py results/casestudy_checkpoint_per_seed.csv "Pebble Checkpoint Case Study (32 seeds)" MUT-0
 ```

@@ -31,6 +31,14 @@ const (
 	MUT9 = "MUT-9" // Single k-th directory sync drop
 
 	// Causal barrier repair controls (formal systems-research identifiers).
+	// Barrier5825 represents the manifest-rotation directory barrier control.
+	// In Pebble v2.1.7 manifest rotation (version_set.go:1026, 650-654):
+	// 1. createManifest calls FS.Create("db/MANIFEST-xxxxxx").
+	// 2. Writes snapshot VersionEdit, calls manifestFile.Sync(), and closes manifestFile,
+	//    leaving the "db/MANIFEST-xxxxxx" directory entry unsynced in "db".
+	// 3. manifestMarker.Move("MANIFEST-xxxxxx") calls FS.Create("db/marker.manifest.<iter>.<manifest>").
+	// Invoking maybeSyncParentDir BEFORE fs.inner.Create flushes "db/MANIFEST-xxxxxx" to durable
+	// storage before the marker entry is created.
 	Barrier5825 = "BARRIER-5825" // Manifest-Rotation Directory Barrier Control: pre-syncs parent dir on marker creation
 	BarrierCkpt = "BARRIER-CKPT" // Checkpoint Directory Barrier Control: pre-syncs parent dir before marker/CURRENT visibility
 
@@ -276,6 +284,42 @@ func (fs *FS) Config() Config {
 // Unwrap returns the underlying filesystem.
 func (fs *FS) Unwrap() vfs.FS {
 	return fs.inner
+}
+
+// WALWriteCount forwards to inner if supported.
+func (fs *FS) WALWriteCount() uint64 {
+	if s, ok := fs.inner.(interface{ WALWriteCount() uint64 }); ok {
+		return s.WALWriteCount()
+	}
+	return 0
+}
+
+// WaitForWALWrite forwards to inner if supported.
+func (fs *FS) WaitForWALWrite(target uint64) {
+	if s, ok := fs.inner.(interface{ WaitForWALWrite(uint64) }); ok {
+		s.WaitForWALWrite(target)
+	}
+}
+
+// BeginIngestSection forwards to inner if supported.
+func (fs *FS) BeginIngestSection() {
+	if s, ok := fs.inner.(interface{ BeginIngestSection() }); ok {
+		s.BeginIngestSection()
+	}
+}
+
+// EndIngestSection forwards to inner if supported.
+func (fs *FS) EndIngestSection() {
+	if s, ok := fs.inner.(interface{ EndIngestSection() }); ok {
+		s.EndIngestSection()
+	}
+}
+
+// NotifyDroppedWALWrite forwards to inner if supported.
+func (fs *FS) NotifyDroppedWALWrite() {
+	if s, ok := fs.inner.(interface{ NotifyDroppedWALWrite() }); ok {
+		s.NotifyDroppedWALWrite()
+	}
 }
 
 // State inspection methods
@@ -537,6 +581,15 @@ func (fs *FS) shouldDropSync(f *file, op string) bool {
 	}
 }
 
+// maybeSyncParentDir executes parent directory fsync barriers BEFORE file creation or linking.
+// In Pebble v2.1.7 (version_set.go:1026, 650-654), createManifest calls FS.Create("db/MANIFEST-xxxxxx"),
+// writes the snapshot VersionEdit, calls manifestFile.Sync(), and closes manifestFile, leaving the
+// "db/MANIFEST-xxxxxx" directory entry unsynced in "db".
+// Next, version_set.go:654 calls manifestMarker.Move("MANIFEST-xxxxxx") (atomicfs/marker.go:195-227),
+// which calls FS.Create("db/marker.manifest.<iter>.MANIFEST-xxxxxx") (line 195).
+// When this happens, maybeSyncParentDir is invoked BEFORE fs.inner.Create creates the marker entry in MemFS.
+// At this exact instant, the unsynced directory entry flushed to syncedChildren in "db" is the
+// "db/MANIFEST-xxxxxx" entry, ensuring the manifest file is durable before the marker pointing to it is created.
 func (fs *FS) maybeSyncParentDir(path string) {
 	if fs.cfg.ID == Barrier5825 && strings.Contains(path, "marker.manifest") {
 		parentDir := fs.inner.PathDir(path)
@@ -563,6 +616,10 @@ func (fs *FS) maybeSyncParentDir(path string) {
 }
 
 // Create implements vfs.FS.
+// Note the critical execution order: fs.maybeSyncParentDir(name) is invoked BEFORE
+// fs.inner.Create(name, category). For Barrier5825, when manifestMarker.Move calls
+// FS.Create("db/marker.manifest.<iter>.MANIFEST-xxxxxx"), maybeSyncParentDir syncs "db"
+// before the new marker is created in MemFS, durably committing "db/MANIFEST-xxxxxx".
 func (fs *FS) Create(name string, category vfs.DiskWriteCategory) (vfs.File, error) {
 	fs.maybeSyncParentDir(name)
 	f, err := fs.inner.Create(name, category)
@@ -744,6 +801,9 @@ func (f *file) Write(p []byte) (int, error) {
 		}
 		f.fs.mu.Unlock()
 		if drop {
+			if n, ok := f.fs.inner.(interface{ NotifyDroppedWALWrite() }); ok {
+				n.NotifyDroppedWALWrite()
+			}
 			return len(p), nil // acknowledged but never applied
 		}
 	}

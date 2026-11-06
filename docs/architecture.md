@@ -78,7 +78,7 @@ crash candidates, and rank them by strategy.
     version-one SHA-256 encoding.
 - **Rankings**: one ordered list of candidates per strategy.
 
-While upstream `MemFS.CrashClone` iterates over unsorted Go maps (`f.children`) when `0 < UnsyncedDataPercent < 100`, `replay.State.Clone` (`internal/replay/replay.go`) implements `deterministicPartialClone`: it takes the deterministic `0%` synced snapshot (`base0`) and deterministic `100%` unsynced snapshot (`full100`) and traverses all directory entries and 4,096-byte file blocks in strictly sorted lexicographical order (`sort.Strings`) using the candidate's derived PCG seed (`rand.NewPCG(0, seed)`). Consequently, all retention policies `0..100%` (including `50%`) are **100% bit-for-bit seed-deterministic** (`TestReplayClonePartialRetentionSeedDeterminism` and `TestExplorePartialRetentionFiveRepeatZeroFlips`). The complete tuple, not a truncated hash, identifies a candidate and outcome.
+While Pebble's `MemFS.CrashClone` provides endpoint snapshots at 0% and 100%, for intermediate retention (`1..99%`), CraConTest defines its own deterministic block-and-entry partial-retention model (`deterministicPartialClone`, validated by `TestDeterministicPartialCloneStatisticalFidelity`), rather than calling Pebble's `CrashClone` (which iterates over unsorted Go maps `f.children`). In `replay.State.Clone` (`internal/replay/replay.go`), `deterministicPartialClone` takes the deterministic `0%` synced snapshot (`base0`) and deterministic `100%` unsynced snapshot (`full100`) and traverses all directory entries and 4,096-byte file blocks in strictly sorted lexicographical order (`sort.Strings`) using the candidate's derived PCG seed (`rand.NewPCG(0, seed)`). Consequently, all retention policies `0..100%` (including `50%`) are **100% bit-for-bit seed-deterministic** (`TestReplayClonePartialRetentionSeedDeterminism` and `TestExplorePartialRetentionFiveRepeatZeroFlips`). The complete tuple, not a truncated hash, identifies a candidate and outcome.
 
 **Strategies** rank *U* using only trace-derived features. They cannot observe
 outcomes, history, or recovery results. The `internal/strategy` package implements
@@ -106,8 +106,9 @@ outcome table.
 2. **Clone**: call `State.Clone(p, seed)` (`internal/replay/replay.go`) on the
    replayed filesystem to produce the post-crash state. For endpoint policies
    (`0%` and `100%`), it delegates directly to `MemFS.CrashClone`; for
-   intermediate retention (e.g., `50%`), it executes `deterministicPartialClone`
-   to ensure 100% bit-for-bit seed-reproducible crash sampling.
+   intermediate retention (`1..99%`, e.g., `50%`), CraConTest executes its own
+   `deterministicPartialClone` (validated by `TestDeterministicPartialCloneStatisticalFidelity`)
+   rather than calling Pebble's `CrashClone`, ensuring 100% bit-for-bit seed-reproducible crash sampling.
 
 3. **Recover**: open Pebble on the cloned filesystem with:
    - An `Options.Logger` whose `Fatalf` panics instead of calling `os.Exit(1)`

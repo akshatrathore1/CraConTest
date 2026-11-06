@@ -98,12 +98,12 @@ See [docs/architecture.md](docs/architecture.md) for full architectural details.
 │   ├── benchmark_per_seed.csv         # Unaggregated per-seed discovery metrics
 │   ├── holdout_summary.csv            # Aggregated holdout fault metrics (MUT-X1..X6)
 │   ├── holdout_per_seed.csv           # Per-seed holdout metrics
-│   ├── realbug_pebble5825_summary.csv # Pebble #5825 A/B benchmark summary
-│   ├── realbug_pebble5825_per_seed.csv
-│   ├── realbug_checkpoint_summary.csv # Checkpoint 15b500fb A/B benchmark summary
-│   ├── realbug_checkpoint_per_seed.csv
-│   ├── realbug_ingest_summary.csv     # Direct L0 Ingest 32-seed A/B benchmark summary
-│   ├── realbug_ingest_per_seed.csv
+│   ├── casestudy_pebble5825_summary.csv # Pebble #5825 A/B benchmark summary
+│   ├── casestudy_pebble5825_per_seed.csv
+│   ├── casestudy_checkpoint_summary.csv # Checkpoint 15b500fb A/B benchmark summary
+│   ├── casestudy_checkpoint_per_seed.csv
+│   ├── casestudy_ingest_summary.csv     # Direct L0 Ingest 32-seed A/B benchmark summary
+│   ├── casestudy_ingest_per_seed.csv
 │   ├── workload_diversity_summary.csv # 5-preset workload diversity summary (16 seeds)
 │   ├── workload_diversity_per_seed.csv
 │   ├── scaling_mut5_summary.csv       # MUT-5 universe-scaling summary (120..1200 ops)
@@ -191,11 +191,11 @@ To evaluate ranking strategies across both dense and sparse failure distribution
 | **MUT-1** | All WAL Syncs Dropped | 36.4% | **1.00** [1.00, 1.00] | **1.00** [1.00, 1.00] | **1.00** [1.00, 1.00] | 1.44 [1.42, 1.46] | 1.37 [1.34, 1.39] | 5.00 [5.00, 5.00] | 17.00 [17.00, 17.00] | 2.00 [2.00, 2.00] |
 | **MUT-2** | MANIFEST Syncs Dropped | 47.3% | **1.00** [1.00, 1.00] | **1.00** [1.00, 1.00] | **1.00** [1.00, 1.00] | 1.17 [1.16, 1.19] | 1.04 [1.04, 1.05] | **1.00** [1.00, 1.00] | 5.00 [5.00, 5.00] | 1.55 [1.38, 1.71] |
 | **MUT-3** | Directory Syncs Dropped | 42.5% | **1.00** [1.00, 1.00] | 1.03 [1.03, 1.04] | **1.00** [1.00, 1.00] | 1.44 [1.40, 1.48] | 1.17 [1.15, 1.19] | **1.00** [1.00, 1.00] | 9.00 [9.00, 9.00] | 2.00 [2.00, 2.00] |
-| **MUT-4** | SST Flush Syncs Dropped | 29.8% | **1.00** [1.00, 1.00] | **1.00** [1.00, 1.00] | **1.00** [1.00, 1.00] | 1.95 [1.89, 2.00] | 1.68 [1.62, 1.74] | **1.00** [1.00, 1.00] | 31.62 [31.24, 32.01] | 2.39 [2.22, 2.56] |
-| **MUT-5** | Sparse $k$-th WAL Sync Dropped ($k=1$) | 2.7% | **1.00** [1.00, 1.00] | **1.00** [1.00, 1.00] | **1.00** [1.00, 1.00] | 13.01 [12.68, 13.34] | 17.04 [16.54, 17.53] | 262.25 [258.20, 266.30] | 17.00 [17.00, 17.00] | 25.97 [25.00, 26.94] |
+| **MUT-4** | SST Flush Syncs Dropped | 29.8% | **1.00** [1.00, 1.00] | **1.00** [1.00, 1.00] | **1.00** [1.00, 1.00] | 1.95 [1.90, 2.01] | 1.67 [1.61, 1.74] | **1.00** [1.00, 1.00] | 31.62 [31.24, 32.01] | 2.39 [2.22, 2.56] |
+| **MUT-5** | Sparse $k$-th WAL Sync Dropped ($k=1$) | 2.7% | **1.00** [1.00, 1.00] | 1.02 [0.98, 1.06] | **1.00** [1.00, 1.00] | 13.07 [12.72, 13.42] | 17.06 [16.56, 17.56] | 262.31 [258.25, 266.38] | 17.00 [17.00, 17.00] | 26.19 [25.22, 27.16] |
 | **MUT-6** | Second Manifest Sync Dropped | 0.8% | **1.00** [1.00, 1.00] | 1.20 [1.17, 1.24] | 14.08 [13.50, 14.65] | 7.72 [7.46, 7.97] | 20.79 [19.89, 21.70] | 101.00 [97.37, 104.63] | 43.15 [42.38, 43.93] | 31.12 [29.02, 33.21] |
 | **MUT-7** | Options Dir Sync (No-op Control) | 0.0% | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 |
-| **MUT-8** | Compaction SST Sync Drop | 15.2% | **1.00** [1.00, 1.00] | **1.00** [1.00, 1.00] | **1.00** [1.00, 1.00] | 3.56 [3.48, 3.65] | 3.24 [3.10, 3.37] | **1.00** [1.00, 1.00] | 55.25 [54.85, 55.65] | 4.44 [4.26, 4.61] |
+| **MUT-8** | Compaction SST Sync Drop | 15.2% | **1.00** [1.00, 1.00] | **1.00** [1.00, 1.00] | **1.00** [1.00, 1.00] | 3.58 [3.50, 3.66] | 3.26 [3.12, 3.40] | **1.00** [1.00, 1.00] | 55.25 [54.85, 55.65] | 4.41 [4.23, 4.58] |
 | **MUT-9** | Single $k$-th Directory Sync Drop | 41.4% | **1.00** [1.00, 1.00] | **1.00** [1.00, 1.00] | **1.00** [1.00, 1.00] | 1.40 [1.36, 1.44] | 1.21 [1.18, 1.23] | **1.00** [1.00, 1.00] | 17.00 [17.00, 17.00] | 1.95 [1.90, 2.01] |
 
 #### Table 2: Failing State Discovery ($S_{25}$ Early Budget / $S_{100}$ Exhaustive Budget Mean)
@@ -203,13 +203,13 @@ To evaluate ranking strategies across both dense and sparse failure distribution
 | Fault Model | DCG ($S_{25}$ / $S_{100}$) | DCG-FlagOnly | RHG | R2 | R1 | LIFO | B6 | B0 |
 |---|---|---|---|---|---|---|---|---|
 | **MUT-1** | **23.94** / **23.97** | **23.94** / **23.97** | 17.69 / **23.97** | 17.12 / **23.97** | 10.02 / 19.80 | 6.53 / 8.94 | 5.00 / 13.00 | 6.12 / 14.61 |
-| **MUT-2** | **25.00** / **33.03** | **25.00** / **33.03** | 24.00 / **33.03** | 21.15 / **33.03** | 8.66 / 22.81 | 7.00 / 11.38 | 11.00 / 30.00 | 5.67 / 13.78 |
+| **MUT-2** | **25.00** / **33.03** | **25.00** / **33.03** | 24.00 / **33.03** | 21.15 / **33.03** | 8.70 / 22.82 | 7.00 / 11.34 | 11.00 / 30.00 | 5.64 / 13.78 |
 | **MUT-3** | 24.00 / **27.00** | **24.12** / **27.00** | 21.03 / **27.00** | 17.26 / **27.00** | 7.27 / 19.00 | 7.16 / 12.06 | 9.00 / 21.00 | 5.00 / 11.22 |
-| **MUT-4** | **21.72** / **21.72** | **21.72** / **21.72** | 16.69 / **21.72** | 12.58 / **21.72** | 5.45 / 14.53 | 8.00 / 12.25 | 0.00 / 16.69 | 3.56 / 8.62 |
-| **MUT-5** | **2.00** / **2.00** | **2.00** / **2.00** | 1.81 / **2.00** | 1.30 / **2.00** | 0.87 / 1.60 | 0.00 / 0.00 | 1.00 / 1.00 | 0.48 / 1.00 |
+| **MUT-4** | **21.69** / **21.69** | **21.69** / **21.69** | 16.69 / **21.69** | 12.57 / **21.69** | 5.44 / 14.51 | 8.00 / 12.25 | 0.00 / 16.69 | 3.53 / 8.59 |
+| **MUT-5** | **2.00** / **2.00** | **2.00** / **2.00** | 1.81 / **2.00** | 1.30 / **2.00** | 0.88 / 1.60 | 0.00 / 0.00 | 1.00 / 1.00 | 0.45 / 1.00 |
 | **MUT-6** | **1.62** / **1.62** | **1.62** / **1.62** | 1.22 / **1.62** | 1.07 / **1.62** | 0.39 / 1.20 | 0.00 / 0.41 | 0.00 / 1.22 | 0.00 / 0.81 |
 | **MUT-7** | 0.00 / 0.00 | 0.00 / 0.00 | 0.00 / 0.00 | 0.00 / 0.00 | 0.00 / 0.00 | 0.00 / 0.00 | 0.00 / 0.00 | 0.00 / 0.00 |
-| **MUT-8** | **12.88** / **12.88** | **12.88** / **12.88** | 7.88 / **12.88** | 6.72 / 12.82 | 3.29 / 8.41 | 8.00 / 11.75 | 0.00 / 9.88 | 2.00 / 5.05 |
+| **MUT-8** | **12.88** / **12.88** | **12.88** / **12.88** | 7.88 / **12.88** | 6.74 / 12.82 | 3.27 / 8.41 | 8.00 / 11.75 | 0.00 / 9.88 | 2.00 / 5.05 |
 | **MUT-9** | **25.00** / **27.00** | **25.00** / **27.00** | 20.00 / **27.00** | 17.78 / **27.00** | 5.57 / 17.44 | 7.00 / 10.94 | 5.00 / 26.00 | 3.03 / 9.83 |
 
 #### Analysis
@@ -224,39 +224,39 @@ To evaluate ranking strategies across both dense and sparse failure distribution
    - **Tier 3A Regime/Epoch Diversity Partitioning:** Operates in Pass 2 after unique `StateKey` representatives are exhausted, increasing full-budget failure-curve area (`AUCNormFailures`) rather than altering $k_1$ or $S_{25}$.
 
 3. **$S_{25}$ Early-Budget Discovery & The ~40-State Equivalence Ceiling:**
-   In a 120-operation workload, there are only ~35–40 distinct canonical `StateKey` persistence states under 0%-retention crashes. Under an exhaustive testing budget ($B = 100$, $S_{100}$), both DCG and R2 discover all reachable failing equivalence classes and tie because both strategies exhaust distinct state representatives before step 100 (reaching identical $S_{100} = 23.97$ on `MUT-1`, $33.03$ on `MUT-2`, $27.00$ on `MUT-3`, $21.72$ on `MUT-4`, and $27.00$ on `MUT-9`). Under MUT-8 (compaction-triggered SST sync drop, 15.2% density), DCG reaches the first failing state at median $k_1 = 1.0$ (mean 1.00) compared to R2's median $k_1 = 3.6$ (mean 3.56) and B0's median $k_1 = 4.0$ (mean 4.44), achieves early-budget $S_{25} = 12.88$ (vs R2's $6.72$ and B0's $2.00$), and matches R2 at full budget ($S_{100} = 12.88$ for DCG vs $12.82$ for R2, compared to $5.05$ for B0). Therefore, early-budget coverage $S_{25}$ ($B = 25$) is the critical discriminant metric for practical CI testing: DCG achieves near-full state discovery saturation within the first 25 tests (e.g. $S_{25} = 23.94$ vs R2's $17.12$ and B0's $6.12$ on `MUT-1`; $S_{25} = 12.88$ vs R2's $6.72$ and B0's $2.00$ on `MUT-8`; $S_{25} = 25.00$ vs R2's $17.78$ and B0's $3.03$ on `MUT-9`), yielding a 2x–8x throughput advantage over random selection.
+   In a 120-operation workload, there are only ~35–40 distinct canonical `StateKey` persistence states under 0%-retention crashes. Under an exhaustive testing budget ($B = 100$, $S_{100}$), both DCG and R2 discover all reachable failing equivalence classes and tie because both strategies exhaust distinct state representatives before step 100 (reaching identical $S_{100} = 23.97$ on `MUT-1`, $33.03$ on `MUT-2`, $27.00$ on `MUT-3`, $21.69$ on `MUT-4`, and $27.00$ on `MUT-9`). Under MUT-8 (compaction-triggered SST sync drop, 15.2% density), DCG reaches the first failing state at median $k_1 = 1.0$ (mean 1.00) compared to R2's median $k_1 = 3.6$ (mean 3.58) and B0's median $k_1 = 4.0$ (mean 4.41), achieves early-budget $S_{25} = 12.88$ (vs R2's $6.74$ and B0's $2.00$), and matches R2 at full budget ($S_{100} = 12.88$ for DCG vs $12.82$ for R2, compared to $5.05$ for B0). Therefore, early-budget coverage $S_{25}$ ($B = 25$) is the critical discriminant metric for practical CI testing: DCG achieves near-full state discovery saturation within the first 25 tests (e.g. $S_{25} = 23.94$ vs R2's $17.12$ and B0's $6.12$ on `MUT-1`; $S_{25} = 12.88$ vs R2's $6.74$ and B0's $2.00$ on `MUT-8`; $S_{25} = 25.00$ vs R2's $17.78$ and B0's $3.03$ on `MUT-9`), yielding a 2x–8x throughput advantage over random selection.
 
 ### 4. Parameterized & Stochastic Fault Generalization (MUT-X1..X5) and Out-of-Contract Control (MUT-X6)
 
-The parameterized $k$-index (`MUT-X1..X3`), stochastic probability-$p$ (`MUT-X4..X5`), and out-of-contract silent write-loss (`MUT-X6`) fault families were committed to `internal/faults/faults.go` on `2026-11-01` (`c67a44a`, prior to tag `v1.0-dcg-pr-freeze`) to evaluate whether the four binary POSIX durability-contract flags generalize across arbitrary sync-drop indices $k$ and drop probabilities $p$ without re-tuning (`284 wins / 0 losses / 46 ties` vs. `R2`, Holm $p \le 0.002$).
+The parameterized $k$-index (`MUT-X1..X3`), stochastic probability-$p$ (`MUT-X4..X5`), and out-of-contract silent write-loss (`MUT-X6`) fault families were committed to `internal/faults/faults.go` on `2026-11-01` (`c67a44a`, prior to tag `v1.0-dcg-pr-freeze`) to evaluate whether the four binary POSIX durability-contract flags generalize across arbitrary sync-drop indices $k$ and drop probabilities $p$ without re-tuning (`287 wins / 0 losses / 43 ties` vs. `R2`, Holm $p \le 0.002$).
 
 Subsequently, `internal/strategy/dcg.go` and `internal/graph/features.go` were frozen at Git tag **`v1.0-dcg-pr-freeze` (`67bbe7d`)**, and **three strictly post-freeze evaluations** were designed and executed with 0 bytes of modification to the ranking or feature code:
 1. **Post-Freeze Holdout 1 (Real Bug — Checkpoint `15b500fb`, §5.2)**: Evaluated across 32 seeds (`MUT-0` vs. `BARRIER-CKPT`).
 2. **Post-Freeze Holdout 2 (Real Bug — Direct L0 `db.Ingest` Cross-Channel Commit-Order Hole, §5.3)**: Evaluated across 32 seeds (`MUT-0` vs. `BARRIER-INGEST`).
 3. **Post-Freeze Holdout 3 (Multi-Distribution Workload Suite, §8)**: 5 workload presets evaluated across 16 seeds and 4 fault models.
 
-Across all 12 testable in-contract holdout settings (`MUT-X1..X5`), `DCG`/`DCG-PR` achieves median $k_1 = 1.00$, winning 284/284 non-tied comparisons against `R2` (0 losses, Holm-adjusted sign-test $p \le 0.002$, mean speedup $2.1\times$–$20.0\times$). On the 3 out-of-contract settings (`MUT-X6`), performance degrades gracefully to the `R2` baseline (Holm-adjusted $p = 1.0$, not significant) — confirming the contract boundary is correctly defined.
+Across all 12 testable in-contract holdout settings (`MUT-X1..X5`), `DCG`/`DCG-PR` achieves median $k_1 = 1.00$, winning 287/287 non-tied comparisons against `R2` (0 losses, Holm-adjusted sign-test $p \le 0.002$, mean speedup $2.2\times$–$19.1\times$). On the 3 out-of-contract settings (`MUT-X6`), performance degrades gracefully to the `R2` baseline (Holm-adjusted $p = 1.0$, not significant) — confirming the contract boundary is correctly defined.
 
 ### 5. Real-World Storage Engine Bug Studies (Pebble #5825, Checkpoint 15b500fb & Direct L0 Ingest)
 
 CraConTest has been evaluated across three distinct real-world crash bugs and subtle persistence races discovered in CockroachDB's Pebble v2.1.7:
 
 1. **Pebble #5825 (Manifest Rotation / Multi-Entry Directory Race) & `BARRIER-5825`:**
-   - Under 50% partial retention during manifest rotation, an unsynced directory entry for the new `MANIFEST-XXXXXX` file coexists with an unsynced removal of the old manifest, resulting in 99 failures across 31 failing seeds under unpatched `MUT-0` (deterministic partial-retention sampler).
+   - Under 50% partial retention during manifest rotation, an unsynced directory entry for the new `MANIFEST-XXXXXX` file coexists with an unsynced removal of the old manifest, resulting in 98 failures across 31 failing seeds under unpatched `MUT-0` (deterministic partial-retention sampler).
    - Causal barrier control `BARRIER-5825` injects a parent directory sync immediately following manifest rotation, eliminating all failures (0/32 seeds).
-   - Pre-frozen `DCG-PR` promotes candidates with coexisting unsynced directory entries (`UnsyncedDirEntryCount >= 2`), discovering the bug at median $k_1 = \mathbf{2.00}$ (mean $2.65$) vs $205.00$ for 0%-first `DCG` (mean $253.52$) and $104.50$ for `B0` (mean $134.63$).
+   - Pre-frozen `DCG-PR` promotes candidates with coexisting unsynced directory entries (`UnsyncedDirEntryCount >= 2`), discovering the bug at median $k_1 = \mathbf{2.00}$ (mean $2.65$, $S_{25} = 2.50$, $S_{100} = 2.50$) vs $205.00$ for 0%-first `DCG` (mean $253.45$) and $112.00$ for `B0` (mean $136.23$).
 
 2. **Pebble Checkpoint Commit `15b500fb` (Checkpoint Directory Sync) & `BARRIER-CKPT`:**
    - In Pebble's checkpoint subsystem, during `db.Checkpoint(destDir)`, Pebble creates hard-linked SSTables, `MANIFEST`, and `marker.manifest.*` inside `destDir` before calling the directory sync inside `manifestMarker.Move` (`checkpoint.go:596`). When a crash occurs *inside that multi-entry window prior to `dirFD.Sync()`* under 50% partial retention, `marker.manifest.*` can survive while the newly created `MANIFEST-*` or hard-linked `.sst` entry in the same directory is dropped, causing reopening to fail with `open_error` (67 failures across 30 of 32 seeds under `MUT-0`).
    - Case Study 2 belongs to the same structural bug class as Case Study 1 (`#5825`) (multi-entry directory races in Pebble's `atomicfs` marker protocol), evaluating **intra-class subsystem transfer** of `dcg-pr` (from manifest rotation in `"db/"` to `db.Checkpoint` in `"checkpoint/"`), not generalization to an unseen bug class.
    - Causal barrier control `BARRIER-CKPT` (`internal/faults/faults.go:551`) forces destination directory synchronization across both `"db/"` and `"checkpoint/"`, reducing checkpoint recovery failures to strictly 0 across all 32 seeds.
-   - Evaluated as a blind holdout on pre-frozen `DCG-PR` (`v1.0-dcg-pr-freeze`), `DCG-PR` discovers the first failure at median $k_1 = \mathbf{2.00}$ (mean $93.17$) vs $215.00$ for 0%-first `DCG` (mean $262.97$) and $168.75$ for `B0` (mean $175.40$).
+   - Evaluated as a blind holdout on pre-frozen `DCG-PR` (`v1.0-dcg-pr-freeze`), `DCG-PR` discovers the first failure at median $k_1 = \mathbf{2.00}$ (mean $93.03$) vs $215.00$ for 0%-first `DCG` (mean $262.93$), $323.56$ for `R2` (mean $325.80$), and $162.50$ for `B0` (mean $175.35$).
 
 3. **Direct L0 `db.Ingest` Cross-Channel Prefix Hole & `BARRIER-INGEST`:**
    - When external SSTables do not overlap active memtables, Pebble bypasses the WAL (`asFlushable = false`), allocating sequence number $s_2 > s_1$ and committing via `MANIFEST` sync (`vs.manifestFile.Sync()`) while earlier un-synced WAL writes at $s_1$ remain unpersisted. Upon a 0%-retention crash, $s_2$ survives via `MANIFEST` while $s_1 < s_2$ is discarded from the unsynced WAL. Under `MUT-0`, **26 of 32 seeds** exhibit prefix violations (seeds 3, 5, 7, 20, 26, 29 have 0 failures because on those seeds randomly generated ingest keys overlapped the active memtable and executed the `asFlushable = true` branch, which synchronously flushes the WAL via `commit.directWrite` at `commit.go:289`; under endpoint retention, 22 of 32 seeds fail with seeds 8, 9, 16, 23 also taking flushable ingest).
    - Note that upstream Pebble crash tests (`TestWALHardCrashRandomized`) track individual uncommitted `NoSync` keys vs RocksDB `db_stress`-style global prefix. RocksDB `db.h` notes `IngestExternalFile` does not imply `FlushWAL(true)`. Direct L0 `db.Ingest` is an input-dependent cross-channel prefix contract divergence under a global prefix oracle.
    - Causal remedy `BARRIER-INGEST` (`db.LogData(nil, pebble.Sync)`) flushes the active WAL before MANIFEST version edit, eliminating prefix violations to strictly 0 across all 32 seeds (**0 of 32 seeds** fail, $S_{25}=0.00, S_{100}=0.00$).
-   - Pre-frozen `DCG-PR` achieves median $k_1 = \mathbf{13.50}$ (mean $16.50$) and `DCG` achieves $13.50$ (mean $16.50$), compared to $28.68$ (mean $27.63$) for `R2` and $22.25$ (mean $26.20$) for `B0`.
+   - Pre-frozen `DCG-PR` achieves median $k_1 = \mathbf{9.00}$ (mean $15.32$) and `DCG` achieves $9.00$ (mean $15.32$), compared to $27.88$ (mean $27.64$) for `R2`, $28.60$ (mean $30.61$) for `R1`, $28.18$ (mean $29.88$) for `DCG Flag-Only`, $81.00$ (mean $80.18$) for `sync-boundary`, and $21.50$ (mean $24.73$) for `B0` across 276 total failures on 22 failing seeds.
 
 ### 6. Candidate Universe Scaling (MUT-5, 120..1200 ops)
 
@@ -269,7 +269,7 @@ To establish whether uninvestigated Pebble v2.1.7 subsystems performing multi-fi
 1. **Source-Level Audit of Pebble v2.1.7 (`github.com/cockroachdb/pebble/v2`):**
    - **External SSTable Ingestion (`ingest.go`):** In `ingest.go:1490`, `d.objProvider.Sync()` unconditionally syncs `dataDir` prior to sequence number allocation and branching. Direct L0 ingest commits via MANIFEST sync (`vs.manifestFile.Sync()` at `version_set.go:649`) without WAL writes. Flushable ingest commits via synchronous WAL fsync (`commit.directWrite(b)` at `commit.go:289` / `ingest.go:1367`) without MANIFEST writes.
    - **Live Format-Major-Version Ratcheting (`format_major_version.go`):** `RatchetFormatMajorVersion` (`format_major_version.go:436–480`) calls `finalizeFormatVersUpgrade` (`line 486`), which transitions `marker.format-version` via `atomicfs.Marker.Move` (`line 495`). Zero MANIFEST edits are logged; directory sync occurs synchronously inside `Move`.
-   - **AtomicFS Marker Dynamics (`vfs/atomicfs/marker.go`):** `Move` executes `Create(new)` -> `f.Close()` -> `Remove(old)` -> `dirFD.Sync()`. Under 50% partial retention (`CrashClone`), `oldMarker` is retained 100% of the time, and `newMarker` 50% of the time; `LocateMarker` deterministically selects the latest valid iteration index.
+   - **AtomicFS Marker Dynamics (`vfs/atomicfs/marker.go`):** `Move` executes `Create(new)` -> `f.Close()` -> `Remove(old)` -> `dirFD.Sync()`. Under CraConTest's deterministic partial-retention model (`deterministicPartialClone`, validated by `TestDeterministicPartialCloneStatisticalFidelity` at 50% retention), `oldMarker` is retained 100% of the time, and `newMarker` 50% of the time; `LocateMarker` deterministically selects the latest valid iteration index.
    - **Checkpoint Subsystem Durability (`checkpoint.go`):** Enforces three directory syncs at lines 287 (OPTIONS and format marker), 596 (SSTable hard links, MANIFEST, and manifest marker), and 448 (WAL files), guaranteeing atomic crash consistency.
 
 2. **Workload Drivers & CLI Flags:**
@@ -277,14 +277,14 @@ To establish whether uninvestigated Pebble v2.1.7 subsystems performing multi-fi
    - Ingested mutations are recorded with `Mutating: true` and `Sync: true` in the append-only history ledger, verified by the prefix oracle.
 
 3. **Systematic Unfaulted Discovery Results (`results/subsystem_discovery.csv`):**
-   - Dedicated discovery test `TestSubsystemDiscovery` evaluated Workload A (IngestEvery: 25), Workload B (RatchetAt: 50), and Workload C (Combined Stress: IngestEvery: 30, RatchetAt: 40, CheckpointAt: 60, MaxManifestFileSize: 1) across seeds `42, 100, 777` under `MUT-0` at retention policies `[0, 50, 100]` (5,409 candidate states).
+   - Dedicated discovery test `TestSubsystemDiscovery` evaluated Workload A (IngestEvery: 25), Workload B (RatchetAt: 50), and Workload C (Combined Stress: IngestEvery: 30, RatchetAt: 40, CheckpointAt: 60, MaxManifestFileSize: 1) across seeds `42, 100, 777` under `MUT-0` at retention policies `[0, 50, 100]` (5,424 candidate states).
    - **0 lost durably-committed keys** and **0 engine recovery panics** across all workloads and seeds, confirming 100% synchronous durability via `d.objProvider.Sync()` (`ingest.go:1490`) and `atomicfs.Marker.Move` (`marker.go:189`).
    - **Workload A (External SSTable Ingestion):** 100% durability on acknowledged ingests (0 durably-committed violations). 40 prefix violations across seeds 42 (15) and 777 (25) reveal a cross-channel commit-order hole on direct L0 ingest: when `db.Ingest` takes the non-overlapping Direct L0 shortcut (`asFlushable = false`), Pebble allocates sequence number $s_2 > s_1$ (`ingest.go:1703`) and syncs `MANIFEST` (`version_set.go:649`) without syncing the active `.log` WAL containing preceding `NoSync` writes at sequence number $s_1 < s_2$. Upon a 0%-retention crash, $s_2$ survives via `MANIFEST` while $s_1$ is lost from the unsynced `WAL`, creating a cross-channel sequence hole (whereas overlapping flushable ingest syncs the shared WAL at `commit.go:289` and preserves strict prefix order).
    - **Workload B (Live Format Ratcheting):** 100% clean recovery and atomic transitions across all policies; 0 violations, 0 panics. The 4 transient open errors under 50% retention (1 on Seed 42, 2 on Seed 100, 1 on Seed 777) occur exclusively during initial database creation prior to operation 1 (creating `"db/MANIFEST-000001"` and `"db/marker.manifest.000001"` prior to initial directory sync); `RatchetFormatMajorVersion` at operation 50 causes 0 open errors and 0 violations.
-   - **Workload C (Combined Lifecycle Stress):** Partial-retention open errors (23 total: 6 on Seed 42, 10 on Seed 100, 7 on Seed 777) during manifest rotation and checkpointing prior to directory sync; zero errors under 0% and 100% retention.
-   - **Verdict:** Across all 5,409 candidate states in Workloads A, B, and C under `MUT-0`, Pebble v2.1.7 exhibits **0 `durably_committed` data-loss violations and 0 recovery panics**, confirming that `d.objProvider.Sync()` (`ingest.go:1490`) and `atomicfs.Marker.Move` (`marker.go:189`) protect acknowledged ingest and format-ratchet operations from losing committed data. Simultaneously, the audit exposed two distinct recovery hazards under `MUT-0`: (1) an **input-dependent cross-channel `prefix` monotonicity hole** during non-overlapping Direct L0 `db.Ingest` (`40` prefix violations in Workload A, analyzed across 32 seeds in §5.3), and (2) **50%-retention intra-operation directory races (`open_error`)** when a crash occurs inside the multi-entry window between `MANIFEST-*`/`.sst` creation and `dirFD.Sync()` (31 total open errors).
+   - **Workload C (Combined Lifecycle Stress):** Partial-retention open errors (17 total: 5 on Seed 42, 8 on Seed 100, 4 on Seed 777) during manifest rotation and checkpointing prior to directory sync; zero errors under 0% and 100% retention.
+   - **Verdict:** Across all 5,424 candidate states in Workloads A, B, and C under `MUT-0`, Pebble v2.1.7 exhibits **0 `durably_committed` data-loss violations and 0 recovery panics**, confirming that `d.objProvider.Sync()` (`ingest.go:1490`) and `atomicfs.Marker.Move` (`marker.go:189`) protect acknowledged ingest and format-ratchet operations from losing committed data. Simultaneously, the audit exposed two distinct recovery hazards under `MUT-0`: (1) an **input-dependent cross-channel `prefix` monotonicity hole** during non-overlapping Direct L0 `db.Ingest` (`40` prefix violations in Workload A, analyzed across 32 seeds in §5.3), and (2) **50%-retention intra-operation directory races (`open_error`)** when a crash occurs inside the multi-entry window between `MANIFEST-*`/`.sst` creation and `dirFD.Sync()` (25 total open errors).
 
-### 8. Multi-Distribution Workload Diversity Suite (M18B)
+### 8. Multi-Distribution Workload Diversity Suite
 
 To evaluate robustness and generalization across non-uniform key-value access distributions, CraConTest provides 5 distinct workload presets configured via `-preset` (`internal/workload/workload.go`):
 1. `ycsb-a`: 50% update / 50% point read over 8 hot keys with periodic sync/flush.

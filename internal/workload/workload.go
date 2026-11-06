@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"runtime"
 
 	"github.com/akshatrathore1/CraConTest/internal/history"
 	"github.com/akshatrathore1/CraConTest/internal/trace"
@@ -502,6 +503,16 @@ func Plan(cfg Config) []PlanOperation {
 	return plan
 }
 
+type walWriteSynchronizer interface {
+	WALWriteCount() uint64
+	WaitForWALWrite(target uint64)
+}
+
+type ingestSectionGate interface {
+	BeginIngestSection()
+	EndIngestSection()
+}
+
 // Run executes the planned workload on db, calling marker methods around each
 // operation, and returns the verified history ledger.
 func Run(db *pebble.DB, marker Marker, cfg Config) ([]history.Entry, error) {
@@ -521,9 +532,38 @@ func Run(db *pebble.DB, marker Marker, cfg Config) ([]history.Entry, error) {
 		return nil, errors.New("workload: ingest requires a valid VFS")
 	}
 
+	var walSync walWriteSynchronizer
+	if ws, ok := marker.(walWriteSynchronizer); ok {
+		walSync = ws
+	} else if ws, ok := targetFS.(walWriteSynchronizer); ok {
+		walSync = ws
+	}
+
+	var ingestGate ingestSectionGate
+	if ig, ok := marker.(ingestSectionGate); ok {
+		ingestGate = ig
+	} else if ig, ok := targetFS.(ingestSectionGate); ok {
+		ingestGate = ig
+	}
+
+	if db != nil {
+		for db.Metrics().MemTable.Count > 1 || db.Metrics().Flush.NumInProgress > 0 {
+			runtime.Gosched()
+		}
+		db.TestOnlyWaitForCleaning()
+		for i := 0; i < 50; i++ {
+			runtime.Gosched()
+		}
+	}
+
 	var eventTracker uint64
 
 	for _, op := range plan {
+		var prevWAL uint64
+		if walSync != nil {
+			prevWAL = walSync.WALWriteCount()
+		}
+
 		eventTracker++
 		beginEv := eventTracker
 		if marker != nil {
@@ -539,6 +579,9 @@ func Run(db *pebble.DB, marker Marker, cfg Config) ([]history.Entry, error) {
 		switch op.Kind {
 		case "set":
 			opErr = db.Set(op.Key, op.Value, wo)
+			if opErr == nil && !op.Sync && walSync != nil {
+				walSync.WaitForWALWrite(prevWAL + 1)
+			}
 
 		case "get":
 			v, closer, err := db.Get(op.Key)
@@ -551,6 +594,9 @@ func Run(db *pebble.DB, marker Marker, cfg Config) ([]history.Entry, error) {
 
 		case "delete":
 			opErr = db.Delete(op.Key, wo)
+			if opErr == nil && !op.Sync && walSync != nil {
+				walSync.WaitForWALWrite(prevWAL + 1)
+			}
 
 		case "batch":
 			v1, closer1, err1 := db.Get(op.Key)
@@ -572,9 +618,15 @@ func Run(db *pebble.DB, marker Marker, cfg Config) ([]history.Entry, error) {
 				opErr = b.Commit(wo)
 			}
 			_ = b.Close()
+			if opErr == nil && !op.Sync && walSync != nil {
+				walSync.WaitForWALWrite(prevWAL + 1)
+			}
 
 		case "range_delete":
 			opErr = db.DeleteRange(op.Key, op.EndKey, wo)
+			if opErr == nil && !op.Sync && walSync != nil {
+				walSync.WaitForWALWrite(prevWAL + 1)
+			}
 
 		case "iterate":
 			it, err := db.NewIter(nil)
@@ -604,10 +656,17 @@ func Run(db *pebble.DB, marker Marker, cfg Config) ([]history.Entry, error) {
 			_ = db.Checkpoint("checkpoint")
 
 		case "ingest":
-			opErr = runIngest(db, targetFS, op, cfg.BarrierIngest)
+			opErr = runIngest(db, targetFS, ingestGate, op, cfg.BarrierIngest)
 
 		case "ratchet":
 			opErr = db.RatchetFormatMajorVersion(pebble.FormatNewest)
+		}
+
+		if db != nil && opErr == nil {
+			for db.Metrics().MemTable.Count > 1 || db.Metrics().Flush.NumInProgress > 0 {
+				runtime.Gosched()
+			}
+			db.TestOnlyWaitForCleaning()
 		}
 
 		eventTracker++
@@ -699,7 +758,7 @@ func Correlate(entries []history.Entry, events []trace.Event) ([]history.Entry, 
 	return result, nil
 }
 
-func runIngest(db *pebble.DB, targetFS vfs.FS, op PlanOperation, barrierIngest bool) error {
+func runIngest(db *pebble.DB, targetFS vfs.FS, ingestGate ingestSectionGate, op PlanOperation, barrierIngest bool) error {
 	if targetFS == nil {
 		return errors.New("workload: ingest requires a valid VFS")
 	}
@@ -754,5 +813,18 @@ func runIngest(db *pebble.DB, targetFS vfs.FS, op PlanOperation, barrierIngest b
 		}
 	}
 
-	return db.Ingest(context.Background(), paths)
+	if ingestGate != nil {
+		ingestGate.BeginIngestSection()
+	}
+	err := db.Ingest(context.Background(), paths)
+	if ingestGate != nil {
+		ingestGate.EndIngestSection()
+	}
+	if err == nil && db != nil {
+		for db.Metrics().MemTable.Count > 1 || db.Metrics().Flush.NumInProgress > 0 {
+			runtime.Gosched()
+		}
+		db.TestOnlyWaitForCleaning()
+	}
+	return err
 }
