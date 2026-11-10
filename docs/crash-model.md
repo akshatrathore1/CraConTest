@@ -64,7 +64,12 @@ works as follows:
 
 While raw upstream `MemFS.CrashClone` provides fast in-memory snapshots, Go's randomized map iteration order over `f.children` causes `CrashClone` to consume pseudo-random numbers in an unstable order whenever `1 <= UnsyncedDataPercent <= 99`. Consequently, invoking raw `MemFS.CrashClone` repeatedly with the exact same seed produces multiple distinct filesystem images (demonstrated in `internal/trace/event_test.go:TestCrashCloneSeedReproducibility`).
 
-To eliminate this nondeterminism and guarantee bit-for-bit reproducibility across all retention policies, CraConTest wraps replay snapshots in `replay.State.Clone` (`internal/replay/replay.go`). For intermediate retention (`1..99%`, such as 50%), CraConTest explicitly defines its own deterministic block-and-entry partial-retention model (`deterministicPartialClone`, validated by `TestDeterministicPartialCloneStatisticalFidelity`), rather than calling Pebble's `CrashClone`. In this model, `State.Clone` takes the deterministic 0% synced snapshot (`base0`) and 100% unsynced snapshot (`full100`), traverses directory entries in strictly sorted lexicographical order (`sort.Strings`), and samples 4,096-byte dirty blocks in ascending offset order using a candidate-derived PCG random number generator (`rand.NewPCG(0, seed)`). This ensures 100% seed determinism for any retention policy from 0% to 100% (`TestReplayClonePartialRetentionSeedDeterminism`) while preserving high statistical retention fidelity across seeds.
+To eliminate this nondeterminism and guarantee bit-for-bit reproducibility across all retention policies, CraConTest wraps replay snapshots in `replay.State.Clone(percent, seed)` (`internal/replay/replay.go:89-110`), which explicitly handles all three retention regimes:
+- **`percent == 0`**: delegates directly to `MemFS.CrashClone` with `UnsyncedDataPercent: 0` (RNG-free).
+- **`percent == 100`**: delegates directly to `MemFS.CrashClone` with `UnsyncedDataPercent: 100` and `rand.New(rand.NewPCG(0, seed))` (seed-invariant because every `IntN(100) < 100` check succeeds unconditionally).
+- **`1 <= percent <= 99`**: constructs `base0` (`UnsyncedDataPercent: 0`) and `full100` (`UnsyncedDataPercent: 100` with `rand.New(rand.NewPCG(0, 0))`), then runs `deterministicPartialClone` using `rng := rand.New(rand.NewPCG(0, seed))`, ensuring every intermediate state is bounded between `base0` and `full100` (`TestReplayEndpointEquivalenceAndBoundaryContainment`). Note that while `0%` and `100%` bound every intermediate policy `p%`, two distinct intermediate percentages `p1 < p2` are not guaranteed to be bitwise subsets at every offset because retaining an unsynced directory at `p2` that was skipped at `p1` consumes additional RNG draws for its children.
+
+In this model, `State.Clone` captures exact `fileSyncedBytes` snapshots at each file's latest `Sync`/`SyncData` (or `SyncTo` with `FullSync=true`). For intermediate retention policies (`1..99%`), for files whose directory entry is synced (`syncedSet[name] == true`), `deterministicPartialClone` reads `syncedBytes` from `base0` (`CrashClone(0)`), and consults `fileSyncedBytes` for unsynced directory entries. `deterministicPartialClone` partitions each file into 4KB blocks. Any 4KB block where the live file contents differ from the synced snapshot (`syncedBytes`) is sampled sequentially from the candidate's PCG PRNG stream (`rand.New(rand.NewPCG(0, seed))`) as directory entries are traversed in sorted lexicographical order (`sort.Strings`) and differing 4KB blocks are traversed in ascending offset order, deciding whether that block retains the unsynced live dirty bytes or reverts to the durable snapshot (`syncedBytes`). Unsynced directory entries are similarly sampled independently in sorted lexicographical order, as verified in `TestDeterministicPartialCloneStatisticalFidelity` and `TestReplayPartialCloneInPlaceOverwriteAfterSync`. This ensures 100% seed determinism for any retention policy from 0% to 100% (`TestReplayClonePartialRetentionSeedDeterminism`) while preserving high statistical retention fidelity across seeds.
 
 ## Pebble's Durability Contract
 
@@ -105,21 +110,14 @@ After a crash, the recovered database state must equal the state produced by
 applying some **prefix** of the commit order. That prefix must include at least
 all durably committed (synced) operations.
 
-Formally: let operations be ordered by their commit sequence number. After
-recovery, there exists an index *j* such that:
-
-- All operations with sequence number ≤ *j* are present.
-- No operation with sequence number > *j* is present.
-- *j* ≥ the sequence number of the last synced operation.
+Formally: let operations be ordered by their commit sequence number. The oracle computes the lower bound $L$ as the state after the last client operation that completed with `Sync: true` (or the initial state if no synchronous operation has completed). The recovered database state $S$ must equal some whole-operation prefix between $L$ and the state after the latest begun mutation at the cutoff.
 
 ### What This Means
 
-- **No holes**: if operation 5 is recovered but operation 4 is not, this is a
-  violation. The recovered state must be a contiguous prefix.
-- **No resurrection**: if operation 8 was never acknowledged, it must not appear
-  in the recovered state.
-- **Batches are atomic**: a batch operation is either fully present or fully
-  absent. A partially applied batch is a violation.
+- **Rule 1 (`durably_committed`)**: If the recovered database state is strictly older than lower bound $L$ ($S < L$), an acknowledged synchronous write has been lost, violating Rule 1.
+- **Rule 2 (`atomic_batch`)**: Multi-key client transactions must commit atomically. A batch operation is either fully present or fully absent in the recovered database; observing an interior state containing only a subset of the batch's keys violates Rule 2.
+- **Rule 3 (`prefix`)**: An unsynced commit-order hole exists where a later write is present while an earlier one is absent ($S \notin [L, U]$).
+- **No resurrection**: if an operation was never acknowledged, it must not appear in the recovered state.
 
 ### Why the Independent Rule is Wrong
 

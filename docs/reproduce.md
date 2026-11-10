@@ -27,11 +27,11 @@ The CLI has five subcommands. Flags use a single dash:
 
 | Command | Flags |
 |---|---|
-| `record` | `-spec <config.json> -out <run-dir> [-fault <MUT-0 … MUT-9, MUT-X1 … MUT-X6>] [-policies 0,100] [-ingest-every <N>] [-ratchet-at <N>]` |
+| `record` | `-spec <config.json> -out <run-dir> [-run <run-dir>] [-fault <MUT-0 … MUT-9, MUT-X1 … MUT-X6>] [-policies 0,100] [-ingest-every <N>] [-ratchet-at <N>] [-barrier-ingest] [-preset <name>]` |
 | `plan` | `-run <run-dir> [-seed <ranking seed>]` |
 | `explore` | `-run <run-dir> [-timeout <duration>]` |
 | `evaluate` | `-run <run-dir> [-budgets 0,1,5,...] [-discovery <csv> -plot <svg>]` |
-| `benchmark` | `[-seeds 42,100,...] [-faults MUT-1,...] [-ops 120] [-report <md>] [-csv <csv>] [-per-seed-csv <csv>] [-ingest-every <N>] [-ratchet-at <N>]` |
+| `benchmark` | `[-seeds 42,100,...] [-faults MUT-1,...] [-ops 120] [-policies 0,100] [-max-manifest-size <bytes>] [-report <md>] [-csv <csv>] [-per-seed-csv <csv>] [-checkpoint-at <N>] [-ingest-every <N>] [-ratchet-at <N>] [-barrier-ingest] [-preset <name>] [-control]` |
 
 ### Directory Structure for Reproduction Artifacts
 
@@ -149,13 +149,13 @@ The multi-seed benchmark runs 32 deterministic workload seeds (`42, 100..900, 10
 |---|---|---|---|---|---|---|---|---|
 | **MUT-0** | Null Control (No Fault) | 0.0% | 0.00 | 0.00 | 0.00 | 0.00 / 0.00 | 0.00 / 0.00 | 0.00 / 0.00 |
 | **MUT-1** | All WAL Syncs Dropped | 36.4% | **1.00** | 1.44 | 2.00 | **23.94** / **23.97** | 17.12 / **23.97** | 6.12 / 14.61 |
-| **MUT-2** | MANIFEST Syncs Dropped | 47.3% | **1.00** | 1.17 | 1.55 | **25.00** / **33.03** | 21.15 / **33.03** | 5.67 / 13.78 |
+| **MUT-2** | MANIFEST Syncs Dropped | 47.3% | **1.00** | 1.17 | 1.55 | **25.00** / **33.00** | 21.14 / **33.00** | 5.64 / 13.75 |
 | **MUT-3** | Directory Syncs Dropped | 42.5% | **1.00** | 1.44 | 2.00 | 24.00 / **27.00** | 17.26 / **27.00** | 5.00 / 11.22 |
-| **MUT-4** | SST Flush Syncs Dropped | 29.8% | **1.00** | 1.95 | 2.39 | **21.72** / **21.72** | 12.58 / **21.72** | 3.56 / 8.62 |
+| **MUT-4** | SST Flush Syncs Dropped | 29.8% | **1.00** | 1.95 | 2.39 | **21.69** / **21.69** | 12.57 / **21.69** | 3.53 / 8.59 |
 | **MUT-5** | Sparse $k$-th WAL Sync Dropped ($k=1$) | 2.7% | **1.00** | 13.01 | 25.97 | **2.00** / **2.00** | 1.30 / **2.00** | 0.48 / 1.00 |
 | **MUT-6** | Second Manifest Sync Dropped | 0.8% | **1.00** | 7.72 | 31.12 | **1.62** / **1.62** | 1.07 / **1.62** | 0.00 / 0.81 |
 | **MUT-7** | Options Dir Sync (No-op Control) | 0.0% | 0.00 | 0.00 | 0.00 | 0.00 / 0.00 | 0.00 / 0.00 | 0.00 / 0.00 |
-| **MUT-8** | Compaction SST Sync Drop | 15.2% | **1.00** | 3.56 | 4.44 | **12.88** / **12.88** | 6.72 / 12.82 | 2.00 / 5.05 |
+| **MUT-8** | Compaction SST Sync Drop | 15.2% | **1.00** | 3.58 | 4.41 | **12.88** / **12.88** | 6.74 / 12.82 | 2.00 / 5.05 |
 | **MUT-9** | Single $k$-th Directory Sync Drop | 41.4% | **1.00** | 1.40 | 1.95 | **25.00** / **27.00** | 17.78 / **27.00** | 3.03 / 9.83 |
 
 ### 4.2 Holdout & Out-of-Contract Benchmark (32 Seeds, MUT-X1 to MUT-X6)
@@ -180,9 +180,9 @@ python3 analysis/paired_stats.py results/holdout_per_seed.csv "Holdout Faults" M
 python3 analysis/paired_stats.py results/holdout_per_seed.csv "Out-of-Contract Control" MUT-X6_k2 MUT-X6_k5 MUT-X6_k9
 ```
 
-### 4.3 Pebble #5825 Real-Bug A/B Benchmark (32 Seeds, MUT-0 vs BARRIER-5825)
+### 4.3 Pebble #5825 Case Study A/B Benchmark (32 Seeds, MUT-0 vs BARRIER-5825)
 
-To evaluate real-world crash inconsistency caused by unsynced parent directory entries under partial retention (CockroachDB Pebble #5825), the real-bug benchmark compares unfaulted `MUT-0` against the patched control `BARRIER-5825` (Manifest-Rotation Barrier Control) across 32 seeds under policies 0%, 50%, and 100% with manifest rotation (`-max-manifest-size 1`):
+To evaluate real-world crash inconsistency caused by unsynced parent directory entries under partial retention (CockroachDB Pebble #5825), the case study benchmark compares unfaulted `MUT-0` against the patched control `BARRIER-5825` (Manifest-Rotation Barrier Control) across 32 seeds under policies 0%, 50%, and 100% with manifest rotation (`-max-manifest-size 1`):
 
 ```bash
 ./cracontest benchmark \
@@ -200,8 +200,8 @@ To run paired statistical comparisons on the Pebble #5825 case study per-seed re
 python3 analysis/paired_stats.py results/casestudy_pebble5825_per_seed.csv "Pebble #5825 Case Study (32 seeds)" MUT-0
 ```
 
-- **Causal Verification:** Under `MUT-0`, 98 failures occur across 31 failing seeds (all manifesting exclusively at 50% partial-retention candidates). Under `BARRIER-5825`, which executes parent directory sync (`maybeSyncParentDir`) *before* `fs.inner.Create` when writing marker files to commit the pending `MANIFEST-xxxxxx` entry, failures drop to **0 across all 32 seeds**, causally confirming the fix for Pebble #5825.
-- **Post-Hoc Partial-Retention Prior (`dcg-pr`):** Standard `dcg` prioritizes 0%-retention candidates first, requiring a median $k_1$ of **205.00** [203.00, 210.00] (mean 253.45) to discover the partial-retention failure. `dcg-pr` incorporates a partial-retention prior tracking `UnsyncedDirEntryCount >= 2`, discovering the first failure at median $k_1 = \mathbf{2.00}$ [1.00, 3.00] (mean 2.65, S25 = 2.50, S100 = 2.50, AUC Failures = 0.8455, AUC Bugs = 0.9212), compared to uniform random B0 median $k_1 = 112.00$ (mean 136.23) and state-representative B5 median $k_1 = 17.00$ (mean 45.26).
+- **Causal Verification:** Under `MUT-0`, 58 failures occur across 25 of 32 failing seeds (all manifesting exclusively at 50% partial-retention candidates). Under `BARRIER-5825`, which executes parent directory sync (`maybeSyncParentDir`) *before* `fs.inner.Create` when writing marker files to commit the pending `MANIFEST-xxxxxx` entry, failures drop to **0 across all 32 seeds**, causally confirming the fix for Pebble #5825.
+- **Post-Hoc Partial-Retention Prior (`dcg-pr`):** Standard `dcg` prioritizes 0%-retention candidates first, requiring a median $k_1$ of **211.00** [203.00, 340.00] (mean 301.60) to discover the partial-retention failure. `dcg-pr` incorporates a partial-retention prior tracking `UnsyncedDirEntryCount >= 2`, discovering the first failure at median $k_1 = \mathbf{2.00}$ [2.00, 5.00] (mean 12.40, S25 = 1.44, S100 = 1.44, AUC Failures = 0.6733, AUC Bugs = 0.7562), compared to uniform random B0 median $k_1 = 148.00$ (mean 180.74) and state-representative B5 median $k_1 = 62.00$ (mean 57.68).
 
 ### 4.4 Intra-Class Subsystem Transfer Case Study: Pebble Checkpoint Directory Race (`15b500fb`) (32 Seeds, MUT-0 vs BARRIER-CKPT)
 
@@ -224,8 +224,8 @@ python3 analysis/paired_stats.py results/casestudy_checkpoint_per_seed.csv "Pebb
 ```
 
 #### Results Summary:
-- **Causal Verification:** In Pebble `db.Checkpoint("checkpoint")`, checkpoint manifest and marker pointer files (`marker.manifest.*`) are written before `dir.Sync()`. Under 50% partial retention, unsynced directory entries are dropped while marker pointers persist, causing checkpoint recovery failure (`open_error`) on 30 of 32 seeds (67 total failures across seeds). Under `BARRIER-CKPT`, which forces parent directory sync when creating checkpoint manifest/marker files, checkpoint recovery failures drop to **0 across all 32 seeds**.
-- **Pre-Freeze Prior Discovery (`dcg-pr`):** The partial-retention prior (`dcg-pr`) was frozen before evaluation (tag `v1.0-dcg-pr-freeze`). `dcg-pr` discovers the checkpoint failure at median $k_1 = \mathbf{2.00}$ [1.00, 125.50] (mean 93.03, AUC Failures = 0.5414, AUC Bugs = 0.6739), compared to 0%-retention-first DCG median $k_1 = 215.00$ (mean 262.93), R2 median $k_1 = 323.56$ (mean 325.80), and uniform random B0 median $k_1 = 162.50$ (mean 175.35).
+- **Causal Verification:** In Pebble `db.Checkpoint("checkpoint")`, checkpoint manifest and marker pointer files (`marker.manifest.*`) are written before `dir.Sync()`. Under 50% partial retention, unsynced directory entries are dropped while marker pointers persist, causing checkpoint recovery failure (`open_error`) on 30 of 32 seeds (58 total failures across seeds). Under `BARRIER-CKPT`, which forces parent directory sync when creating checkpoint manifest/marker files, checkpoint recovery failures drop to **0 across all 32 seeds**.
+- **Pre-Freeze Prior Discovery (`dcg-pr`):** The partial-retention prior (`dcg-pr`) was frozen before evaluation (tag `v1.0-dcg-pr-freeze`). `dcg-pr` discovers the checkpoint failure at median $k_1 = \mathbf{3.00}$ [1.00, 277.50] (mean 140.03, S25 = 0.56, S100 = 0.56, AUC Failures = 0.4749, AUC Bugs = 0.6321), compared to 0%-retention-first DCG median $k_1 = 386.50$ (mean 319.20), R2 median $k_1 = 328.40$ (mean 336.53), and uniform random B0 median $k_1 = 172.00$ (mean 190.73).
 
 ### 4.5 MUT-5 Universe-Scaling Benchmark (ops ∈ {120, 300, 600, 1200})
 
@@ -246,8 +246,8 @@ Outputs: `results/scaling_mut5_per_seed.csv` and `results/scaling_mut5_summary.c
 #### Results Summary:
 - Candidate universes scale from ~338 (120 ops) to ~2,958 (1,200 ops).
 - DCG maintains constant $O(1)$ discovery cost: median $k_1 = 1.00$, mean $k_1 = 1.00$ across all 4 scales.
-- Random and heuristic baselines scale linearly with universe size: B0 mean $k_1$ scales from 25.75 to 222.38; B2 (LIFO) mean $k_1$ scales from 260.50 to 2,881.25; R2 mean $k_1$ scales from 11.62 to 83.50.
-- Average planning/ranking runtime remains sub-60ms (56.1ms) even at ~3,000 candidates.
+- Random and heuristic baselines scale linearly with universe size: B0 mean $k_1$ scales from 25.75 to 214.50; B2 (LIFO) mean $k_1$ scales from 260.50 to 2,881.00; R2 mean $k_1$ scales from 11.62 to 83.12.
+- Average planning/ranking runtime remains sub-65ms (63.0ms) even at ~3,000 candidates.
 
 ### 4.6 Multi-Shape Null-Control Verification (108 Runs, 0 False Alarms)
 
@@ -258,7 +258,7 @@ go test -v -count=1 -timeout 1200s -run TestNullControlMultiShape ./internal/exp
 ```
 
 Outputs: `results/null_control_multishape.csv`.
-Result: Exactly 0 violations, 0 open errors, 0 panics, and 0 hangs across all 108 runs (>50,000 crash states explored).
+Result: Exactly 0 violations, 0 open errors, 0 panics, and 0 hangs across all 108 runs (>50,000 crash states explored; Rule-of-Three 95% upper bound $\le 2.78\%$ per run, $\le 0.006\%$ across $>50{,}000$ candidates).
 
 ### 4.7 Pebble Subsystem Discovery Benchmark (Workloads A, B, C under MUT-0)
 
@@ -287,11 +287,11 @@ go run ./cmd/cracontest benchmark -faults MUT-0 -seeds 42,100,777 -ops 80 -inges
 ```
 
 #### Results Summary:
-- **0 lost durably-committed keys** across all 9 runs (5,424 candidate states), confirming 100% synchronous durability via `d.objProvider.Sync()` (`ingest.go:1490`) and `atomicfs.Marker.Move` (`marker.go:189`).
+- **0 lost durably-committed keys** across all 9 runs (5,415 candidate states), with no durably-committed data loss observed in these workloads.
 - **0 engine recovery panics or hangs**.
 - **Workload A (External SSTable Ingestion):** 0 lost committed keys. 40 prefix violations across seeds 42 (15) and 777 (25) reveal a cross-channel commit-order hole on direct L0 ingest: when `db.Ingest` takes the non-overlapping direct L0 shortcut (`asFlushable = false`), Pebble allocates sequence number $s_2 > s_1$ (`ingest.go:1703`) and syncs `MANIFEST` (`version_set.go:649`) without syncing the active `.log` WAL containing preceding `NoSync` writes at sequence number $s_1 < s_2$. Upon a 0%-retention crash, $s_2$ survives via `MANIFEST` while $s_1$ is lost from the unsynced `WAL`, creating a cross-channel sequence hole (whereas overlapping flushable ingest syncs the shared WAL at `commit.go:289` and preserves strict prefix order).
-- **Workload B (Live Format-Version Ratcheting):** 100% clean recovery and atomic transitions across all policies; 0 violations, 0 panics, and 4 transient unlinked-marker open errors under 50% retention (1 on seed 42, 2 on seed 100, 1 on seed 777).
-- **Workload C (Combined Lifecycle Stress):** 0 lost committed keys, 0 panics. 17 open errors occur exclusively under 50% partial retention during manifest rotation and checkpointing prior to directory sync (5 on seed 42, 8 on seed 100, 4 on seed 777).
+- **Workload B (Live Format-Version Ratcheting):** 0 violations, 0 panics, and 3 open errors under 50% retention at initial database creation cutoffs (0 on seed 42, 2 on seed 100, 1 on seed 777).
+- **Workload C (Combined Lifecycle Stress):** 0 lost committed keys, 0 panics. 13 open errors occur exclusively under 50% partial retention during manifest rotation and checkpointing prior to directory sync (4 on seed 42, 7 on seed 100, 2 on seed 777).
 
 ## 5. Acceptance Tests
 

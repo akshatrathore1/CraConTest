@@ -28,6 +28,16 @@ graph builder.
    `SyncData()`. Manifest files and directory handles use `Sync()` directly.
    The wrapper must record both to correctly capture all persistence boundaries.
 
+6. **Same-handle sync adjacency and cleaner gating.** In `internal/vfsrec/recorder.go`,
+   `appendSyncEventLocked` preserves the logical pairing of write operations and
+   sync barriers by repositioning sync events immediately following their corresponding
+   mutations on the same handle, halting at same-handle events, unlock boundaries,
+   or client operation boundaries (`OpBegin`/`OpEnd`), preventing concurrent
+   background events (such as `Close` or `EngineEvent`) from splitting `Write` and
+   `Sync`/`SyncData` pairs. During ingest workloads, `inIngestSection` serializes
+   obsolete-file cleaner sweeps to prevent asynchronous background cleaner deletions
+   from interleaving with direct L0 table ingests or WAL syncs.
+
 ## Pebble's VFS Interface (v2.1.7)
 
 ### `vfs.FS` Methods
@@ -257,19 +267,13 @@ This ensures:
 - The cost is acceptable because the underlying `vfs.NewMem()` is itself
   mutex-protected.
 
-### The Recording FS is Non-Crashable
+### Recording FS In-Memory Wrapping and Non-Crashable Execution
 
-During the RECORD phase, the wrapper sits on top of `vfs.NewMem()` (not
-`vfs.NewCrashableMem()`). The crashable filesystem is used only during the
-EXPLORE phase, when trace events are replayed into a fresh
-`vfs.NewCrashableMem()` to construct crash states. This separation is
-deliberate:
+`vfsrec.New` wraps any in-memory `vfs.FS` (`vfs.NewMem()` in recorder unit tests or `vfs.NewCrashableMem()` in CLI `record` and `benchmark`). Crucially, `CrashClone()` is never invoked on the recording filesystem during Phase 1 RECORD—crash snapshots are constructed exclusively in Phase 3 EXPLORE by replaying trace prefixes into a fresh `vfs.NewCrashableMem()`. This separation is deliberate:
 
-- `vfs.NewMem()` avoids the overhead of tracking synced vs. unsynced state
-  during recording.
+- During recording, mutations run against the active filesystem without triggering crash snapshot locks.
 - It avoids the `cloneMu` lock contention present in `NewCrashableMem()`.
-- The v2.1.7 `CrashClone` deadlock (concurrent mutations during clone) is
-  not a concern because `CrashClone` is never called on the recording FS.
+- The upstream Pebble `CrashClone` deadlock (concurrent mutations during clone) is avoided entirely because `CrashClone()` is never called on the recording filesystem during Phase 1.
 
 ## How the Trace Feeds the Dependency Graph
 

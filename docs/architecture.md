@@ -16,9 +16,11 @@ recording from analysis and testing from evaluation.
 
 ### Phase 1: RECORD (once per workload specification)
 
-A seeded workload drives Pebble through a recording VFS wrapper that captures
-every mutating filesystem call. The recording runs on `vfs.NewMem()` (not
-`NewCrashableMem()`; the crashable filesystem is only needed in Phase 3).
+A seeded workload drives Pebble through a recording VFS wrapper (`vfsrec.New`) that captures
+every mutating filesystem call. `vfsrec.New` wraps any in-memory `vfs.FS` (`vfs.NewMem()` in recorder
+unit tests or `vfs.NewCrashableMem()` in CLI `record` and `benchmark`). `CrashClone()` is never
+invoked on the recording filesystem during Phase 1 RECORD—crash snapshots are constructed
+exclusively in Phase 3 EXPLORE by replaying trace prefixes into a fresh `vfs.NewCrashableMem()`.
 
 **Inputs:**
 - A workload specification: operation mix, sizes, base seed, retention
@@ -44,6 +46,33 @@ every mutating filesystem call. The recording runs on `vfs.NewMem()` (not
   WAL and SSTable syncs through `vfs.NewSyncingFile`, which dispatches via
   `File.SyncData()`. Manifest files and directory handles use `File.Sync()`
   directly.
+- In `appendSyncEventLocked`, the recorder enforces same-handle adjacency: any
+  `Sync`, `SyncData`, or `SyncTo` is repositioned immediately adjacent to the
+  preceding `Write`/`WriteAt` on the same handle, halting at any same-handle
+  event, lock, or client operation boundary (`OpBegin`/`OpEnd`), preventing
+  concurrent background `Close` or `EngineEvent` records from splitting write-sync
+  pairs.
+- `NoSync` client mutations (`set`, `delete`, `batch`, `range_delete`) wait on `walCond`
+  (`WaitForWALWrite` in `internal/vfsrec/recorder.go:111-148`, with `NotifyDroppedWALWrite` for
+  `MUT-X6`) so `LogWriter.flushLoop` emits the operation's `.log` `Write` before `OpEnd`.
+- During ingest workloads, `inIngestSection` gates non-staging, non-marker background `Remove`
+  calls (`internal/vfsrec/recorder.go:468-475`) on `ingestCond` until a deferred `EndIngestSection()`
+  call broadcasts upon `db.Ingest` return, while `FlushBegin` (`internal/vfsrec/listener.go:102-138`)
+  executes a 500-iteration `runtime.Gosched()` loop and, when outside `inIngestSection`, waits on
+  `manifestCond` while `pendingManifestDeletions > 0` (`ManifestCreated` at `listener.go:151-158`
+  when `dbManifestCount > 2` until `ManifestDeleted` at `listener.go:159-169`) so obsolete manifest
+  cleanup from a prior manifest rotation completes before the next flush begins. All synchronization
+  barriers (`WaitForWALWrite` on `walCond`, `FlushBegin` on `manifestCond`, and `drainBackgroundWork`)
+  wait purely on condition-variable / counter predicates during normal execution and enforce a 5-second
+  fail-fast safety bound that panics loudly (`panic(...)`) if a background goroutine ever stalls,
+  ensuring traces never silently fall back to wall-clock timing. The 5-second fail-fast timers in
+  `WaitForWALWrite` and `FlushBegin` set a mutex-protected `timedOut` boolean flag prior to `Broadcast()`
+  (preventing any clock-skew lost wakeup); because `FlushBegin` runs inside Pebble's flush callback,
+  its panic propagates unrecoverably through Pebble's background flush goroutine by design. This synchronization
+  prevents asynchronous cleaner deletions of SST/WAL files from interleaving with `db.Ingest` so
+  traces are reproducible, shifting background cleaner deletions to immediately after
+  `EndIngestSection()` (under-representing mid-ingest background cleaner states and
+  over-representing post-ingest states).
 - `File.SyncTo()` is recorded but provides no durability guarantee (it returns
   `(false, nil)` in MemFS).
 - Small memtable sizes and explicit `Flush`/`Compact` calls ensure the trace
@@ -66,9 +95,15 @@ crash candidates, and rank them by strategy.
   unsynced data, which directory entries are pending, and how many persistence
   events are downstream.
 - **Durability-contract features (`ContractFeatures`)**: per-cutoff indicators
-  (`AckSyncMissing`, `DanglingTableCount`, `UnsyncedDirectoryRename`, `ContractScore`)
-  computed causally from trace prefixes (`internal/graph/features.go`) without
-  inspecting recovery outcomes.
+  (`AckSyncMissing`, `DanglingTableCount`—covering dangling tables and uncommitted manifest edits via `manifestDirtyUncommitted`—`UnsyncedDirectoryRename`,
+  `HasClosedDirtyLog`, `UnsyncedDirEntryCount`, `ContractScore`) computed causally from trace prefixes
+  (`internal/graph/features.go`) without inspecting recovery outcomes.
+- **Persistence State Equivalence (`StateKey`)**: partitions crash candidates into
+  canonical equivalence classes. `StateKey` represents a two-sided approximation:
+  finer-grained than the physical disk image on pending entries (since `keyPending`
+  records the creating `trace.Event` ID), and coarser than the consistency oracle
+  (aggregating dirty byte spans without tracking client acknowledgment history or
+  overwritten spans).
 - A **candidate universe** *U*: each candidate is a tuple
   *(event cutoff k, retention percentage, seed)*.
   - *k*: after one-based events `1..k`; zero is before the trace.
@@ -76,9 +111,17 @@ crash candidates, and rank them by strategy.
     `CrashCloneCfg.UnsyncedDataPercent`).
   - *seed*: derived from the base seed, cutoff and percentage by the
     version-one SHA-256 encoding.
+  Within a given `(seed, fault)` execution, all ranking strategies evaluate an
+  identical candidate universe. Across fault models, universe size varies because
+  `faults.FS` intercepts and drops specific sync barriers prior to trace recording.
 - **Rankings**: one ordered list of candidates per strategy.
 
-While Pebble's `MemFS.CrashClone` provides endpoint snapshots at 0% and 100%, for intermediate retention (`1..99%`), CraConTest defines its own deterministic block-and-entry partial-retention model (`deterministicPartialClone`, validated by `TestDeterministicPartialCloneStatisticalFidelity`), rather than calling Pebble's `CrashClone` (which iterates over unsorted Go maps `f.children`). In `replay.State.Clone` (`internal/replay/replay.go`), `deterministicPartialClone` takes the deterministic `0%` synced snapshot (`base0`) and deterministic `100%` unsynced snapshot (`full100`) and traverses all directory entries and 4,096-byte file blocks in strictly sorted lexicographical order (`sort.Strings`) using the candidate's derived PCG seed (`rand.NewPCG(0, seed)`). Consequently, all retention policies `0..100%` (including `50%`) are **100% bit-for-bit seed-deterministic** (`TestReplayClonePartialRetentionSeedDeterminism` and `TestExplorePartialRetentionFiveRepeatZeroFlips`). The complete tuple, not a truncated hash, identifies a candidate and outcome.
+To eliminate trace and clone nondeterminism and guarantee bit-for-bit reproducibility across all retention policies, `replay.State.Clone(percent, seed)` (`internal/replay/replay.go:89-110`) explicitly handles all three retention regimes:
+- `percent == 0`: delegates directly to `MemFS.CrashClone` with `UnsyncedDataPercent: 0` (RNG-free).
+- `percent == 100`: delegates directly to `MemFS.CrashClone` with `UnsyncedDataPercent: 100` and `rand.New(rand.NewPCG(0, seed))` (seed-invariant because every `IntN(100) < 100` check succeeds unconditionally).
+- `1 <= percent <= 99`: constructs `base0` (`UnsyncedDataPercent: 0`) and `full100` (`UnsyncedDataPercent: 100` with `rand.New(rand.NewPCG(0, 0))`), then runs `deterministicPartialClone` using `rng := rand.New(rand.NewPCG(0, seed))`, ensuring every intermediate state is bounded between `base0` and `full100` (`TestReplayEndpointEquivalenceAndBoundaryContainment`). Note that while `0%` and `100%` bound every intermediate policy `p%`, two distinct intermediate percentages `p1 < p2` are not guaranteed to be bitwise subsets at every offset because retaining an unsynced directory at `p2` that was skipped at `p1` consumes additional RNG draws for its children.
+
+In this model, `State.Clone` captures exact `fileSyncedBytes` snapshots at each file's latest `Sync`/`SyncData` (or `SyncTo` with `FullSync=true`). For intermediate retention policies (`1..99%`), for files whose directory entry is synced (`syncedSet[name] == true`), `deterministicPartialClone` reads `syncedBytes` from `base0` (`CrashClone(0)`), and consults `fileSyncedBytes` for unsynced directory entries. `deterministicPartialClone` partitions each file into 4KB blocks. Any 4KB block where the live file contents differ from the synced snapshot (`syncedBytes`) is sampled sequentially from the candidate's PCG PRNG stream (`rand.New(rand.NewPCG(0, seed))`) as directory entries are traversed in sorted lexicographical order (`sort.Strings`) and differing 4KB blocks are traversed in ascending offset order, deciding whether that block retains the unsynced live dirty bytes or reverts to the durable snapshot (`syncedBytes`). Unsynced directory entries are similarly sampled independently in sorted lexicographical order, as verified in `TestDeterministicPartialCloneStatisticalFidelity` and `TestReplayPartialCloneInPlaceOverwriteAfterSync`. Consequently, all retention policies `0..100%` (including `50%`) are **100% bit-for-bit seed-deterministic** (`TestReplayClonePartialRetentionSeedDeterminism` and `TestExplorePartialRetentionFiveRepeatZeroFlips`). The complete tuple, not a truncated hash, identifies a candidate and outcome.
 
 **Strategies** rank *U* using only trace-derived features. They cannot observe
 outcomes, history, or recovery results. The `internal/strategy` package implements
@@ -103,12 +146,11 @@ outcome table.
   Preserve open resource handles and cursor/alias behavior. Do not close
   or synchronize those handles before the snapshot.
 
-2. **Clone**: call `State.Clone(p, seed)` (`internal/replay/replay.go`) on the
-   replayed filesystem to produce the post-crash state. For endpoint policies
-   (`0%` and `100%`), it delegates directly to `MemFS.CrashClone`; for
-   intermediate retention (`1..99%`, e.g., `50%`), CraConTest executes its own
-   `deterministicPartialClone` (validated by `TestDeterministicPartialCloneStatisticalFidelity`)
-   rather than calling Pebble's `CrashClone`, ensuring 100% bit-for-bit seed-reproducible crash sampling.
+2. **Clone**: call `State.Clone(p, seed)` (`internal/replay/replay.go:89-110`) on the
+   replayed filesystem to produce the post-crash state across all three retention cases:
+   - `p == 0`: delegates to `MemFS.CrashClone` with `UnsyncedDataPercent: 0` (RNG-free).
+   - `p == 100`: delegates to `MemFS.CrashClone` with `UnsyncedDataPercent: 100` and `rand.New(rand.NewPCG(0, seed))` (seed-invariant because every `IntN(100) < 100` check succeeds unconditionally).
+   - `1 <= p <= 99`: constructs `base0` (`UnsyncedDataPercent: 0`) and `full100` (`UnsyncedDataPercent: 100` with `rand.New(rand.NewPCG(0, 0))`), then runs `deterministicPartialClone` using `rng := rand.New(rand.NewPCG(0, seed))`, ensuring every intermediate state is bounded between `base0` and `full100` (`TestReplayEndpointEquivalenceAndBoundaryContainment`). Note that while `0%` and `100%` bound every intermediate policy `p%`, two distinct intermediate percentages `p1 < p2` are not guaranteed to be bitwise subsets at every offset because retaining an unsynced directory at `p2` that was skipped at `p1` consumes additional RNG draws for its children.
 
 3. **Recover**: open Pebble on the cloned filesystem with:
    - An `Options.Logger` whose `Fatalf` panics instead of calling `os.Exit(1)`
@@ -121,12 +163,15 @@ outcome table.
    agree, dump all key-value pairs.
 
 5. **Oracle**: compare the dump against the history ledger using the prefix
-  (no-hole) rule. Legal states are whole-operation prefixes between the last
-  acknowledged synchronous mutation and the latest begun mutation at the
-  cutoff. In-flight batches are wholly present or absent. A later Sync also
-  covers earlier NoSync mutations. Compare whole states before diagnosing
-  divergence so overwrites, deletes and repeated states remain legal.
-  Emit exactly one outcome class per candidate.
+  (no-hole) rule. Legal states are whole-operation prefixes between the lower bound
+  $L$ (the state after the last client operation that completed with `Sync: true`,
+  or the initial state if no synchronous operation has completed) and the latest begun
+  mutation at the cutoff. If recovered state is older than $L$, the oracle reports
+  a `durably_committed` violation (Rule 1). Multi-key client batches must commit
+  atomically: observing an interior state where only some mutations of a batch are
+  present violates `atomic_batch` (Rule 2). A later Sync also covers earlier NoSync
+  mutations. Compare whole states before diagnosing divergence so overwrites, deletes
+  and repeated states remain legal. Emit exactly one outcome class per candidate.
 
 **Outputs:**
 - An **outcome table**: one record per candidate with outcome class, violated
