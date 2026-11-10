@@ -2,6 +2,7 @@ package exp_test
 
 import (
 	"bytes"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -345,4 +346,191 @@ func TestExplorePartialRetentionFiveRepeatZeroFlips(t *testing.T) {
 			t.Fatalf("repeat %d: detected %d outcome flips out of %d candidates", repeat, mismatches, len(universe))
 		}
 	}
+}
+
+type customCheckpointFS struct {
+	vfs.FS
+	delay             chan struct{}
+	panicOnSecondList bool
+	listCount         int
+}
+
+func (c *customCheckpointFS) List(dir string) ([]string, error) {
+	c.listCount++
+	if c.panicOnSecondList && c.listCount >= 2 {
+		panic("simulated fatal corruption in checkpoint")
+	}
+	return c.FS.List(dir)
+}
+
+func (c *customCheckpointFS) Lock(name string) (io.Closer, error) {
+	if c.delay != nil {
+		<-c.delay
+	}
+	return c.FS.Lock(name)
+}
+
+func TestInspectCheckpointRecovery_Outcomes(t *testing.T) {
+	newBaseMem := func() vfs.FS {
+		mem := vfs.NewMem()
+		_ = mem.MkdirAll("checkpoint", 0755)
+		curFile, err := mem.Create("checkpoint/CURRENT", "unspecified")
+		if err != nil {
+			t.Fatalf("Create CURRENT: %v", err)
+		}
+		_, _ = curFile.Write([]byte("MANIFEST-000001\n"))
+		_ = curFile.Close()
+		return mem
+	}
+
+	// 1. Primary failure preservation
+	t.Run("PrimaryFailurePreserved", func(t *testing.T) {
+		baseMem := newBaseMem()
+		outcome := oracle.Outcome{
+			Class:  oracle.ClassViolation,
+			Rule:   "prefix",
+			Detail: "primary db prefix violation",
+		}
+		exp.InspectCheckpointRecovery(baseMem, 1*time.Second, []string{"data"}, &outcome)
+		if outcome.Class != oracle.ClassViolation || outcome.Detail != "primary db prefix violation" {
+			t.Fatalf("expected primary outcome preserved, got %+v", outcome)
+		}
+	})
+
+	// 2. Checkpoint Open Error
+	t.Run("CheckpointOpenError", func(t *testing.T) {
+		baseMem := newBaseMem()
+		outcome := oracle.Outcome{Class: oracle.ClassValid}
+		// MANIFEST-000001 does not exist, so SafeOpen will fail with Err
+		exp.InspectCheckpointRecovery(baseMem, 1*time.Second, []string{"data"}, &outcome)
+		if outcome.Class != oracle.ClassOpenError {
+			t.Fatalf("expected ClassOpenError, got %s", outcome.Class)
+		}
+		if !strings.HasPrefix(outcome.Detail, "checkpoint: ") {
+			t.Fatalf("expected 'checkpoint: ' prefix, got %q", outcome.Detail)
+		}
+		if outcome.Rule != "" || outcome.Signature != "" {
+			t.Fatalf("expected empty rule and signature, got rule=%q sig=%q", outcome.Rule, outcome.Signature)
+		}
+	})
+
+	// 3. Checkpoint Timeout
+	t.Run("CheckpointTimeout", func(t *testing.T) {
+		baseMem := newBaseMem()
+		delayChan := make(chan struct{})
+		defer close(delayChan)
+		cFS := &customCheckpointFS{
+			FS:    baseMem,
+			delay: delayChan,
+		}
+		outcome := oracle.Outcome{Class: oracle.ClassValid}
+		exp.InspectCheckpointRecovery(cFS, 20*time.Millisecond, []string{"data"}, &outcome)
+		if outcome.Class != oracle.ClassHang {
+			t.Fatalf("expected ClassHang, got %s", outcome.Class)
+		}
+		if outcome.Detail != "checkpoint: open timeout" {
+			t.Fatalf("expected 'checkpoint: open timeout', got %q", outcome.Detail)
+		}
+		if outcome.Rule != "" || outcome.Signature != "" {
+			t.Fatalf("expected empty rule and signature, got rule=%q sig=%q", outcome.Rule, outcome.Signature)
+		}
+	})
+
+	// 4. Checkpoint Panic
+	t.Run("CheckpointPanic", func(t *testing.T) {
+		baseMem := newBaseMem()
+		cFS := &customCheckpointFS{
+			FS:                baseMem,
+			panicOnSecondList: true,
+		}
+		outcome := oracle.Outcome{Class: oracle.ClassValid}
+		exp.InspectCheckpointRecovery(cFS, 1*time.Second, []string{"data"}, &outcome)
+		if outcome.Class != oracle.ClassPanic {
+			t.Fatalf("expected ClassPanic, got %s, detail=%q", outcome.Class, outcome.Detail)
+		}
+		if !strings.HasPrefix(outcome.Detail, "checkpoint: ") || !strings.Contains(outcome.Detail, "simulated fatal corruption in checkpoint") {
+			t.Fatalf("expected checkpoint panic detail, got %q", outcome.Detail)
+		}
+		if outcome.Rule != "" || outcome.Signature != "" {
+			t.Fatalf("expected empty rule and signature, got rule=%q sig=%q", outcome.Rule, outcome.Signature)
+		}
+	})
+
+	// 5. Checkpoint Clean Recovery
+	t.Run("CheckpointClean", func(t *testing.T) {
+		realFS := vfs.NewMem()
+		db, err := pebble.Open("checkpoint", &pebble.Options{FS: realFS})
+		if err != nil {
+			t.Fatalf("pebble.Open: %v", err)
+		}
+		if err := db.Set([]byte("ck1"), []byte("cv1"), pebble.Sync); err != nil {
+			t.Fatalf("db.Set: %v", err)
+		}
+		if err := db.Close(); err != nil {
+			t.Fatalf("db.Close: %v", err)
+		}
+
+		outcome := oracle.Outcome{Class: oracle.ClassValid}
+		exp.InspectCheckpointRecovery(realFS, 2*time.Second, []string{"data"}, &outcome)
+		if outcome.Class != oracle.ClassValid {
+			t.Fatalf("expected ClassValid, got %s (detail: %s)", outcome.Class, outcome.Detail)
+		}
+	})
+
+	// 6. Checkpoint Integrity Failure
+	t.Run("CheckpointIntegrityFailure", func(t *testing.T) {
+		realFS := vfs.NewMem()
+		db, err := pebble.Open("checkpoint", &pebble.Options{FS: realFS})
+		if err != nil {
+			t.Fatalf("pebble.Open: %v", err)
+		}
+		if err := db.Set([]byte("ck1"), []byte("cv1"), pebble.Sync); err != nil {
+			t.Fatalf("db.Set: %v", err)
+		}
+		if err := db.Flush(); err != nil {
+			t.Fatalf("db.Flush: %v", err)
+		}
+		if err := db.Close(); err != nil {
+			t.Fatalf("db.Close: %v", err)
+		}
+
+		// Find the SSTable in checkpoint and corrupt its body
+		entries, err := realFS.List("checkpoint")
+		if err != nil {
+			t.Fatalf("List checkpoint: %v", err)
+		}
+		sstFound := false
+		for _, e := range entries {
+			if strings.HasSuffix(e, ".sst") {
+				sstFound = true
+				fPath := "checkpoint/" + e
+				f, err := realFS.OpenReadWrite(fPath, "unspecified")
+				if err != nil {
+					t.Fatalf("OpenReadWrite %s: %v", fPath, err)
+				}
+				_, _ = f.WriteAt([]byte("corrupted data junk bytes"), 0)
+				_ = f.Close()
+				break
+			}
+		}
+		if !sstFound {
+			t.Fatal("no .sst file found in checkpoint")
+		}
+
+		outcome := oracle.Outcome{Class: oracle.ClassValid}
+		exp.InspectCheckpointRecovery(realFS, 2*time.Second, []string{"pebble-sst"}, &outcome)
+		if outcome.Class != oracle.ClassViolation {
+			t.Fatalf("expected ClassViolation, got %s (detail: %s)", outcome.Class, outcome.Detail)
+		}
+		if outcome.Rule != "structural" {
+			t.Fatalf("expected rule 'structural', got %q", outcome.Rule)
+		}
+		if !strings.HasPrefix(outcome.Detail, "checkpoint integrity: ") {
+			t.Fatalf("expected 'checkpoint integrity: ' prefix, got %q", outcome.Detail)
+		}
+		expectedSig := oracle.FormatSignature("structural", "checkpoint", []string{"pebble-sst"})
+		if outcome.Signature != expectedSig {
+			t.Fatalf("expected signature %q, got %q", expectedSig, outcome.Signature)
+		}
+	})
 }

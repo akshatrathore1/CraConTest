@@ -526,7 +526,8 @@ func (s *State) applyEvent(event trace.Event) error {
 			return fmt.Errorf("replay: syncTo fullSync mismatch on event %d: trace=%v, replay=%v",
 				event.ID, event.FullSync, fullSync)
 		}
-		if p, ok := s.handlePath[event.Handle]; ok {
+		if event.FullSync {
+			p := s.handlePath[event.Handle]
 			s.snapshotSyncedBytes(p, event.Size)
 		}
 		return nil

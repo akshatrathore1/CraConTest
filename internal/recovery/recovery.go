@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"iter"
+	"strings"
 	"time"
 
 	"github.com/cockroachdb/pebble/v2"
@@ -46,9 +47,13 @@ type OpenResult struct {
 	Timeout bool
 }
 
-// SafeOpen attempts to open a Pebble database on the given filesystem with
-// panic recovery and timeout protection. The returned OpenResult describes
-// what happened.
+// SafeOpen opens a Pebble database at dir on fs with a timeout and panic recovery.
+// Any logger fatals are intercepted by PanicLogger and converted to panics,
+// which SafeOpen recovers and reports in OpenResult.Panic.
+// Because pebble.Open does not accept a context.Context, a call blocked inside an
+// uncooperative VFS operation cannot be preempted by the Go runtime on timeout;
+// the background drain goroutine acts as a bounded reaper (at most one per timed-out
+// candidate) that closes the DB if pebble.Open eventually unblocks.
 func SafeOpen(fs vfs.FS, dir string, timeout time.Duration) OpenResult {
 	type result struct {
 		db  *pebble.DB
@@ -80,7 +85,7 @@ func SafeOpen(fs vfs.FS, dir string, timeout time.Duration) OpenResult {
 		if r.err != nil {
 			// Check if it was a panic-converted error.
 			errStr := r.err.Error()
-			if len(errStr) > 7 && errStr[:7] == "panic: " {
+			if strings.HasPrefix(errStr, "panic: ") {
 				return OpenResult{Panic: errStr[7:]}
 			}
 			return OpenResult{Err: r.err}
@@ -189,14 +194,23 @@ func AllEntries(db *pebble.DB) iter.Seq2[string, string] {
 	return func(yield func(string, string) bool) {
 		it, err := db.NewIter(nil)
 		if err != nil {
-			return
+			panic(fmt.Sprintf("recovery: AllEntries new iterator: %v", err))
 		}
 		defer it.Close()
 		for valid := it.First(); valid; valid = it.Next() {
-			val, _ := it.ValueAndErr()
+			val, err := it.ValueAndErr()
+			if err != nil {
+				panic(fmt.Sprintf("recovery: AllEntries value error: %v", err))
+			}
 			if !yield(string(it.Key()), string(val)) {
+				if err := it.Error(); err != nil {
+					panic(fmt.Sprintf("recovery: AllEntries iterator error: %v", err))
+				}
 				return
 			}
+		}
+		if err := it.Error(); err != nil {
+			panic(fmt.Sprintf("recovery: AllEntries iterator error: %v", err))
 		}
 	}
 }

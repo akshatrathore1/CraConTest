@@ -84,7 +84,7 @@ func features(view *graph.View, universe []candidate.Candidate) ([]graph.Feature
 	return result, true
 }
 
-type groupKey struct {
+type statePercentKey struct {
 	state   string
 	percent int
 }
@@ -216,11 +216,11 @@ func (representative) Rank(view *graph.View, universe []candidate.Candidate) []c
 	if !ok {
 		return nil
 	}
-	seen := make(map[groupKey]bool)
+	seen := make(map[statePercentKey]bool)
 	first := make([]candidate.Candidate, 0, len(ordered))
 	var rest []candidate.Candidate
 	for index, item := range ordered {
-		key := groupKey{labels[index].StateKey, item.Percent}
+		key := statePercentKey{labels[index].StateKey, item.Percent}
 		if seen[key] {
 			rest = append(rest, item)
 			continue
@@ -323,11 +323,11 @@ func (strategy combined) Rank(view *graph.View, universe []candidate.Candidate) 
 		queue = append(queue, scored{position: index, score: base[index] + w.Delta, novel: true})
 	}
 	heap.Init(&queue)
-	seen := make(map[groupKey]bool)
+	seen := make(map[statePercentKey]bool)
 	result := make([]candidate.Candidate, 0, len(ordered))
 	for queue.Len() > 0 {
 		top := heap.Pop(&queue).(scored)
-		key := groupKey{labels[top.position].StateKey, ordered[top.position].Percent}
+		key := statePercentKey{labels[top.position].StateKey, ordered[top.position].Percent}
 		if top.novel && seen[key] {
 			heap.Push(&queue, scored{position: top.position, score: base[top.position], novel: false})
 			continue
@@ -372,11 +372,11 @@ func Explain(view *graph.View, universe []candidate.Candidate, w Weights) ([]Sco
 	}
 	heap.Init(&queue)
 
-	seen := make(map[groupKey]bool)
+	seen := make(map[statePercentKey]bool)
 	records := make([]ScoreRecord, 0, len(ordered))
 	for queue.Len() > 0 {
 		top := heap.Pop(&queue).(scored)
-		key := groupKey{labels[top.position].StateKey, ordered[top.position].Percent}
+		key := statePercentKey{labels[top.position].StateKey, ordered[top.position].Percent}
 		if top.novel && seen[key] {
 			heap.Push(&queue, scored{position: top.position, score: base[top.position], novel: false})
 			continue

@@ -20,6 +20,9 @@ jobs:
           go-version-file: 'go.mod'
           check-latest: true
 
+      - name: Verify Dependencies
+        run: go mod verify
+
       - name: Format
         run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
 

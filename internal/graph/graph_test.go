@@ -97,6 +97,35 @@ func TestStateKeyTracksSyncs(test *testing.T) {
 	}
 }
 
+func TestStateKeyIgnoresOpBeginAndOpEnd(t *testing.T) {
+	// 1. In walTrace(), event 5 is KindOpBegin, event 6 is KindWrite, event 7 is KindSyncData, and event 8 is KindOpEnd.
+	events := walTrace()
+	view := build(t, events)
+
+	// Across KindOpBegin (cuts 4 -> 5): StateKey must be unchanged.
+	if view.Cuts[4].StateKey != view.Cuts[5].StateKey {
+		t.Fatalf("StateKey changed across KindOpBegin: cut 4 = %s, cut 5 = %s", view.Cuts[4].StateKey, view.Cuts[5].StateKey)
+	}
+
+	// Across KindOpEnd (cuts 7 -> 8): StateKey must be unchanged.
+	if view.Cuts[7].StateKey != view.Cuts[8].StateKey {
+		t.Fatalf("StateKey changed across KindOpEnd: cut 7 = %s, cut 8 = %s", view.Cuts[7].StateKey, view.Cuts[8].StateKey)
+	}
+
+	// 2. Unsynced write followed immediately by KindOpEnd:
+	// Verify that cutoffs at KindWrite and KindOpEnd have the exact same StateKey.
+	shortTrace := []trace.Event{
+		{ID: 1, Kind: trace.KindCreate, File: "db/unsynced.log", Handle: 1, Cat: "pebble-wal"},
+		{ID: 2, Kind: trace.KindOpBegin, Op: 1, OpKind: "set"},
+		{ID: 3, Kind: trace.KindWrite, File: "db/unsynced.log", Handle: 1, Data: []byte("dirty_bytes"), Len: 11},
+		{ID: 4, Kind: trace.KindOpEnd, Op: 1, OpKind: "set"},
+	}
+	shortView := build(t, shortTrace)
+	if shortView.Cuts[3].StateKey != shortView.Cuts[4].StateKey {
+		t.Fatalf("unsynced write StateKey (%s) != post-OpEnd StateKey (%s)", shortView.Cuts[3].StateKey, shortView.Cuts[4].StateKey)
+	}
+}
+
 func TestBoundaryLabels(test *testing.T) {
 	view := build(test, walTrace())
 	for cut, want := range map[uint64]bool{3: true, 6: true, 10: true, 14: true, 15: true, 13: false, 7: false} {

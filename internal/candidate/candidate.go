@@ -403,7 +403,7 @@ func StateHash(events []trace.Event, cut uint64, percent int) string {
 	return states[cut].Key(percent)
 }
 
-type groupKey struct {
+type collapseKey struct {
 	event   uint64
 	percent int
 }
@@ -411,10 +411,10 @@ type groupKey struct {
 func collapseWithoutTrace(candidates []Candidate) []Candidate {
 	ordered := append([]Candidate(nil), candidates...)
 	Sort(ordered)
-	seen := make(map[groupKey]bool, len(ordered))
+	seen := make(map[collapseKey]bool, len(ordered))
 	result := make([]Candidate, 0, len(ordered))
 	for _, c := range ordered {
-		k := groupKey{event: c.Event, percent: c.Percent}
+		k := collapseKey{event: c.Event, percent: c.Percent}
 		if seen[k] {
 			continue
 		}

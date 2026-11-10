@@ -15,6 +15,7 @@ type recFile struct {
 	handle uint64
 	label  string
 	isDir  bool
+	cat    vfs.DiskWriteCategory
 	closed bool
 	cursor int64
 }
@@ -103,6 +104,12 @@ func (f *recFile) Write(p []byte) (int, error) {
 		event.Err = err.Error()
 	}
 	f.fs.appendEventLocked(event)
+	if isDBWALPath(f.label) && (f.cat == "pebble-wal" || f.cat == vfs.WriteCategoryUnspecified || f.cat == "") {
+		f.fs.walWrites++
+		if f.fs.walCond != nil {
+			f.fs.walCond.Broadcast()
+		}
+	}
 	return n, err
 }
 
@@ -153,7 +160,11 @@ func (f *recFile) Sync() error {
 	if err != nil {
 		event.Err = err.Error()
 	}
-	f.fs.appendEventLocked(event)
+	if !f.isDir && event.Err == "" {
+		f.fs.appendSyncEventLocked(event)
+	} else {
+		f.fs.appendEventLocked(event)
+	}
 	return err
 }
 
@@ -175,7 +186,11 @@ func (f *recFile) SyncData() error {
 	if err != nil {
 		event.Err = err.Error()
 	}
-	f.fs.appendEventLocked(event)
+	if !f.isDir && event.Err == "" {
+		f.fs.appendSyncEventLocked(event)
+	} else {
+		f.fs.appendEventLocked(event)
+	}
 	return err
 }
 
@@ -199,26 +214,55 @@ func (f *recFile) SyncTo(length int64) (bool, error) {
 	if err != nil {
 		event.Err = err.Error()
 	}
-	f.fs.appendEventLocked(event)
+	if !f.isDir && event.Err == "" {
+		f.fs.appendSyncEventLocked(event)
+	} else {
+		f.fs.appendEventLocked(event)
+	}
 	return fullSync, err
 }
 
 func (f *recFile) ReadAt(p []byte, off int64) (int, error) {
+	f.fs.mu.Lock()
+	defer f.fs.mu.Unlock()
+	if f.closed {
+		return 0, os.ErrClosed
+	}
 	return f.inner.ReadAt(p, off)
 }
 
 func (f *recFile) Stat() (vfs.FileInfo, error) {
+	f.fs.mu.Lock()
+	defer f.fs.mu.Unlock()
+	if f.closed {
+		return nil, os.ErrClosed
+	}
 	return f.inner.Stat()
 }
 
 func (f *recFile) Preallocate(offset, length int64) error {
+	f.fs.mu.Lock()
+	defer f.fs.mu.Unlock()
+	if f.closed {
+		return os.ErrClosed
+	}
 	return f.inner.Preallocate(offset, length)
 }
 
 func (f *recFile) Prefetch(offset, length int64) error {
+	f.fs.mu.Lock()
+	defer f.fs.mu.Unlock()
+	if f.closed {
+		return os.ErrClosed
+	}
 	return f.inner.Prefetch(offset, length)
 }
 
 func (f *recFile) Fd() uintptr {
+	f.fs.mu.Lock()
+	defer f.fs.mu.Unlock()
+	if f.closed || f.inner == nil {
+		return 0
+	}
 	return f.inner.Fd()
 }

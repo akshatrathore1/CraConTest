@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"runtime"
+	"time"
 
 	"github.com/akshatrathore1/CraConTest/internal/history"
 	"github.com/akshatrathore1/CraConTest/internal/trace"
@@ -26,6 +27,26 @@ const (
 	PresetOverwriteHeavy = "overwrite-heavy"
 	PresetDeleteHeavy    = "delete-heavy"
 )
+
+// Operation kinds.
+const (
+	OpSet         = "set"
+	OpGet         = "get"
+	OpDelete      = "delete"
+	OpBatch       = "batch"
+	OpRangeDelete = "range_delete"
+	OpIterate     = "iterate"
+	OpFlush       = "flush"
+	OpCompact     = "compact"
+	OpCheckpoint  = "checkpoint"
+	OpIngest      = "ingest"
+	OpRatchet     = "ratchet"
+)
+
+type walWriteSyncer interface {
+	WALWriteCount() uint64
+	WaitForWALWrite(target uint64)
+}
 
 // Config specifies the configuration for deterministic workload execution.
 type Config struct {
@@ -503,9 +524,41 @@ func Plan(cfg Config) []PlanOperation {
 	return plan
 }
 
-type walWriteSynchronizer interface {
-	WALWriteCount() uint64
-	WaitForWALWrite(target uint64)
+func drainBackgroundWork(db *pebble.DB) {
+	if db == nil {
+		return
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	waitClean := func() {
+		rem := time.Until(deadline)
+		if rem <= 0 {
+			panic("workload: drainBackgroundWork exceeded 5s deadline")
+		}
+		done := make(chan struct{})
+		go func() {
+			db.TestOnlyWaitForCleaning()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(rem):
+			panic("workload: drainBackgroundWork exceeded 5s deadline")
+		}
+	}
+	for db.Metrics().MemTable.Count > 1 || db.Metrics().Flush.NumInProgress > 0 || db.Metrics().Compact.NumInProgress > 0 {
+		if time.Now().After(deadline) {
+			panic("workload: drainBackgroundWork exceeded 5s deadline")
+		}
+		runtime.Gosched()
+	}
+	waitClean()
+	for db.Metrics().MemTable.Count > 1 || db.Metrics().Flush.NumInProgress > 0 || db.Metrics().Compact.NumInProgress > 0 {
+		if time.Now().After(deadline) {
+			panic("workload: drainBackgroundWork exceeded 5s deadline")
+		}
+		runtime.Gosched()
+	}
+	waitClean()
 }
 
 type ingestSectionGate interface {
@@ -532,13 +585,6 @@ func Run(db *pebble.DB, marker Marker, cfg Config) ([]history.Entry, error) {
 		return nil, errors.New("workload: ingest requires a valid VFS")
 	}
 
-	var walSync walWriteSynchronizer
-	if ws, ok := marker.(walWriteSynchronizer); ok {
-		walSync = ws
-	} else if ws, ok := targetFS.(walWriteSynchronizer); ok {
-		walSync = ws
-	}
-
 	var ingestGate ingestSectionGate
 	if ig, ok := marker.(ingestSectionGate); ok {
 		ingestGate = ig
@@ -546,26 +592,26 @@ func Run(db *pebble.DB, marker Marker, cfg Config) ([]history.Entry, error) {
 		ingestGate = ig
 	}
 
-	if db != nil {
-		for db.Metrics().MemTable.Count > 1 || db.Metrics().Flush.NumInProgress > 0 {
-			runtime.Gosched()
-		}
-		db.TestOnlyWaitForCleaning()
-		for i := 0; i < 50; i++ {
-			runtime.Gosched()
-		}
+	drainBackgroundWork(db)
+
+	var walSync walWriteSyncer
+	if ws, ok := cfg.FS.(walWriteSyncer); ok {
+		walSync = ws
+	} else if ws, ok := targetFS.(walWriteSyncer); ok {
+		walSync = ws
+	} else if ws, ok := marker.(walWriteSyncer); ok {
+		walSync = ws
 	}
 
 	var eventTracker uint64
 
 	for _, op := range plan {
+		eventTracker++
+		beginEv := eventTracker
 		var prevWAL uint64
 		if walSync != nil {
 			prevWAL = walSync.WALWriteCount()
 		}
-
-		eventTracker++
-		beginEv := eventTracker
 		if marker != nil {
 			marker.Begin(op.Op, op.Kind)
 		}
@@ -579,9 +625,6 @@ func Run(db *pebble.DB, marker Marker, cfg Config) ([]history.Entry, error) {
 		switch op.Kind {
 		case "set":
 			opErr = db.Set(op.Key, op.Value, wo)
-			if opErr == nil && !op.Sync && walSync != nil {
-				walSync.WaitForWALWrite(prevWAL + 1)
-			}
 
 		case "get":
 			v, closer, err := db.Get(op.Key)
@@ -594,9 +637,6 @@ func Run(db *pebble.DB, marker Marker, cfg Config) ([]history.Entry, error) {
 
 		case "delete":
 			opErr = db.Delete(op.Key, wo)
-			if opErr == nil && !op.Sync && walSync != nil {
-				walSync.WaitForWALWrite(prevWAL + 1)
-			}
 
 		case "batch":
 			v1, closer1, err1 := db.Get(op.Key)
@@ -618,15 +658,9 @@ func Run(db *pebble.DB, marker Marker, cfg Config) ([]history.Entry, error) {
 				opErr = b.Commit(wo)
 			}
 			_ = b.Close()
-			if opErr == nil && !op.Sync && walSync != nil {
-				walSync.WaitForWALWrite(prevWAL + 1)
-			}
 
 		case "range_delete":
 			opErr = db.DeleteRange(op.Key, op.EndKey, wo)
-			if opErr == nil && !op.Sync && walSync != nil {
-				walSync.WaitForWALWrite(prevWAL + 1)
-			}
 
 		case "iterate":
 			it, err := db.NewIter(nil)
@@ -662,11 +696,15 @@ func Run(db *pebble.DB, marker Marker, cfg Config) ([]history.Entry, error) {
 			opErr = db.RatchetFormatMajorVersion(pebble.FormatNewest)
 		}
 
-		if db != nil && opErr == nil {
-			for db.Metrics().MemTable.Count > 1 || db.Metrics().Flush.NumInProgress > 0 {
-				runtime.Gosched()
+		if walSync != nil && opErr == nil && op.Sync {
+			switch op.Kind {
+			case OpSet, OpDelete, OpBatch, OpRangeDelete:
+				walSync.WaitForWALWrite(prevWAL + 1)
 			}
-			db.TestOnlyWaitForCleaning()
+		}
+
+		if opErr == nil {
+			drainBackgroundWork(db)
 		}
 
 		eventTracker++
@@ -813,18 +851,15 @@ func runIngest(db *pebble.DB, targetFS vfs.FS, ingestGate ingestSectionGate, op 
 		}
 	}
 
-	if ingestGate != nil {
-		ingestGate.BeginIngestSection()
-	}
-	err := db.Ingest(context.Background(), paths)
-	if ingestGate != nil {
-		ingestGate.EndIngestSection()
-	}
-	if err == nil && db != nil {
-		for db.Metrics().MemTable.Count > 1 || db.Metrics().Flush.NumInProgress > 0 {
-			runtime.Gosched()
+	err := func() error {
+		if ingestGate != nil {
+			ingestGate.BeginIngestSection()
+			defer ingestGate.EndIngestSection()
 		}
-		db.TestOnlyWaitForCleaning()
+		return db.Ingest(context.Background(), paths)
+	}()
+	if err == nil {
+		drainBackgroundWork(db)
 	}
 	return err
 }

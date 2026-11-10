@@ -292,18 +292,164 @@ func Check(ctx Context) Outcome {
 	}
 
 	// Rule 3: prefix (all other content divergence).
-	// Identify earliest divergent mutation kind when comparing recovered against S_L.
-	divergentOpKind := "unknown"
-	sl := states[lower]
+	// Overwrite-aware divergence detection: identify the earliest operation i whose
+	// mutations are absent/divergent in recovered (and not overwritten by a later
+	// surviving operation) while a subsequent operation j > i is present.
+	rawKeyTouchedAfter := func(fromIdx int, key string) bool {
+		for k := fromIdx + 1; k < len(stateMeta); k++ {
+			entryK := ctx.History[stateMeta[k].entryIndex]
+			for _, mk := range entryK.Mutations {
+				if mk.Kind == "range_delete" {
+					if key >= string(mk.Key) && key < string(mk.End) {
+						return true
+					}
+				} else if string(mk.Key) == key {
+					return true
+				}
+			}
+		}
+		return false
+	}
 
-	// Find the earliest entry in states that diverges from recovered.
-	for i := 1; i <= lower && i < len(stateMeta); i++ {
-		si := states[i]
-		if !stateEqual(si, recovered) {
-			divergentOpKind = stateMeta[i].opKind
-			break
+	opSatisfiedModuloLater := func(idx int) bool {
+		entry := ctx.History[stateMeta[idx].entryIndex]
+		sIdx := states[idx]
+		for _, m := range entry.Mutations {
+			if m.Kind == "range_delete" {
+				startKey := string(m.Key)
+				endKey := string(m.End)
+				for rk := range recovered {
+					if rk >= startKey && rk < endKey && !rawKeyTouchedAfter(idx, rk) {
+						return false
+					}
+				}
+			} else {
+				k := string(m.Key)
+				if recovered[k] != sIdx[k] && !rawKeyTouchedAfter(idx, k) {
+					return false
+				}
+			}
+		}
+		return true
+	}
+
+	keyOverwrittenToRecoveredAfter := func(fromIdx int, key string) bool {
+		sBefore := states[fromIdx-1]
+		for k := fromIdx + 1; k < len(stateMeta); k++ {
+			entryK := ctx.History[stateMeta[k].entryIndex]
+			touched := false
+			for _, mk := range entryK.Mutations {
+				if mk.Kind == "range_delete" {
+					if key >= string(mk.Key) && key < string(mk.End) {
+						touched = true
+						break
+					}
+				} else if string(mk.Key) == key {
+					touched = true
+					break
+				}
+			}
+			if !touched || states[k][key] != recovered[key] {
+				continue
+			}
+			if !opSatisfiedModuloLater(k) {
+				continue
+			}
+			// If k sets key to the exact value it already had before fromIdx,
+			// require k to have at least one witness key in recovered that differs from sBefore.
+			if recovered[key] == sBefore[key] {
+				hasWitness := false
+				for _, mk := range entryK.Mutations {
+					if mk.Kind != "range_delete" {
+						wk := string(mk.Key)
+						if recovered[wk] == states[k][wk] && recovered[wk] != sBefore[wk] {
+							hasWitness = true
+							break
+						}
+					}
+				}
+				if !hasWitness {
+					continue
+				}
+			}
+			return true
+		}
+		return false
+	}
+
+	opDivergesInRecovered := func(idx int) bool {
+		entry := ctx.History[stateMeta[idx].entryIndex]
+		sIdx := states[idx]
+		for _, m := range entry.Mutations {
+			if m.Kind == "range_delete" {
+				startKey := string(m.Key)
+				endKey := string(m.End)
+				for rk := range recovered {
+					if rk >= startKey && rk < endKey && !keyOverwrittenToRecoveredAfter(idx, rk) {
+						return true
+					}
+				}
+			} else {
+				k := string(m.Key)
+				if recovered[k] != sIdx[k] && !keyOverwrittenToRecoveredAfter(idx, k) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+
+	opPresentInRecovered := func(idx int) bool {
+		entry := ctx.History[stateMeta[idx].entryIndex]
+		if len(entry.Mutations) == 0 {
+			return false
+		}
+		sPrev := states[idx-1]
+		sIdx := states[idx]
+		if opDivergesInRecovered(idx) {
+			return false
+		}
+		for _, m := range entry.Mutations {
+			if m.Kind == "range_delete" {
+				startKey := string(m.Key)
+				endKey := string(m.End)
+				for pk := range sPrev {
+					if pk >= startKey && pk < endKey && recovered[pk] == "" {
+						return true
+					}
+				}
+			} else if m.Kind == "set" {
+				k := string(m.Key)
+				if val, ok := recovered[k]; ok && val == sIdx[k] {
+					return true
+				}
+			} else {
+				k := string(m.Key)
+				if _, ok := recovered[k]; !ok && sPrev[k] != "" {
+					return true
+				}
+			}
+		}
+		return false
+	}
+
+	divergentOpKind := "unknown"
+	for i := 1; i < len(stateMeta); i++ {
+		if opDivergesInRecovered(i) {
+			laterPresent := false
+			for j := i + 1; j < len(stateMeta); j++ {
+				if opPresentInRecovered(j) {
+					laterPresent = true
+					break
+				}
+			}
+			if laterPresent {
+				divergentOpKind = stateMeta[i].opKind
+				break
+			}
 		}
 	}
+
 	if divergentOpKind == "unknown" && lower < len(states)-1 {
 		divergentOpKind = stateMeta[lower+1].opKind
 	}
@@ -311,7 +457,6 @@ func Check(ctx Context) Outcome {
 		divergentOpKind = ctx.History[0].Kind
 	}
 
-	_ = sl // used in divergence analysis
 	return Outcome{
 		Candidate: cand,
 		Class:     ClassViolation,

@@ -18,6 +18,7 @@ import (
 	"github.com/akshatrathore1/CraConTest/internal/recovery"
 	"github.com/akshatrathore1/CraConTest/internal/replay"
 	"github.com/akshatrathore1/CraConTest/internal/trace"
+	"github.com/cockroachdb/pebble/v2/vfs"
 )
 
 // JournalStage represents the execution lifecycle stage in the journal.
@@ -376,29 +377,7 @@ func RunExplore(cfg RunnerConfig) (*ExploreResult, error) {
 		stageTimings.Oracle = time.Since(startOracle)
 
 		// Check checkpoint directory if it exists and has a manifest pointer visible
-		ckptEntries, ckptErr := clonedFS.List("checkpoint")
-		if ckptErr == nil && len(ckptEntries) > 0 {
-			hasPointer := false
-			for _, e := range ckptEntries {
-				if strings.Contains(e, "marker.manifest") || e == "CURRENT" {
-					hasPointer = true
-					break
-				}
-			}
-			if hasPointer {
-				ckptRes := recovery.SafeOpen(clonedFS, "checkpoint", timeout)
-				if ckptRes.Err != nil {
-					// Checkpoint dir recovery failed — classify as open error
-					terminalOutcome.Class = oracle.ClassOpenError
-					terminalOutcome.Detail = fmt.Sprintf("checkpoint recovery: %v", ckptRes.Err)
-				} else {
-					if ckptRes.DB != nil {
-						_ = recovery.CheckIntegrity(ckptRes.DB)
-						_ = ckptRes.DB.Close()
-					}
-				}
-			}
-		}
+		InspectCheckpointRecovery(clonedFS, timeout, cutCategories, &terminalOutcome)
 
 		if err := finishCandidate(jw, cand, &terminalOutcome, &stageTimings, candStart, &outcomes, timingsMap, &summary); err != nil {
 			return nil, fmt.Errorf("runner write journal: %w", err)
@@ -458,5 +437,60 @@ func updateSummary(summary *RunSummary, class oracle.Class) {
 		summary.Hangs++
 	case oracle.ClassOracleError:
 		summary.OracleErrors++
+	}
+}
+
+// InspectCheckpointRecovery checks the secondary "checkpoint" database if present and updates terminalOutcome.
+func InspectCheckpointRecovery(clonedFS vfs.FS, timeout time.Duration, cutCategories []string, terminalOutcome *oracle.Outcome) {
+	if terminalOutcome.Class != oracle.ClassValid {
+		return
+	}
+	ckptEntries, ckptErr := clonedFS.List("checkpoint")
+	if ckptErr != nil || len(ckptEntries) == 0 {
+		return
+	}
+	hasPointer := false
+	for _, e := range ckptEntries {
+		if strings.Contains(e, "marker.manifest") || e == "CURRENT" {
+			hasPointer = true
+			break
+		}
+	}
+	if !hasPointer {
+		return
+	}
+	ckptRes := recovery.SafeOpen(clonedFS, "checkpoint", timeout)
+	if ckptRes.Timeout {
+		terminalOutcome.Class = oracle.ClassHang
+		terminalOutcome.Detail = "checkpoint: open timeout"
+		terminalOutcome.Rule = ""
+		terminalOutcome.Signature = ""
+	} else if ckptRes.Panic != "" {
+		terminalOutcome.Class = oracle.ClassPanic
+		terminalOutcome.Detail = "checkpoint: " + ckptRes.Panic
+		terminalOutcome.Rule = ""
+		terminalOutcome.Signature = ""
+	} else if ckptRes.Err != nil {
+		terminalOutcome.Class = oracle.ClassOpenError
+		terminalOutcome.Detail = "checkpoint: " + ckptRes.Err.Error()
+		terminalOutcome.Rule = ""
+		terminalOutcome.Signature = ""
+	} else if ckptRes.DB != nil {
+		var integrityErr error
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					integrityErr = fmt.Errorf("%v", r)
+				}
+			}()
+			integrityErr = recovery.CheckIntegrity(ckptRes.DB)
+		}()
+		if integrityErr != nil {
+			terminalOutcome.Class = oracle.ClassViolation
+			terminalOutcome.Rule = "structural"
+			terminalOutcome.Detail = "checkpoint integrity: " + integrityErr.Error()
+			terminalOutcome.Signature = oracle.FormatSignature("structural", "checkpoint", cutCategories)
+		}
+		_ = ckptRes.DB.Close()
 	}
 }

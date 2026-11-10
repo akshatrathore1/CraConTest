@@ -228,7 +228,7 @@ func (strategy rhgStrategy) rankDetailed(view *graph.View, universe []candidate.
 	heap.Init(&queue)
 
 	// Step 3: Lazy re-scoring heap ranking of 0% representatives
-	seen := make(map[groupKey]bool)
+	seen := make(map[statePercentKey]bool)
 	rankedReps0 := make([]candidate.Candidate, 0, len(repList0))
 	repScores := make(map[candidate.Candidate]float64, len(reps))
 	repNovelty := make(map[candidate.Candidate]float64, len(reps))
@@ -236,7 +236,7 @@ func (strategy rhgStrategy) rankDetailed(view *graph.View, universe []candidate.
 	for queue.Len() > 0 {
 		top := heap.Pop(&queue).(scored)
 		cand := repList0[top.position]
-		key := groupKey{state: repFeats0[top.position].StateKey, percent: cand.Percent}
+		key := statePercentKey{state: repFeats0[top.position].StateKey, percent: cand.Percent}
 
 		if top.novel && seen[key] {
 			heap.Push(&queue, scored{position: top.position, score: baseScores[top.position], novel: false})

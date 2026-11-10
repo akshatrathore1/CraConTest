@@ -23,10 +23,12 @@ type FS struct {
 	nextHandle               uint64
 	events                   []trace.Event
 	hook                     func(id uint64)
-	walWrites                uint64
-	walCond                  *sync.Cond
+	waitTimeout              time.Duration
 	inIngestSection          bool
 	ingestCond               *sync.Cond
+	walWrites                uint64
+	walCond                  *sync.Cond
+	dbManifestCount          int
 	pendingManifestDeletions int
 	manifestCond             *sync.Cond
 }
@@ -42,9 +44,107 @@ var (
 
 // New constructs a recording filesystem wrapper around inner.
 func New(inner vfs.FS) *FS {
-	return &FS{
+	fs := &FS{
 		inner: inner,
 	}
+	fs.ingestCond = sync.NewCond(&fs.mu)
+	fs.walCond = sync.NewCond(&fs.mu)
+	fs.manifestCond = sync.NewCond(&fs.mu)
+	return fs
+}
+
+// isPrimaryDBDir reports whether path resides in the root directory ("") or a
+// primary database directory ("db", "db_*", or "testdb"), excluding secondary
+// or staging directories such as "checkpoint/", "ingest_staging/", or unrelated folders.
+func isPrimaryDBDir(path string) bool {
+	slash := strings.IndexByte(path, '/')
+	if slash < 0 {
+		return path != ""
+	}
+	if strings.IndexByte(path[slash+1:], '/') >= 0 {
+		return false
+	}
+	dir := path[:slash]
+	return dir == "db" || strings.HasPrefix(dir, "db_") || dir == "testdb"
+}
+
+// isDBWALPath reports whether path is a primary-DB WAL segment ("*.log" in the
+// root or primary DB directory, excluding "checkpoint/" and other non-primary directories).
+func isDBWALPath(path string) bool {
+	return isPrimaryDBDir(path) && strings.HasSuffix(path, ".log")
+}
+
+// isDBManifestPath reports whether path is a primary-DB MANIFEST file ("MANIFEST-*"
+// in the root or primary DB directory, excluding "checkpoint/", atomic "marker." files,
+// and other non-primary directories).
+func isDBManifestPath(path string) bool {
+	if !isPrimaryDBDir(path) {
+		return false
+	}
+	base := path
+	if slash := strings.LastIndexByte(path, '/'); slash >= 0 {
+		base = path[slash+1:]
+	}
+	return !strings.HasPrefix(base, "marker.") && strings.HasPrefix(base, "MANIFEST-")
+}
+
+// WALWriteCount returns the number of recorded primary-DB WAL write/drop events.
+func (fs *FS) WALWriteCount() uint64 {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	return fs.walWrites
+}
+
+// NotifyDroppedWALWrite increments the WAL write counter and wakes any waiter
+// when a fault injector drops a primary-DB WAL write before it reaches vfsrec.FS.
+func (fs *FS) NotifyDroppedWALWrite() {
+	fs.mu.Lock()
+	fs.walWrites++
+	if fs.walCond != nil {
+		fs.walCond.Broadcast()
+	}
+	fs.mu.Unlock()
+}
+
+// WaitForWALWrite blocks until WALWriteCount() >= target, panicking if a 5-second
+// safety deadline expires before the expected WAL write is recorded.
+func (fs *FS) WaitForWALWrite(target uint64) {
+	fs.mu.Lock()
+	if fs.walWrites >= target {
+		fs.mu.Unlock()
+		return
+	}
+	if fs.walCond == nil {
+		fs.walCond = sync.NewCond(&fs.mu)
+	}
+	timeout := fs.waitTimeout
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	var timedOut bool
+	done := make(chan struct{})
+	go func() {
+		timer := time.NewTimer(timeout)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			fs.mu.Lock()
+			timedOut = true
+			fs.walCond.Broadcast()
+			fs.mu.Unlock()
+		case <-done:
+		}
+	}()
+	for fs.walWrites < target {
+		if timedOut {
+			close(done)
+			fs.mu.Unlock()
+			panic("vfsrec: WaitForWALWrite exceeded 5s deadline")
+		}
+		fs.walCond.Wait()
+	}
+	close(done)
+	fs.mu.Unlock()
 }
 
 // Begin records an OpBegin marker event for a client operation.
@@ -88,65 +188,54 @@ func (fs *FS) SetHook(hook func(id uint64)) {
 func (fs *FS) appendEventLocked(event trace.Event) {
 	event.ID = uint64(len(fs.events) + 1)
 	fs.events = append(fs.events, event)
-	if event.Kind == trace.KindWrite && (strings.HasSuffix(event.File, ".log") || event.Cat == "pebble-wal") {
-		fs.walWrites++
-		if fs.walCond != nil {
-			fs.walCond.Broadcast()
-		}
-	}
 	if fs.hook != nil {
 		fs.hook(event.ID)
 	}
 }
 
-// WALWriteCount returns the current count of WAL write events.
-func (fs *FS) WALWriteCount() uint64 {
-	fs.mu.Lock()
-	defer fs.mu.Unlock()
-	return fs.walWrites
-}
+// syncReorderScanWindow bounds the backward scan over trailing non-mutating
+// events when placing a file Sync/SyncData/SyncTo adjacent to its preceding
+// Write/WriteAt on the same handle.
+const syncReorderScanWindow = 8
 
-// NotifyDroppedWALWrite increments the WAL write counter and broadcasts to waiting
-// goroutines, allowing dropped WAL writes (such as MUT-X6) to advance synchronization.
-func (fs *FS) NotifyDroppedWALWrite() {
-	fs.mu.Lock()
-	defer fs.mu.Unlock()
-	fs.walWrites++
-	if fs.walCond != nil {
-		fs.walCond.Broadcast()
+func (fs *FS) appendSyncEventLocked(event trace.Event) {
+	insertIdx := -1
+	n := len(fs.events)
+	for i := n - 1; i >= 0 && (n-1-i) < syncReorderScanWindow; i-- {
+		e := fs.events[i]
+		if e.Handle == event.Handle || e.Kind == trace.KindUnlock || e.Kind == trace.KindOpBegin || e.Kind == trace.KindOpEnd {
+			break
+		}
+		isNonMutating := !e.IsMutation() || e.Kind == trace.KindEngineEvent
+		if !isNonMutating {
+			break
+		}
+		if i > 0 {
+			prev := fs.events[i-1]
+			if (prev.Kind == trace.KindWrite || prev.Kind == trace.KindWriteAt) && prev.Handle == event.Handle {
+				insertIdx = i
+				break
+			}
+		}
 	}
-}
 
-// WaitForWALWrite waits until fs.walWrites >= target (with a 200ms safety timeout goroutine
-// or deadline so synthetic unit tests without a background WAL flusher never block forever).
-func (fs *FS) WaitForWALWrite(target uint64) {
-	fs.mu.Lock()
-	if fs.walWrites >= target {
-		fs.mu.Unlock()
+	if insertIdx < 0 {
+		fs.appendEventLocked(event)
 		return
 	}
-	if fs.walCond == nil {
-		fs.walCond = sync.NewCond(&fs.mu)
+
+	// Insert event at insertIdx and shift trailing non-mutating events right by 1
+	fs.events = append(fs.events, trace.Event{})
+	copy(fs.events[insertIdx+1:], fs.events[insertIdx:n])
+	event.ID = uint64(insertIdx + 1)
+	fs.events[insertIdx] = event
+	for j := insertIdx + 1; j < len(fs.events); j++ {
+		fs.events[j].ID = uint64(j + 1)
 	}
-	var timedOut bool
-	done := make(chan struct{})
-	defer close(done)
-	go func() {
-		select {
-		case <-done:
-		case <-time.After(200 * time.Millisecond):
-			fs.mu.Lock()
-			timedOut = true
-			if fs.walCond != nil {
-				fs.walCond.Broadcast()
-			}
-			fs.mu.Unlock()
-		}
-	}()
-	for fs.walWrites < target && !timedOut {
-		fs.walCond.Wait()
+
+	if fs.hook != nil {
+		fs.hook(event.ID)
 	}
-	fs.mu.Unlock()
 }
 
 // BeginIngestSection marks the start of an ingest section, pausing background flushes.
@@ -207,6 +296,9 @@ func (fs *FS) Create(name string, category vfs.DiskWriteCategory) (vfs.File, err
 	if err != nil {
 		return nil, err
 	}
+	if isDBManifestPath(canon) {
+		fs.dbManifestCount++
+	}
 	innerFile, err := fs.inner.Create(name, category)
 	event := trace.Event{
 		Kind: trace.KindCreate,
@@ -228,6 +320,7 @@ func (fs *FS) Create(name string, category vfs.DiskWriteCategory) (vfs.File, err
 		handle: fs.nextHandle,
 		label:  canon,
 		isDir:  false,
+		cat:    category,
 	}, nil
 }
 
@@ -325,6 +418,7 @@ func (fs *FS) OpenReadWrite(name string, category vfs.DiskWriteCategory, opts ..
 		handle: fs.nextHandle,
 		label:  canon,
 		isDir:  false,
+		cat:    category,
 	}, nil
 }
 
@@ -371,28 +465,13 @@ func (fs *FS) Remove(name string) error {
 		return err
 	}
 
-	if fs.inIngestSection && !strings.Contains(canon, "ingest_staging") && !strings.Contains(canon, "ingest_") {
+	if fs.inIngestSection && !strings.Contains(canon, "ingest_staging") && !strings.Contains(canon, "ingest_") && !strings.Contains(canon, "marker.manifest") {
 		if fs.ingestCond == nil {
 			fs.ingestCond = sync.NewCond(&fs.mu)
 		}
-		var timedOut bool
-		done := make(chan struct{})
-		go func() {
-			select {
-			case <-done:
-			case <-time.After(500 * time.Millisecond):
-				fs.mu.Lock()
-				timedOut = true
-				if fs.ingestCond != nil {
-					fs.ingestCond.Broadcast()
-				}
-				fs.mu.Unlock()
-			}
-		}()
-		for fs.inIngestSection && !timedOut {
+		for fs.inIngestSection {
 			fs.ingestCond.Wait()
 		}
-		close(done)
 	}
 
 	err = fs.inner.Remove(name)
@@ -489,6 +568,7 @@ func (fs *FS) ReuseForWrite(oldname, newname string, category vfs.DiskWriteCateg
 		handle: fs.nextHandle,
 		label:  canonNew,
 		isDir:  false,
+		cat:    category,
 	}, nil
 }
 

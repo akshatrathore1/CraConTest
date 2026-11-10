@@ -17,6 +17,12 @@ import (
 	"github.com/cockroachdb/pebble/v2/vfs"
 )
 
+type walWriteNotifier interface {
+	WALWriteCount() uint64
+	WaitForWALWrite(target uint64)
+	NotifyDroppedWALWrite()
+}
+
 // Seeded fault IDs.
 const (
 	MUT0 = "MUT-0" // Null pass-through control
@@ -30,7 +36,7 @@ const (
 	MUT8 = "MUT-8" // RocksDB #10460: fsyncs omitted after trigger event
 	MUT9 = "MUT-9" // Single k-th directory sync drop
 
-	// Causal barrier repair controls (formal systems-research identifiers).
+	// Causal barrier repair controls.
 	// Barrier5825 represents the manifest-rotation directory barrier control.
 	// In Pebble v2.1.7 manifest rotation (version_set.go:1026, 650-654):
 	// 1. createManifest calls FS.Create("db/MANIFEST-xxxxxx").
@@ -142,16 +148,19 @@ func NormalizeID(id string) (string, error) {
 	}
 }
 
-// IsSparse reports whether a fault model is a sparse/windowed fault model.
+// IsSparse reports whether a fault model is a sparse, windowed, or selective
+// fault model (MUT-2..MUT-9 and MUT-X1..MUT-X6), as opposed to the null control
+// (MUT-0), the dense every-WAL-sync drop baseline (MUT-1), or barrier controls.
 func IsSparse(id string) bool {
 	norm, err := NormalizeID(id)
 	if err != nil {
 		return false
 	}
 	switch norm {
-	case Barrier5825, BarrierCkpt:
+	case Barrier5825, BarrierCkpt, MUT0, MUT1:
 		return false
-	case MUT2, MUT3, MUT4, MUT5, MUT6, MUT7, MUT8, MUT9:
+	case MUT2, MUT3, MUT4, MUT5, MUT6, MUT7, MUT8, MUT9,
+		MUTX1, MUTX2, MUTX3, MUTX4, MUTX5, MUTX6:
 		return true
 	default:
 		return false
@@ -221,6 +230,15 @@ type FS struct {
 	xCall    int
 }
 
+// Indices into FS.xN for k-th event hold-out fault models (MUT-X4 and MUT-X5
+// use FS.xCall for stateless hash-based stochastic sampling).
+const (
+	xIdxX1 = 1
+	xIdxX2 = 2
+	xIdxX3 = 3
+	xIdxX6 = 4
+)
+
 func flakyHash(seed, idx int) float64 {
 	z := uint64(seed)*0x9E3779B97F4A7C15 + uint64(idx)*0xBF58476D1CE4E5B9 + 0x94D049BB133111EB
 	z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9
@@ -286,21 +304,6 @@ func (fs *FS) Unwrap() vfs.FS {
 	return fs.inner
 }
 
-// WALWriteCount forwards to inner if supported.
-func (fs *FS) WALWriteCount() uint64 {
-	if s, ok := fs.inner.(interface{ WALWriteCount() uint64 }); ok {
-		return s.WALWriteCount()
-	}
-	return 0
-}
-
-// WaitForWALWrite forwards to inner if supported.
-func (fs *FS) WaitForWALWrite(target uint64) {
-	if s, ok := fs.inner.(interface{ WaitForWALWrite(uint64) }); ok {
-		s.WaitForWALWrite(target)
-	}
-}
-
 // BeginIngestSection forwards to inner if supported.
 func (fs *FS) BeginIngestSection() {
 	if s, ok := fs.inner.(interface{ BeginIngestSection() }); ok {
@@ -315,10 +318,18 @@ func (fs *FS) EndIngestSection() {
 	}
 }
 
-// NotifyDroppedWALWrite forwards to inner if supported.
-func (fs *FS) NotifyDroppedWALWrite() {
-	if s, ok := fs.inner.(interface{ NotifyDroppedWALWrite() }); ok {
-		s.NotifyDroppedWALWrite()
+// WALWriteCount forwards to the underlying recorder FS if supported.
+func (fs *FS) WALWriteCount() uint64 {
+	if w, ok := fs.inner.(walWriteNotifier); ok {
+		return w.WALWriteCount()
+	}
+	return 0
+}
+
+// WaitForWALWrite forwards to the underlying recorder FS if supported.
+func (fs *FS) WaitForWALWrite(target uint64) {
+	if w, ok := fs.inner.(walWriteNotifier); ok {
+		w.WaitForWALWrite(target)
 	}
 }
 
@@ -380,7 +391,12 @@ func (fs *FS) ArmDirSyncDrop() {
 func (fs *FS) Trigger(name string) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
-	if fs.cfg.TriggerName == "" || name == fs.cfg.TriggerName || name == "CompactionBegin" || name == "TableCreated" {
+	if name == fs.cfg.TriggerName {
+		fs.triggered = true
+		return
+	}
+	if (fs.cfg.TriggerName == "" || fs.cfg.TriggerName == "CompactionBegin") &&
+		(name == "CompactionBegin" || name == "TableCreated") {
 		fs.triggered = true
 	}
 }
@@ -436,19 +452,10 @@ func (fs *FS) onFileCreate(name string, category vfs.DiskWriteCategory) {
 }
 
 func isMetadataPointer(base, full string) bool {
-	if base == "CURRENT" || strings.HasPrefix(base, "CURRENT") {
-		return true
-	}
-	if strings.HasPrefix(base, "OPTIONS") {
-		return true
-	}
-	if strings.Contains(base, "marker.manifest") || strings.Contains(full, "marker.manifest") {
-		return true
-	}
-	if strings.Contains(full, "CURRENT") {
-		return true
-	}
-	return false
+	return strings.HasPrefix(base, "CURRENT") ||
+		strings.HasPrefix(base, "OPTIONS") ||
+		strings.Contains(full, "marker.manifest") ||
+		strings.Contains(full, "CURRENT")
 }
 
 func (fs *FS) shouldDropSync(f *file, op string) bool {
@@ -485,6 +492,8 @@ func (fs *FS) shouldDropSync(f *file, op string) bool {
 		if string(f.category) == "pebble-manifest" {
 			fs.manifestSyncCount++
 			if !fs.manSyncDropped {
+				// Note: walSyncCount is only incremented in case MUT5 (line 483),
+				// so walSyncCount is always 0 under MUT6; this drops the 2nd MANIFEST sync.
 				if fs.manifestCount > 1 || fs.manifestSyncCount >= 2 || fs.walSyncCount > 0 {
 					fs.manSyncDropped = true
 					return true
@@ -522,12 +531,12 @@ func (fs *FS) shouldDropSync(f *file, op string) bool {
 
 	case MUTX1:
 		if string(f.category) == "pebble-wal" && !f.isDir {
-			fs.xN[1]++
+			fs.xN[xIdxX1]++
 			k := fs.cfg.XK
 			if k <= 0 {
 				k = 2 // default: drop the 2nd WAL sync
 			}
-			if fs.xN[1] == k && !fs.xDropped {
+			if fs.xN[xIdxX1] == k && !fs.xDropped {
 				fs.xDropped = true
 				return true
 			}
@@ -536,12 +545,12 @@ func (fs *FS) shouldDropSync(f *file, op string) bool {
 
 	case MUTX2:
 		if string(f.category) == "pebble-manifest" && !f.isDir {
-			fs.xN[2]++
+			fs.xN[xIdxX2]++
 			k := fs.cfg.XK
 			if k <= 0 {
 				k = 2 // default: drop the 2nd MANIFEST sync
 			}
-			if fs.xN[2] == k && !fs.xDropped {
+			if fs.xN[xIdxX2] == k && !fs.xDropped {
 				fs.xDropped = true
 				return true
 			}
@@ -550,12 +559,12 @@ func (fs *FS) shouldDropSync(f *file, op string) bool {
 
 	case MUTX3:
 		if (string(f.category) == "pebble-memtable-flush" || string(f.category) == "pebble-compaction") && !f.isDir {
-			fs.xN[3]++
+			fs.xN[xIdxX3]++
 			k := fs.cfg.XK
 			if k <= 0 {
 				k = 1 // default: drop the 1st SST sync
 			}
-			if fs.xN[3] == k && !fs.xDropped {
+			if fs.xN[xIdxX3] == k && !fs.xDropped {
 				fs.xDropped = true
 				return true
 			}
@@ -790,19 +799,19 @@ func (f *file) ReadAt(p []byte, off int64) (int, error) {
 func (f *file) Write(p []byte) (int, error) {
 	if f.fs != nil && f.fs.cfg.ID == MUTX6 && string(f.category) == "pebble-wal" {
 		f.fs.mu.Lock()
-		f.fs.xN[4]++
+		f.fs.xN[xIdxX6]++
 		k := f.fs.cfg.XK
 		if k <= 0 {
 			k = 2 // default: drop the 2nd WAL write
 		}
-		drop := f.fs.xN[4] == k && !f.fs.xDropped
+		drop := f.fs.xN[xIdxX6] == k && !f.fs.xDropped
 		if drop {
 			f.fs.xDropped = true
 		}
 		f.fs.mu.Unlock()
 		if drop {
-			if n, ok := f.fs.inner.(interface{ NotifyDroppedWALWrite() }); ok {
-				n.NotifyDroppedWALWrite()
+			if w, ok := f.fs.inner.(walWriteNotifier); ok {
+				w.NotifyDroppedWALWrite()
 			}
 			return len(p), nil // acknowledged but never applied
 		}

@@ -1,17 +1,14 @@
 package vfsrec
 
 import (
-	"sync"
+	"runtime"
 	"time"
 
 	"github.com/akshatrathore1/CraConTest/internal/trace"
 	"github.com/cockroachdb/pebble/v2"
 )
 
-func (fs *FS) recordEngineEvent(note string, job uint64, inputs, outputs []string) {
-	fs.mu.Lock()
-	defer fs.mu.Unlock()
-
+func (fs *FS) recordEngineEventLocked(note string, job uint64, inputs, outputs []string) {
 	event := trace.Event{
 		Kind:    trace.KindEngineEvent,
 		Note:    note,
@@ -19,7 +16,37 @@ func (fs *FS) recordEngineEvent(note string, job uint64, inputs, outputs []strin
 		Inputs:  inputs,
 		Outputs: outputs,
 	}
+	if (note == "ManifestDeleted" || note == "TableDeleted" || note == "WALDeleted") && len(inputs) > 0 {
+		targetFile := inputs[0]
+		insertIdx := -1
+		n := len(fs.events)
+		for i := n - 1; i >= 0 && (n-1-i) < syncReorderScanWindow; i-- {
+			if fs.events[i].Kind == trace.KindRemove && fs.events[i].File == targetFile {
+				insertIdx = i + 1
+				break
+			}
+			if fs.events[i].IsMutation() {
+				break
+			}
+		}
+		if insertIdx >= 0 && insertIdx < len(fs.events) {
+			event.ID = uint64(insertIdx + 1)
+			fs.events = append(fs.events, trace.Event{})
+			copy(fs.events[insertIdx+1:], fs.events[insertIdx:len(fs.events)-1])
+			fs.events[insertIdx] = event
+			for i := insertIdx; i < len(fs.events); i++ {
+				fs.events[i].ID = uint64(i + 1)
+			}
+			return
+		}
+	}
 	fs.appendEventLocked(event)
+}
+
+func (fs *FS) recordEngineEvent(note string, job uint64, inputs, outputs []string) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	fs.recordEngineEventLocked(note, job, inputs, outputs)
 }
 
 func pathSlice(name string) []string {
@@ -73,55 +100,41 @@ func (fs *FS) EventListener() pebble.EventListener {
 			fs.recordEngineEvent("DiskSlow", 0, nil, nil)
 		},
 		FlushBegin: func(info pebble.FlushInfo) {
-			fs.mu.Lock()
-			if fs.inIngestSection {
-				if fs.ingestCond == nil {
-					fs.ingestCond = sync.NewCond(&fs.mu)
-				}
-				var timedOut bool
-				done := make(chan struct{})
-				go func() {
-					select {
-					case <-done:
-					case <-time.After(500 * time.Millisecond):
-						fs.mu.Lock()
-						timedOut = true
-						if fs.ingestCond != nil {
-							fs.ingestCond.Broadcast()
-						}
-						fs.mu.Unlock()
-					}
-				}()
-				for fs.inIngestSection && !timedOut {
-					fs.ingestCond.Wait()
-				}
-				close(done)
+			for i := 0; i < 500; i++ {
+				runtime.Gosched()
 			}
-			if fs.pendingManifestDeletions > 0 {
-				if fs.manifestCond == nil {
-					fs.manifestCond = sync.NewCond(&fs.mu)
+			fs.mu.Lock()
+			if !fs.inIngestSection && fs.pendingManifestDeletions > 0 && fs.manifestCond != nil {
+				timeout := fs.waitTimeout
+				if timeout <= 0 {
+					timeout = 5 * time.Second
 				}
 				var timedOut bool
 				done := make(chan struct{})
 				go func() {
+					timer := time.NewTimer(timeout)
+					defer timer.Stop()
 					select {
-					case <-done:
-					case <-time.After(200 * time.Millisecond):
+					case <-timer.C:
 						fs.mu.Lock()
 						timedOut = true
-						if fs.manifestCond != nil {
-							fs.manifestCond.Broadcast()
-						}
+						fs.manifestCond.Broadcast()
 						fs.mu.Unlock()
+					case <-done:
 					}
 				}()
-				for fs.pendingManifestDeletions > 0 && !timedOut {
+				for !fs.inIngestSection && fs.pendingManifestDeletions > 0 {
+					if timedOut {
+						close(done)
+						fs.mu.Unlock()
+						panic("vfsrec: FlushBegin manifestCond wait exceeded 5s deadline")
+					}
 					fs.manifestCond.Wait()
 				}
 				close(done)
 			}
+			fs.recordEngineEventLocked("FlushBegin", jobID(info.JobID), nil, nil)
 			fs.mu.Unlock()
-			fs.recordEngineEvent("FlushBegin", jobID(info.JobID), nil, nil)
 		},
 		FlushEnd: func(info pebble.FlushInfo) {
 			fs.recordEngineEvent("FlushEnd", jobID(info.JobID), nil, nil)
@@ -137,22 +150,22 @@ func (fs *FS) EventListener() pebble.EventListener {
 		},
 		ManifestCreated: func(info pebble.ManifestCreateInfo) {
 			fs.mu.Lock()
-			if info.JobID > 0 {
+			defer fs.mu.Unlock()
+			if fs.dbManifestCount > 2 {
 				fs.pendingManifestDeletions++
 			}
-			fs.mu.Unlock()
-			fs.recordEngineEvent("ManifestCreated", jobID(info.JobID), nil, pathSlice(info.Path))
+			fs.recordEngineEventLocked("ManifestCreated", jobID(info.JobID), nil, pathSlice(info.Path))
 		},
 		ManifestDeleted: func(info pebble.ManifestDeleteInfo) {
 			fs.mu.Lock()
+			defer fs.mu.Unlock()
 			if fs.pendingManifestDeletions > 0 {
 				fs.pendingManifestDeletions--
-				if fs.manifestCond != nil {
+				if fs.pendingManifestDeletions == 0 && fs.manifestCond != nil {
 					fs.manifestCond.Broadcast()
 				}
 			}
-			fs.mu.Unlock()
-			fs.recordEngineEvent("ManifestDeleted", jobID(info.JobID), pathSlice(info.Path), nil)
+			fs.recordEngineEventLocked("ManifestDeleted", jobID(info.JobID), pathSlice(info.Path), nil)
 		},
 		TableCreated: func(info pebble.TableCreateInfo) {
 			fs.recordEngineEvent("TableCreated", jobID(info.JobID), nil, pathSlice(info.Path))

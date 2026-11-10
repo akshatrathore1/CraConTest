@@ -231,7 +231,7 @@ type ingestStratSpec struct {
 var ingestStratSpecs = []ingestStratSpec{
 	{"dcg", "dcg", "dcg", "Durability-Contract Guided (DCG)"},
 	{"dcg-pr", "dcg-pr", "dcg-pr", "DCG Partial-Retention Prior (DCG-PR)"},
-	{"dcg-ablate", "dcg-flag-only", "dcg-flag-only", "DCG Flag-Only (Ablation)"},
+	{"dcg-flag-only", "dcg-flag-only", "dcg-flag-only", "DCG Flag-Only (Ablation)"},
 	{"r2", "r2", "r2", "State-Representative Random (R2)"},
 	{"r1", "r1", "r1", "0%-Retention-First Random (R1)"},
 	{"c1", "b6", "sync-boundary", "sync-boundary"},

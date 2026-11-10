@@ -113,8 +113,9 @@ def analyse(settings, root, strategies=('dcg', 'dcg-pr', 'dcg-flag-only', 'r2', 
         for s in active_settings:
             seeds_map = data_by_fault.get(s, {})
             nd = len(seeds_map)
-            K = {n: [] for n in strategies}
-            S = {n: [] for n in strategies}
+            K_single = {n: [] for n in strategies}
+            K_mean = {n: [] for n in strategies}
+            S_mean = {n: [] for n in strategies}
             dens = []
             used = 0
             def seed_key(x):
@@ -133,18 +134,32 @@ def analyse(settings, root, strategies=('dcg', 'dcg-pr', 'dcg-flag-only', 'r2', 
                 dens.append(m / univ if univ > 0 else 0.0)
                 for n in strategies:
                     r_n = s_rows.get(n, {})
-                    val_k1 = r_n.get('k1_single')
-                    k1 = int(val_k1) if (val_k1 is not None and str(val_k1).strip() != '' and int(val_k1) > 0) else None
-                    val_s25 = r_n.get('s25_single')
-                    s25 = int(val_s25) if (val_s25 is not None and str(val_s25).strip() != '') else 0
-                    K[n].append(k1)
-                    S[n].append(s25)
-            out.append((s, used, nd, dens, K, S))
+                    val_k1_single = r_n.get('k1_single')
+                    try:
+                        k1_single = float(val_k1_single) if (val_k1_single is not None and str(val_k1_single).strip() != '' and float(val_k1_single) > 0) else None
+                    except ValueError:
+                        k1_single = None
+
+                    val_k1_mean = r_n.get('k1_failure_mean') if (r_n.get('k1_failure_mean') is not None and str(r_n.get('k1_failure_mean')).strip() != '') else r_n.get('k1_single')
+                    try:
+                        k1_mean = float(val_k1_mean) if (val_k1_mean is not None and str(val_k1_mean).strip() != '' and float(val_k1_mean) > 0) else None
+                    except ValueError:
+                        k1_mean = None
+
+                    val_s25 = r_n.get('s25_mean') if (r_n.get('s25_mean') is not None and str(r_n.get('s25_mean')).strip() != '') else r_n.get('s25_single')
+                    try:
+                        s25 = float(val_s25) if (val_s25 is not None and str(val_s25).strip() != '') else 0.0
+                    except ValueError:
+                        s25 = 0.0
+                    K_single[n].append(k1_single)
+                    K_mean[n].append(k1_mean)
+                    S_mean[n].append(s25)
+            out.append((s, used, nd, dens, K_single, K_mean, S_mean))
     else:
         active_settings = settings if settings else [os.path.basename(p) for p in sorted(glob.glob(f'{root}/*')) if os.path.isdir(p)]
         for s in active_settings:
             dirs = sorted(glob.glob(f'{root}/{s}/*'))
-            K = {n: [] for n in strategies}; S = {n: [] for n in strategies}; dens = []; used = 0
+            K_single = {n: [] for n in strategies}; K_mean = {n: [] for n in strategies}; S_mean = {n: [] for n in strategies}; dens = []; used = 0
             for d in dirs:
                 if not os.path.exists(f'{d}/outcomes.json') or not os.path.exists(f'{d}/trace.json'):
                     continue
@@ -154,44 +169,62 @@ def analyse(settings, root, strategies=('dcg', 'dcg-pr', 'dcg-flag-only', 'r2', 
                     continue
                 used += 1; dens.append(m / len(fail) if len(fail) > 0 else 0.0)
                 for n in strategies:
-                    k1, s25 = metrics(rank(d, n), fail, anchor); K[n].append(k1); S[n].append(s25)
-            out.append((s, used, len(dirs), dens, K, S))
+                    k1, s25 = metrics(rank(d, n), fail, anchor)
+                    K_single[n].append(k1)
+                    K_mean[n].append(k1)
+                    S_mean[n].append(s25)
+            out.append((s, used, len(dirs), dens, K_single, K_mean, S_mean))
     return out
 
 def report(settings, root, title):
     res = analyse(settings, root)
+    is_pr_casestudy = 'pebble5825' in root or 'checkpoint' in root
     print(f'\n##### {title}')
-    print(f"{'setting':14s} {'seeds w/ fail':>13s} {'dens%':>6s} | {'k1 DCG':>7s} {'k1 R2':>7s} {'k1 R1':>7s} {'k1 B0':>7s} {'k1 Flag':>7s} {'k1 LIFO':>8s} | {'R2/DCG [95% CI]':>22s} | DCG<R2 W/L/T  p(sign)  p(Wilcoxon) | S25 DCG/R2")
+    if is_pr_casestudy:
+        print(f"{'setting':14s} {'seeds w/ fail':>13s} {'dens%':>6s} | {'k1 DCG-PR':>9s} {'k1 DCG':>7s} {'k1 R2':>7s} {'k1 R1':>7s} {'k1 B0':>7s} {'k1 Flag':>7s} {'k1 LIFO':>8s} | {'R2/DCG-PR [95% CI]':>22s} | DCG-PR<R2 W/L/T  p(sign)  p(Wilcoxon) | S25 PR/R2")
+    else:
+        print(f"{'setting':14s} {'seeds w/ fail':>13s} {'dens%':>6s} | {'k1 DCG':>7s} {'k1 R2':>7s} {'k1 R1':>7s} {'k1 B0':>7s} {'k1 Flag':>7s} {'k1 LIFO':>8s} | {'R2/DCG [95% CI]':>22s} | DCG<R2 W/L/T  p(sign)  p(Wilcoxon) | S25 DCG/R2")
     ps = []; rows = []
-    for s, used, nd, dens, K, S in res:
+    for s, used, nd, dens, K_single, K_mean, S_mean in res:
         if used < 8:
             print(f"{s:14s} {used:>7d}/{nd:<5d} (fewer than 8 seeds with any failure: not testable, reported as null)")
             continue
-        p, w, l, t = sign_p_less(K.get('dcg', []), K.get('r2', []))
-        pw = wilcoxon_p_less(K.get('dcg', []), K.get('r2', []))
-        lo, hi = boot_ratio(K.get('r2', []), K.get('dcg', []))
+        if is_pr_casestudy:
+            p, w, l, t = sign_p_less(K_mean.get('dcg-pr', []), K_mean.get('r2', []))
+            pw = wilcoxon_p_less(K_mean.get('dcg-pr', []), K_mean.get('r2', []))
+            lo, hi = boot_ratio(K_mean.get('r2', []), K_mean.get('dcg-pr', []))
+        else:
+            p, w, l, t = sign_p_less(K_single.get('dcg', []), K_single.get('r2', []))
+            pw = wilcoxon_p_less(K_single.get('dcg', []), K_single.get('r2', []))
+            lo, hi = boot_ratio(K_mean.get('r2', []), K_mean.get('dcg', []))
         ps.append(p)
-        rows.append((s, used, nd, dens, K, S, p, pw, w, l, t, lo, hi))
+        rows.append((s, used, nd, dens, K_single, K_mean, S_mean, p, pw, w, l, t, lo, hi))
     adj = holm(ps) if ps else []
-    for (s, used, nd, dens, K, S, p, pw, w, l, t, lo, hi), pa in zip(rows, adj):
-        mean = lambda n: safe_mean(K.get(n, []))
-        m_dcg = mean('dcg')
+    for (s, used, nd, dens, K_single, K_mean, S_mean, p, pw, w, l, t, lo, hi), pa in zip(rows, adj):
+        mean = lambda n: safe_mean(K_mean.get(n, []))
+        eval_strat = 'dcg-pr' if is_pr_casestudy else 'dcg'
+        m_eval = mean(eval_strat)
         m_r2 = mean('r2')
-        if m_dcg and not math.isnan(m_dcg) and not math.isnan(m_r2) and m_dcg > 0:
-            ratio_str = f"{m_r2 / m_dcg:6.1f}x"
+        if m_eval and not math.isnan(m_eval) and not math.isnan(m_r2) and m_eval > 0:
+            ratio_str = f"{m_r2 / m_eval:6.1f}x"
         else:
             ratio_str = "   N/Ax"
         dens_mean = 100 * safe_mean(dens)
-        s_dcg = safe_mean(S.get('dcg', []))
-        s_r2 = safe_mean(S.get('r2', []))
-        print(f"{s:14s} {used:>7d}/{nd:<5d} {dens_mean:6.1f} | {mean('dcg'):7.2f} {mean('r2'):7.2f} {mean('r1'):7.2f} {mean('b0'):7.2f} {mean('dcg-flag-only'):7.2f} {mean('b2'):8.1f} | {ratio_str} [{lo:5.1f},{hi:6.1f}] | {w:2d}/{l:2d}/{t:2d}   {p:8.2e}  {pw:8.2e} (Holm {pa:.1e}) | {s_dcg:.1f}/{s_r2:.1f}")
+        s_eval = safe_mean(S_mean.get('dcg-pr' if is_pr_casestudy else 'dcg', []))
+        s_r2 = safe_mean(S_mean.get('r2', []))
+        if is_pr_casestudy:
+            print(f"{s:14s} {used:>7d}/{nd:<5d} {dens_mean:6.1f} | {mean('dcg-pr'):9.2f} {mean('dcg'):7.2f} {mean('r2'):7.2f} {mean('r1'):7.2f} {mean('b0'):7.2f} {mean('dcg-flag-only'):7.2f} {mean('b2'):8.1f} | {ratio_str} [{lo:5.1f},{hi:6.1f}] | {w:2d}/{l:2d}/{t:2d}   {p:8.2e}  {pw:8.2e} (Holm {pa:.1e}) | {s_eval:.1f}/{s_r2:.1f}")
+        else:
+            print(f"{s:14s} {used:>7d}/{nd:<5d} {dens_mean:6.1f} | {mean('dcg'):7.2f} {mean('r2'):7.2f} {mean('r1'):7.2f} {mean('b0'):7.2f} {mean('dcg-flag-only'):7.2f} {mean('b2'):8.1f} | {ratio_str} [{lo:5.1f},{hi:6.1f}] | {w:2d}/{l:2d}/{t:2d}   {p:8.2e}  {pw:8.2e} (Holm {pa:.1e}) | {s_eval:.1f}/{s_r2:.1f}")
     # worse-than-baseline flags
     def is_worse(k_a, k_b):
         ma, mb = safe_mean(k_a), safe_mean(k_b)
         return not math.isnan(ma) and not math.isnan(mb) and ma > mb
 
-    print('\n  settings where DCG is WORSE than R2 on average k1:', [r[0] for r in rows if is_worse(r[4].get('dcg'), r[4].get('r2'))] or 'none')
-    print('  settings where DCG is WORSE than uniform random (B0) on average k1:', [r[0] for r in rows if is_worse(r[4].get('dcg'), r[4].get('b0'))] or 'none')
+    target_strat = 'dcg-pr' if is_pr_casestudy else 'dcg'
+    target_name = 'DCG-PR' if is_pr_casestudy else 'DCG'
+    print(f'\n  settings where {target_name} is WORSE than R2 on average k1:', [r[0] for r in rows if is_worse(r[5].get(target_strat), r[5].get('r2'))] or 'none')
+    print(f'  settings where {target_name} is WORSE than uniform random (B0) on average k1:', [r[0] for r in rows if is_worse(r[5].get(target_strat), r[5].get('b0'))] or 'none')
     return rows
 
 if __name__ == '__main__':

@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/csv"
 	"encoding/json"
 	"errors"
@@ -146,7 +147,9 @@ func runRecord(args []string) error {
 		if err != nil {
 			return fmt.Errorf("read spec: %w", err)
 		}
-		if err := json.Unmarshal(data, &cfg); err != nil {
+		dec := json.NewDecoder(bytes.NewReader(data))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&cfg); err != nil {
 			return fmt.Errorf("parse spec: %w", err)
 		}
 	}
@@ -249,6 +252,9 @@ func runRecord(args []string) error {
 	if err := enc.Encode(meta); err != nil {
 		return fmt.Errorf("encode run.json: %w", err)
 	}
+	if err := metaFile.Close(); err != nil {
+		return fmt.Errorf("close run.json: %w", err)
+	}
 
 	// Write trace.json
 	traceFile, err := os.Create(filepath.Join(targetDir, "trace.json"))
@@ -259,6 +265,9 @@ func runRecord(args []string) error {
 	if err := trace.Encode(traceFile, traceEvents); err != nil {
 		return fmt.Errorf("encode trace.json: %w", err)
 	}
+	if err := traceFile.Close(); err != nil {
+		return fmt.Errorf("close trace.json: %w", err)
+	}
 
 	// Write history.json
 	histFile, err := os.Create(filepath.Join(targetDir, "history.json"))
@@ -268,6 +277,9 @@ func runRecord(args []string) error {
 	defer histFile.Close()
 	if err := history.Encode(histFile, correlated); err != nil {
 		return fmt.Errorf("encode history.json: %w", err)
+	}
+	if err := histFile.Close(); err != nil {
+		return fmt.Errorf("close history.json: %w", err)
 	}
 
 	fmt.Printf("Recorded run %s (fault %s): %d events, %d history entries -> %s\n",

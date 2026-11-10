@@ -156,6 +156,12 @@ func TestFaultIDsAndValidation(t *testing.T) {
 		t.Error("MUT-0, MUT-1, and BARRIER-CKPT should not be sparse")
 	}
 
+	for _, id := range []string{faults.MUTX1, faults.MUTX2, faults.MUTX3, faults.MUTX4, faults.MUTX5, faults.MUTX6, "MUT-X1_k6"} {
+		if !faults.IsSparse(id) {
+			t.Errorf("%s should be sparse", id)
+		}
+	}
+
 	normCkpt, err := faults.NormalizeID("MUT-0-FIXCKPT")
 	if err != nil || normCkpt != faults.BarrierCkpt {
 		t.Errorf("NormalizeID(MUT-0-FIXCKPT): got (%q, %v), want (BARRIER-CKPT, nil)", normCkpt, err)
@@ -804,6 +810,27 @@ func TestFaultMUT8RocksDB10460TriggerDropping(t *testing.T) {
 	}
 	if stateFS2.TriggerDropCount() != 2 {
 		t.Errorf("expected TriggerDropCount=2, got %d", stateFS2.TriggerDropCount())
+	}
+
+	// Subtest 3: custom TriggerName — Trigger("CompactionBegin") must NOT set triggered
+	// when TriggerName is explicitly "FlushBegin".
+	mock3 := newMockFS()
+	fs3, err := faults.NewWithConfig(faults.Config{
+		ID:          faults.MUT8,
+		DropBudget:  1,
+		TriggerName: "FlushBegin",
+	}, mock3)
+	if err != nil {
+		t.Fatalf("faults.NewWithConfig MUT-8/FlushBegin: %v", err)
+	}
+	stateFS3 := fs3.(*faults.FS)
+	stateFS3.Trigger("CompactionBegin")
+	if stateFS3.IsTriggered() {
+		t.Errorf("Trigger(\"CompactionBegin\") should leave IsTriggered=false when TriggerName=FlushBegin")
+	}
+	stateFS3.Trigger("FlushBegin")
+	if !stateFS3.IsTriggered() {
+		t.Errorf("Trigger(\"FlushBegin\") should set IsTriggered=true when TriggerName=FlushBegin")
 	}
 }
 

@@ -6,7 +6,9 @@ import (
 	"errors"
 	"io"
 	"os"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/akshatrathore1/CraConTest/internal/trace"
 	"github.com/akshatrathore1/CraConTest/internal/vfsrec"
@@ -634,4 +636,304 @@ func TestOpenReadWriteCreatedFlag(t *testing.T) {
 	if events[3].Created {
 		t.Fatalf("expected Created=false on second OpenReadWrite: %+v", events[3])
 	}
+}
+
+func TestAppendSyncEventStopsAtSameHandleCloseAndOpBoundary(t *testing.T) {
+	// 1. Verify that an interleaved Close on a different handle (handle 2) or an EngineEvent
+	// between Write(handle 1) and SyncData(handle 1) is reordered so SyncData(handle 1)
+	// sits immediately after Write(handle 1).
+	rec1 := vfsrec.New(vfs.NewMem())
+	rec1.AppendEventForTesting(trace.Event{Kind: trace.KindWrite, Handle: 1, File: "wal.log"})
+	rec1.AppendEventForTesting(trace.Event{Kind: trace.KindClose, Handle: 2, File: "other.sst"})
+	rec1.AppendEventForTesting(trace.Event{Kind: trace.KindEngineEvent, File: "", Note: "TableCreated"})
+	rec1.AppendSyncEventForTesting(trace.Event{Kind: trace.KindSyncData, Handle: 1, File: "wal.log"})
+
+	evs1 := rec1.Events()
+	if len(evs1) != 4 {
+		t.Fatalf("expected 4 events, got %d", len(evs1))
+	}
+	if evs1[0].Kind != trace.KindWrite || evs1[0].Handle != 1 {
+		t.Errorf("evs1[0]: got %v, want Write(1)", evs1[0])
+	}
+	if evs1[1].Kind != trace.KindSyncData || evs1[1].Handle != 1 {
+		t.Errorf("evs1[1]: got %v, want SyncData(1) immediately after Write(1)", evs1[1])
+	}
+	if evs1[2].Kind != trace.KindClose || evs1[2].Handle != 2 {
+		t.Errorf("evs1[2]: got %v, want Close(2)", evs1[2])
+	}
+	if evs1[3].Kind != trace.KindEngineEvent {
+		t.Errorf("evs1[3]: got %v, want EngineEvent", evs1[3])
+	}
+	for i, e := range evs1 {
+		if e.ID != uint64(i+1) {
+			t.Errorf("evs1[%d].ID = %d, want %d", i, e.ID, i+1)
+		}
+	}
+
+	// 2. Verify that same-handle Close(1), OpBegin, OpEnd, or Write(2) between Write(1)
+	// and a subsequent SyncData(1) acts as a hard stop and is never crossed.
+	hardStopCases := []struct {
+		name      string
+		stopEvent trace.Event
+	}{
+		{"SameHandleClose", trace.Event{Kind: trace.KindClose, Handle: 1, File: "wal.log"}},
+		{"OpBegin", trace.Event{Kind: trace.KindOpBegin, OpKind: "set"}},
+		{"OpEnd", trace.Event{Kind: trace.KindOpEnd, OpKind: "set"}},
+		{"WriteDifferentHandle", trace.Event{Kind: trace.KindWrite, Handle: 2, File: "other.log", Len: 10}},
+	}
+
+	for _, tc := range hardStopCases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := vfsrec.New(vfs.NewMem())
+			rec.AppendEventForTesting(trace.Event{Kind: trace.KindWrite, Handle: 1, File: "wal.log"})
+			rec.AppendEventForTesting(tc.stopEvent)
+			rec.AppendSyncEventForTesting(trace.Event{Kind: trace.KindSyncData, Handle: 1, File: "wal.log"})
+
+			evs := rec.Events()
+			if len(evs) != 3 {
+				t.Fatalf("expected 3 events, got %d", len(evs))
+			}
+			if evs[0].Kind != trace.KindWrite || evs[0].Handle != 1 {
+				t.Errorf("evs[0]: got %v, want Write(1)", evs[0])
+			}
+			if evs[1].Kind != tc.stopEvent.Kind || evs[1].Handle != tc.stopEvent.Handle {
+				t.Errorf("evs[1]: got %v, want hard stop event %v", evs[1], tc.stopEvent)
+			}
+			if evs[2].Kind != trace.KindSyncData || evs[2].Handle != 1 {
+				t.Errorf("evs[2]: got %v, want SyncData(1) kept after hard stop", evs[2])
+			}
+		})
+	}
+}
+
+func TestRecFileConcurrentReadAtAndClose(t *testing.T) {
+	for iter := 0; iter < 50; iter++ {
+		mem := vfs.NewMem()
+		rec := vfsrec.New(mem)
+		f, err := rec.Create("testfile.dat", vfs.WriteCategoryUnspecified)
+		if err != nil {
+			t.Fatalf("Create failed: %v", err)
+		}
+		data := make([]byte, 1024)
+		if _, err := f.Write(data); err != nil {
+			t.Fatalf("Write failed: %v", err)
+		}
+
+		var wg sync.WaitGroup
+		wg.Add(4)
+
+		go func() {
+			defer wg.Done()
+			buf := make([]byte, 64)
+			for i := 0; i < 100; i++ {
+				_, _ = f.ReadAt(buf, int64((i*16)%512))
+			}
+		}()
+
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 100; i++ {
+				_, _ = f.Stat()
+			}
+		}()
+
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 100; i++ {
+				_ = f.Preallocate(0, 1024)
+				_ = f.Prefetch(0, 512)
+				_ = f.Fd()
+			}
+		}()
+
+		go func() {
+			defer wg.Done()
+			_ = f.Close()
+		}()
+
+		wg.Wait()
+	}
+}
+
+func TestIsDBWALAndManifestPathPredicates(t *testing.T) {
+	walTrueCases := []string{
+		"000001.log",
+		"db/000001.log",
+		"db_ycsb_a/000001.log",
+		"testdb/000001.log",
+	}
+	for _, p := range walTrueCases {
+		if !vfsrec.IsDBWALPathForTesting(p) {
+			t.Errorf("IsDBWALPathForTesting(%q) = false, want true", p)
+		}
+	}
+
+	walFalseCases := []string{
+		"",
+		"checkpoint/000001.log",
+		"ingest_staging/000001.log",
+		"other/000001.log",
+		"db/sub/000001.log",
+		"db/000001.sst",
+	}
+	for _, p := range walFalseCases {
+		if vfsrec.IsDBWALPathForTesting(p) {
+			t.Errorf("IsDBWALPathForTesting(%q) = true, want false", p)
+		}
+	}
+
+	manifestTrueCases := []string{
+		"MANIFEST-000001",
+		"db/MANIFEST-000001",
+		"db_compact/MANIFEST-000002",
+		"testdb/MANIFEST-000003",
+	}
+	for _, p := range manifestTrueCases {
+		if !vfsrec.IsDBManifestPathForTesting(p) {
+			t.Errorf("IsDBManifestPathForTesting(%q) = false, want true", p)
+		}
+	}
+
+	manifestFalseCases := []string{
+		"",
+		"checkpoint/MANIFEST-000001",
+		"db/marker.manifest.000001.MANIFEST-000001",
+		"other/MANIFEST-000001",
+		"db/sub/MANIFEST-000001",
+		"db/CURRENT",
+	}
+	for _, p := range manifestFalseCases {
+		if vfsrec.IsDBManifestPathForTesting(p) {
+			t.Errorf("IsDBManifestPathForTesting(%q) = true, want false", p)
+		}
+	}
+}
+
+func TestWaitForWALWriteSynchronizationAndExclusion(t *testing.T) {
+	mem := vfs.NewMem()
+	rec := vfsrec.New(mem)
+
+	if rec.WALWriteCount() != 0 {
+		t.Fatalf("WALWriteCount() initial: got %d, want 0", rec.WALWriteCount())
+	}
+	rec.WaitForWALWrite(0)
+
+	// Writing to root-level "000001.log" ("pebble-wal") increments WALWriteCount() to 1.
+	f1, err := rec.Create("000001.log", "pebble-wal")
+	if err != nil {
+		t.Fatalf("Create 000001.log failed: %v", err)
+	}
+	if _, err := f1.Write([]byte("data1")); err != nil {
+		t.Fatalf("Write f1 failed: %v", err)
+	}
+	if got := rec.WALWriteCount(); got != 1 {
+		t.Fatalf("WALWriteCount() after f1 write: got %d, want 1", got)
+	}
+
+	// Writing to "db/000002.log" (vfs.WriteCategoryUnspecified) increments WALWriteCount() to 2.
+	if err := rec.MkdirAll("db", 0755); err != nil {
+		t.Fatalf("MkdirAll db failed: %v", err)
+	}
+	f2, err := rec.Create("db/000002.log", vfs.WriteCategoryUnspecified)
+	if err != nil {
+		t.Fatalf("Create db/000002.log failed: %v", err)
+	}
+	if _, err := f2.Write([]byte("data2")); err != nil {
+		t.Fatalf("Write f2 failed: %v", err)
+	}
+	if got := rec.WALWriteCount(); got != 2 {
+		t.Fatalf("WALWriteCount() after f2 write: got %d, want 2", got)
+	}
+
+	// Writing to "checkpoint/000003.log", "other/000004.log", or "db/nonwal.log" with "pebble-manifest" does NOT increment.
+	if err := rec.MkdirAll("checkpoint", 0755); err != nil {
+		t.Fatalf("MkdirAll checkpoint failed: %v", err)
+	}
+	f3, err := rec.Create("checkpoint/000003.log", "pebble-wal")
+	if err != nil {
+		t.Fatalf("Create checkpoint/000003.log failed: %v", err)
+	}
+	if _, err := f3.Write([]byte("data3")); err != nil {
+		t.Fatalf("Write f3 failed: %v", err)
+	}
+
+	if err := rec.MkdirAll("other", 0755); err != nil {
+		t.Fatalf("MkdirAll other failed: %v", err)
+	}
+	f4, err := rec.Create("other/000004.log", "pebble-wal")
+	if err != nil {
+		t.Fatalf("Create other/000004.log failed: %v", err)
+	}
+	if _, err := f4.Write([]byte("data4")); err != nil {
+		t.Fatalf("Write f4 failed: %v", err)
+	}
+
+	f5, err := rec.Create("db/nonwal.log", "pebble-manifest")
+	if err != nil {
+		t.Fatalf("Create db/nonwal.log failed: %v", err)
+	}
+	if _, err := f5.Write([]byte("data5")); err != nil {
+		t.Fatalf("Write f5 failed: %v", err)
+	}
+
+	if got := rec.WALWriteCount(); got != 2 {
+		t.Fatalf("WALWriteCount() after non-primary/non-wal writes: got %d, want 2", got)
+	}
+
+	// Spawns a goroutine that writes to "db/000002.log" and another goroutine that calls
+	// NotifyDroppedWALWrite(), verifying that a foreground call to WaitForWALWrite(4) blocks
+	// until woken by those broadcasts and returns cleanly once WALWriteCount() == 4.
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		_, _ = f2.Write([]byte("more data"))
+	}()
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		rec.NotifyDroppedWALWrite()
+	}()
+
+	rec.WaitForWALWrite(4)
+	if got := rec.WALWriteCount(); got != 4 {
+		t.Fatalf("WALWriteCount() after wait: got %d, want 4", got)
+	}
+}
+
+func TestWaitForWALWriteAndFlushBeginDeadlinePanics(t *testing.T) {
+	t.Run("WaitForWALWrite_TimeoutPanics", func(t *testing.T) {
+		rec := vfsrec.New(vfs.NewMem())
+		rec.SetWaitTimeoutForTesting(15 * time.Millisecond)
+
+		var panicked any
+		func() {
+			defer func() {
+				panicked = recover()
+			}()
+			rec.WaitForWALWrite(1)
+		}()
+
+		want := "vfsrec: WaitForWALWrite exceeded 5s deadline"
+		if panicked != want {
+			t.Fatalf("WaitForWALWrite panic mismatch: got %v, want %q", panicked, want)
+		}
+	})
+
+	t.Run("FlushBegin_TimeoutPanics", func(t *testing.T) {
+		rec := vfsrec.New(vfs.NewMem())
+		rec.SetWaitTimeoutForTesting(15 * time.Millisecond)
+		rec.SetPendingManifestDeletionsForTesting(1)
+
+		var panicked any
+		func() {
+			defer func() {
+				panicked = recover()
+			}()
+			listener := rec.EventListener()
+			listener.FlushBegin(pebble.FlushInfo{JobID: 1})
+		}()
+
+		want := "vfsrec: FlushBegin manifestCond wait exceeded 5s deadline"
+		if panicked != want {
+			t.Fatalf("FlushBegin panic mismatch: got %v, want %q", panicked, want)
+		}
+	})
 }
