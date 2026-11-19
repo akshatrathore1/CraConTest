@@ -364,11 +364,15 @@ func GenerateMultiSeedReportMarkdown(res *BenchmarkResult) string {
 	if commit == "" {
 		commit = "unknown"
 	}
+	goVersion := res.GoVersion
+	if goVersion == "" {
+		goVersion = "not recorded"
+	}
 
 	sb.WriteString("# CraConTest: Multi-Seed Evaluation Across Fault Models\n\n")
 	sb.WriteString(fmt.Sprintf("**Date:** %s  \n", dateStr))
 	sb.WriteString(fmt.Sprintf("**Git Commit:** `%s`  \n", commit))
-	sb.WriteString(fmt.Sprintf("**Evaluation Engine:** CockroachDB Pebble v2.1.7 (Go runtime: %s)  \n", time.Now().UTC().Format(time.RFC3339)))
+	sb.WriteString(fmt.Sprintf("**Evaluation Engine:** CockroachDB Pebble v2.1.7 (Go runtime: %s)  \n", goVersion))
 	sb.WriteString(fmt.Sprintf("**Workload Seeds (%d):** `%v`  \n", len(res.Config.WorkloadSeeds), res.Config.WorkloadSeeds))
 	sb.WriteString(fmt.Sprintf("**Execution Time:** %.2f seconds total  \n", res.TotalDuration.Seconds()))
 	sb.WriteString(fmt.Sprintf("**Null Control (MUT-0):** %d observed failures across %d evaluated seeds at 0%%/100%% retention  \n\n",

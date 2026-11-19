@@ -6,6 +6,7 @@ import (
 	"math"
 	"os"
 	"os/exec"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -208,6 +209,7 @@ type FaultModelSummary struct {
 type BenchmarkResult struct {
 	Timestamp      string                       `json:"timestamp"`
 	GitCommit      string                       `json:"git_commit,omitempty"`
+	GoVersion      string                       `json:"go_version,omitempty"`
 	Config         BenchmarkConfig              `json:"config"`
 	FaultSummaries map[string]FaultModelSummary `json:"fault_summaries"`
 	MUT0Violations int                          `json:"mut0_violations"`
@@ -948,6 +950,7 @@ func RunBenchmark(cfg BenchmarkConfig, progress func(string)) (*BenchmarkResult,
 	return &BenchmarkResult{
 		Timestamp:      time.Now().UTC().Format(time.RFC3339),
 		GitCommit:      CurrentGitCommit(),
+		GoVersion:      runtime.Version(),
 		Config:         cfg,
 		FaultSummaries: faultSummaries,
 		MUT0Violations: mut0Violations,
@@ -1193,10 +1196,14 @@ func median(vals []float64) float64 {
 // GenerateEmpiricalReportMarkdown renders the comprehensive empirical comparison report as Markdown.
 func GenerateEmpiricalReportMarkdown(res *BenchmarkResult) string {
 	var sb strings.Builder
+	goVersion := res.GoVersion
+	if goVersion == "" {
+		goVersion = "not recorded"
+	}
 
 	sb.WriteString("# CraConTest Empirical Report: Multi-Seed Benchmarking & Discovery Curves\n\n")
 	sb.WriteString(fmt.Sprintf("**Date:** %s  \n", res.Timestamp[:10]))
-	sb.WriteString(fmt.Sprintf("**Evaluation Engine:** Pebble v2.1.7 (Go runtime: %s)  \n", time.Now().UTC().Format(time.RFC3339)))
+	sb.WriteString(fmt.Sprintf("**Evaluation Engine:** Pebble v2.1.7 (Go runtime: %s)  \n", goVersion))
 	sb.WriteString(fmt.Sprintf("**Workload Seeds (%d):** `%v`  \n", len(res.Config.WorkloadSeeds), res.Config.WorkloadSeeds))
 	sb.WriteString(fmt.Sprintf("**Execution Time:** %.2f seconds total  \n", res.TotalDuration.Seconds()))
 	sb.WriteString(fmt.Sprintf("**Null Control (MUT-0):** %d observed failures across the evaluated seeds  \n\n", res.MUT0Violations))

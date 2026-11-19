@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
-    branches: [ main ]
+    branches: [main]
 
 jobs:
   test-linux:
@@ -18,7 +18,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@41dfa10bad2bb2aeab73afc76774e5781a77e842 # v5.3.0
         with:
-          go-version-file: 'go.mod'
+          go-version-file: "go.mod"
           check-latest: true
 
       - name: Verify Dependencies
@@ -47,7 +47,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@41dfa10bad2bb2aeab73afc76774e5781a77e842 # v5.3.0
         with:
-          go-version-file: 'go.mod'
+          go-version-file: "go.mod"
           check-latest: true
 
       - name: Verify Dependencies

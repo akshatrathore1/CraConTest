@@ -349,6 +349,7 @@ func TestMultiSeed_CSV_And_Report_Generation(t *testing.T) {
 
 	res := &exp.BenchmarkResult{
 		Timestamp: "2026-10-25T00:00:00Z",
+		GoVersion: "go1.27.3",
 		Config: exp.BenchmarkConfig{
 			WorkloadSeeds: []uint64{42},
 		},
@@ -419,6 +420,11 @@ func TestMultiSeed_CSV_And_Report_Generation(t *testing.T) {
 	}
 	if strings.Contains(string(reportData), "faster fault discovery") || strings.Contains(string(reportData), "Statistical Population") {
 		t.Errorf("report contains an unsupported speed or population claim: %s", string(reportData))
+	}
+	for _, generatedReport := range []string{string(reportData), exp.GenerateEmpiricalReportMarkdown(res)} {
+		if !strings.Contains(generatedReport, "Go runtime: go1.27.3") {
+			t.Error("report does not identify the evaluated Go runtime")
+		}
 	}
 }
 
