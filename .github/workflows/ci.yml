@@ -10,12 +10,13 @@ jobs:
   test-linux:
     name: Test (Linux)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@41dfa10bad2bb2aeab73afc76774e5781a77e842 # v5.3.0
         with:
           go-version-file: 'go.mod'
           check-latest: true
@@ -30,7 +31,103 @@ jobs:
         run: go vet ./...
 
       - name: Unit and Integration Tests
-        run: go test -count=1 ./...
+        run: go test -count=1 -timeout 15m ./...
 
       - name: Race Detection Tests
-        run: go test -race -count=1 ./...
+        run: go test -race -count=1 -timeout 15m ./...
+
+  test-windows:
+    name: Test (Windows, CGO_ENABLED=0)
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Set up Go
+        uses: actions/setup-go@41dfa10bad2bb2aeab73afc76774e5781a77e842 # v5.3.0
+        with:
+          go-version-file: 'go.mod'
+          check-latest: true
+
+      - name: Verify Dependencies
+        run: go mod verify
+
+      - name: Format
+        run: |
+          $files = gofmt -l .
+          if ($files) {
+            Write-Host "Unformatted files:"
+            $files
+            exit 1
+          }
+
+      - name: Vet
+        run: go vet ./...
+        env:
+          CGO_ENABLED: "0"
+
+      - name: Unit and Integration Tests
+        # Race detector note: Go's race detector (-race) on Windows requires CGO
+        # (CGO_ENABLED=1) and a C compiler (MinGW-w64 gcc). Windows CI runs with
+        # CGO_ENABLED=0 to validate standard pure-Go compilation and test execution
+        # without external C toolchain dependencies. Race detection is comprehensively
+        # validated on Linux in the test-linux job.
+        run: go test -count=1 -timeout 15m ./...
+        env:
+          CGO_ENABLED: "0"
+
+  analysis-python:
+    name: Analysis (Python ${{ matrix.python-version }} on ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.12", "3.15.2"]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Set up Python
+        uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.4.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          allow-prereleases: false
+          cache: pip
+          cache-dependency-path: analysis/requirements.txt
+
+      - name: Install analysis dependencies
+        # Install with binary wheel preference and graceful fallback if prebuilt wheels are unavailable
+        shell: pwsh
+        run: |
+          $installed = $false
+          try {
+            $prev = $PSNativeCommandUseErrorActionPreference
+            $PSNativeCommandUseErrorActionPreference = $false
+            python -I -m pip --isolated install --only-binary=:all: -r analysis/requirements.txt
+            if ($LASTEXITCODE -eq 0) { $installed = $true }
+            $PSNativeCommandUseErrorActionPreference = $prev
+          } catch {
+            Write-Host "Initial --only-binary install encountered an exception; proceeding to fallback."
+          }
+          if (-not $installed) {
+            Write-Host "Prebuilt wheels not available for all packages; falling back to prefer-binary..."
+            python -I -m pip --isolated install --prefer-binary -r analysis/requirements.txt
+          }
+
+      - name: Verify analysis dependencies
+        run: python -I -m pip --isolated check
+
+      - name: Run statistical unit tests
+        run: python -I analysis/test_paired_stats.py
+
+      - name: Run benchmark analysis
+        shell: pwsh
+        run: |
+          if (Test-Path results/benchmark_per_seed.csv) {
+            python -I -W error analysis/paired_stats.py results/benchmark_per_seed.csv "Benchmark Compatibility" MUT-1 MUT-2 MUT-3 MUT-4 MUT-5 MUT-6 MUT-8 MUT-9
+          } else {
+            Write-Host "results/benchmark_per_seed.csv not present; skipping analysis."
+          }

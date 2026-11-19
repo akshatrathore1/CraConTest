@@ -58,8 +58,8 @@ func TestEvaluatorHandBuiltSixTupleCurves(t *testing.T) {
 	expectedPoints1 := []exp.Point{
 		{Budget: 0, Tested: 0, Failures: 0, DistinctBugs: 0},
 		{Budget: 1, Tested: 1, Failures: 0, DistinctBugs: 0}, // c0 (valid)
-		{Budget: 3, Tested: 3, Failures: 2, DistinctBugs: 1}, // c0, c1 (viol sigA), c2 (open_error)
-		{Budget: 6, Tested: 6, Failures: 4, DistinctBugs: 2}, // all: c1(sigA), c2(err), c3(sigA), c4(sigB)
+		{Budget: 3, Tested: 3, Failures: 2, DistinctBugs: 2}, // c0, c1 (viol sigA), c2 (open_error)
+		{Budget: 6, Tested: 6, Failures: 4, DistinctBugs: 3}, // all: c1(sigA), c2(err), c3(sigA), c4(sigB)
 	}
 
 	if len(points1) != len(expectedPoints1) {
@@ -82,8 +82,8 @@ func TestEvaluatorHandBuiltSixTupleCurves(t *testing.T) {
 	expectedPoints2 := []exp.Point{
 		{Budget: 0, Tested: 0, Failures: 0, DistinctBugs: 0},
 		{Budget: 1, Tested: 1, Failures: 1, DistinctBugs: 1}, // c4 (viol sigB)
-		{Budget: 3, Tested: 3, Failures: 3, DistinctBugs: 2}, // c4 (sigB), c2 (open_error), c1 (sigA)
-		{Budget: 6, Tested: 6, Failures: 4, DistinctBugs: 2}, // all
+		{Budget: 3, Tested: 3, Failures: 3, DistinctBugs: 3}, // c4 (sigB), c2 (open_error), c1 (sigA)
+		{Budget: 6, Tested: 6, Failures: 4, DistinctBugs: 3}, // all
 	}
 
 	if len(points2) != len(expectedPoints2) {
@@ -502,5 +502,91 @@ func TestEvaluateWithNormalizedOpenErrors(t *testing.T) {
 		if points[i] != expected[i] {
 			t.Errorf("point %d: got %+v, want %+v", i, points[i], expected[i])
 		}
+	}
+}
+
+func TestEvaluateWithUnnormalizedOpenErrorAndPanicSignatures(t *testing.T) {
+	universe := makeTestUniverse(4)
+	c0, c1, c2, c3 := universe[0], universe[1], universe[2], universe[3]
+
+	sigA := "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+	// Deliberately leave Signature empty for open_error and panic to verify that
+	// Evaluate and TabulateSummary automatically normalize them via NormalizeTable.
+	outcomes := []oracle.Outcome{
+		{Candidate: c0, Class: oracle.ClassOpenError, Detail: "corrupt MANIFEST"},
+		{Candidate: c1, Class: oracle.ClassPanic, Detail: "slice bounds out of range [4] with length 2"},
+		{Candidate: c2, Class: oracle.ClassViolation, Rule: "durably_committed", Signature: sigA},
+		{Candidate: c3, Class: oracle.ClassValid},
+	}
+
+	budgets := []int{0, 1, 2, 3, 4}
+	ranking := []candidate.Candidate{c0, c1, c2, c3}
+
+	points, err := exp.Evaluate(universe, ranking, outcomes, budgets)
+	if err != nil {
+		t.Fatalf("Evaluate: %v", err)
+	}
+
+	expected := []exp.Point{
+		{Budget: 0, Tested: 0, Failures: 0, DistinctBugs: 0},
+		{Budget: 1, Tested: 1, Failures: 1, DistinctBugs: 1}, // c0 (open_error normalized to manifest_corrupt)
+		{Budget: 2, Tested: 2, Failures: 2, DistinctBugs: 2}, // c0, c1 (panic normalized to slice bounds)
+		{Budget: 3, Tested: 3, Failures: 3, DistinctBugs: 3}, // c0, c1, c2 (viol sigA)
+		{Budget: 4, Tested: 4, Failures: 3, DistinctBugs: 3}, // c0, c1, c2, c3 (valid)
+	}
+
+	for i := range points {
+		if points[i] != expected[i] {
+			t.Errorf("point %d: got %+v, want %+v", i, points[i], expected[i])
+		}
+	}
+
+	summary, err := exp.TabulateSummary(universe, ranking, outcomes)
+	if err != nil {
+		t.Fatalf("TabulateSummary: %v", err)
+	}
+	if summary.DistinctBugs != 3 {
+		t.Errorf("expected DistinctBugs=3, got %d", summary.DistinctBugs)
+	}
+	if summary.OpenErrors != 1 || summary.Panics != 1 || summary.Violations != 1 {
+		t.Errorf("expected OpenErrors=1, Panics=1, Violations=1, got OpenErrors=%d, Panics=%d, Violations=%d",
+			summary.OpenErrors, summary.Panics, summary.Violations)
+	}
+}
+
+func TestClassHangDistinctBugsTracking(t *testing.T) {
+	universe := makeTestUniverse(3)
+	outcomes := []oracle.Outcome{
+		{Candidate: universe[0], Class: oracle.ClassValid},
+		{Candidate: universe[1], Class: oracle.ClassHang, Detail: "SafeOpen timeout after 5s"},
+		{Candidate: universe[2], Class: oracle.ClassHang, Detail: "SafeOpen timeout after 10s"},
+	}
+
+	budgets := []int{0, 1, 2, 3}
+	ranking := universe
+
+	points, err := exp.Evaluate(universe, ranking, outcomes, budgets)
+	if err != nil {
+		t.Fatalf("Evaluate failed: %v", err)
+	}
+
+	// Budget 3 tested all 3 candidates; 2 hangs with normalized signature "v1:hang:SafeOpen timeout after Ns"
+	if points[3].Failures != 2 {
+		t.Errorf("expected 2 failures, got %d", points[3].Failures)
+	}
+	if points[3].DistinctBugs != 1 {
+		t.Errorf("expected 1 distinct bug (collapsed by N normalization), got %d", points[3].DistinctBugs)
+	}
+
+	summary, err := exp.TabulateSummary(universe, ranking, outcomes)
+	if err != nil {
+		t.Fatalf("TabulateSummary failed: %v", err)
+	}
+	if summary.Hangs != 2 {
+		t.Errorf("expected Hangs=2, got %d", summary.Hangs)
+	}
+	if summary.DistinctBugs != 1 {
+		t.Errorf("expected DistinctBugs=1, got %d", summary.DistinctBugs)
 	}
 }

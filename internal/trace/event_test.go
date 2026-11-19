@@ -65,6 +65,36 @@ func TestTraceV1RoundTrip(test *testing.T) {
 	}
 }
 
+func TestTraceV1PreallocateRoundTrip(test *testing.T) {
+	events := []trace.Event{
+		{ID: 1, Kind: trace.KindCreate, File: "data", Handle: 1},
+		{ID: 2, Kind: trace.KindPreallocate, File: "data", Handle: 1, Off: 64, Size: 4096},
+		{ID: 3, Kind: trace.KindWrite, File: "data", Handle: 1, Data: []byte("abcd"), Len: 4},
+		{ID: 4, Kind: trace.KindClose, File: "data", Handle: 1},
+	}
+	var encoded bytes.Buffer
+	if err := trace.Encode(&encoded, events); err != nil {
+		test.Fatal(err)
+	}
+	decoded, err := trace.Decode(&encoded)
+	if err != nil {
+		test.Fatal(err)
+	}
+	if !reflect.DeepEqual(events, decoded) {
+		test.Fatal("preallocation offset or size changed during round trip")
+	}
+	if !decoded[1].IsMutation() || decoded[1].IsBarrier() {
+		test.Fatal("preallocation must be a mutation attempt, not a durability barrier")
+	}
+	cuts, err := trace.CutIDs(decoded)
+	if err != nil {
+		test.Fatal(err)
+	}
+	if !reflect.DeepEqual(cuts, []uint64{0, 1, 2, 3}) {
+		test.Fatalf("preallocation cutoff missing or changed: %v", cuts)
+	}
+}
+
 func TestTraceV1RejectsInvalidRecords(test *testing.T) {
 	cases := map[string]func([]trace.Event){
 		"ID gap":                    func(events []trace.Event) { events[3].ID = 99 },

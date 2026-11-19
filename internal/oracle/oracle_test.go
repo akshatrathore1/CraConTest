@@ -1,6 +1,7 @@
 package oracle_test
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -352,4 +353,406 @@ func TestOraclePrefixHoleDivergentOpKind(t *testing.T) {
 	if outcomeRewrite.Signature != expectedSigRewrite {
 		t.Fatalf("expected signature for 'ingest', got %q, want %q", outcomeRewrite.Signature, expectedSigRewrite)
 	}
+}
+
+func TestOraclePrefixHoleEmptyValues(t *testing.T) {
+	cases := []struct {
+		name      string
+		initial   oracle.State
+		laterKind string
+		later     history.Mutation
+		recovered oracle.State
+	}{
+		{
+			name:      "missing empty value before surviving set",
+			laterKind: "set",
+			later:     setMut("C", "1"),
+			recovered: oracle.State{"A": "1", "C": "1"},
+		},
+		{
+			name:      "surviving delete of empty value",
+			initial:   oracle.State{"D": ""},
+			laterKind: "delete",
+			later:     history.Mutation{Kind: "delete", Key: []byte("D")},
+			recovered: oracle.State{"A": "1"},
+		},
+		{
+			name:      "surviving range delete of empty value",
+			initial:   oracle.State{"D": ""},
+			laterKind: "range_delete",
+			later:     history.Mutation{Kind: "range_delete", Key: []byte("D"), End: []byte("E")},
+			recovered: oracle.State{"A": "1"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			entries := []history.Entry{
+				testEntry(1, 1, 2, false, "set", setMut("A", "1")),
+				testEntry(2, 3, 4, false, "ingest", setMut("B", "")),
+				testEntry(3, 5, 6, false, tc.laterKind, tc.later),
+			}
+			outcome := oracle.Check(oracle.Context{
+				Candidate: candidate.Candidate{Event: 6, Percent: 0},
+				History:   entries,
+				Initial:   tc.initial,
+				Recovered: tc.recovered,
+			})
+			if outcome.Class != oracle.ClassViolation || outcome.Rule != "prefix" {
+				t.Fatalf("got %s/%s, want violation/prefix", outcome.Class, outcome.Rule)
+			}
+			expected := oracle.FormatSignature("prefix", "ingest", nil)
+			if outcome.Signature != expected {
+				t.Fatalf("got signature %q, want missing ingest signature %q", outcome.Signature, expected)
+			}
+		})
+	}
+}
+
+func TestOracleFromIdx0AndRangeDeleteOverwrite(t *testing.T) {
+	// Defect 18: fromIdx == 0 must not panic, and range_delete must act as a valid witness.
+	// Op 1 (set, 1..2): set k1=v1
+	// Op 2 (range_delete, 3..4): range_delete [k0, k2)
+	// Op 3 (set, 5..6): set k3=v3
+	op1 := testEntry(1, 1, 2, false, "set", setMut("k1", "v1"))
+	rangeMut := history.Mutation{Kind: "range_delete", Key: []byte("k0"), End: []byte("k2")}
+	op2 := testEntry(2, 3, 4, false, "range_delete", rangeMut)
+	op3 := testEntry(3, 5, 6, false, "set", setMut("k3", "v3"))
+
+	events := []trace.Event{
+		{ID: 1, Kind: trace.KindOpBegin, Op: 1, OpKind: "set"},
+		{ID: 2, Kind: trace.KindOpEnd, Op: 1, OpKind: "set"},
+		{ID: 3, Kind: trace.KindOpBegin, Op: 2, OpKind: "range_delete"},
+		{ID: 4, Kind: trace.KindOpEnd, Op: 2, OpKind: "range_delete"},
+		{ID: 5, Kind: trace.KindOpBegin, Op: 3, OpKind: "set"},
+		{ID: 6, Kind: trace.KindOpEnd, Op: 3, OpKind: "set"},
+	}
+
+	// Case 1: Op 1 missing, Op 3 present -> evaluated fromIdx 0
+	ctxFrom0 := oracle.Context{
+		Candidate: candidate.Candidate{Event: 6, Percent: 100, Seed: 1},
+		History:   []history.Entry{op1, op2, op3},
+		Events:    events,
+		Recovered: oracle.State{"k3": "v3"},
+	}
+	// Does not panic and identifies valid or prefix violation
+	outcome := oracle.Check(ctxFrom0)
+	if outcome.Class == oracle.ClassPanic || outcome.Class == oracle.ClassOracleError {
+		t.Fatalf("unexpected oracle error or panic on fromIdx 0: %+v", outcome)
+	}
+}
+
+func TestOracleEdgeCases(t *testing.T) {
+	t.Run("EmptyBatchRejectedAsInvalidHistory", func(t *testing.T) {
+		// According to history.Validate contract, mutating operation "batch" with 0 mutations
+		// must be detected and rejected as ClassOracleError.
+		emptyBatch := testEntry(1, 1, 2, true, "batch")
+		events := []trace.Event{
+			{ID: 1, Kind: trace.KindOpBegin, Op: 1, OpKind: "batch"},
+			{ID: 2, Kind: trace.KindOpEnd, Op: 1, OpKind: "batch"},
+		}
+		ctx := oracle.Context{
+			Candidate: candidate.Candidate{Event: 2, Percent: 100, Seed: 1},
+			History:   []history.Entry{emptyBatch},
+			Events:    events,
+			Recovered: oracle.State{},
+		}
+		res := oracle.Check(ctx)
+		if res.Class != oracle.ClassOracleError || !strings.Contains(res.Detail, "must have at least one mutation") {
+			t.Fatalf("expected ClassOracleError for empty batch, got: %s (detail: %s)", res.Class, res.Detail)
+		}
+	})
+
+	t.Run("BatchMultipleMutationsSameKey", func(t *testing.T) {
+		// A batch with multiple mutations touching the same key (e.g. set k=v1, then set k=v2)
+		batch := testEntry(1, 1, 2, true, "batch", setMut("k", "v1"), setMut("k", "v2"))
+		events := []trace.Event{
+			{ID: 1, Kind: trace.KindOpBegin, Op: 1, OpKind: "batch"},
+			{ID: 2, Kind: trace.KindOpEnd, Op: 1, OpKind: "batch"},
+		}
+		ctx := oracle.Context{
+			Candidate: candidate.Candidate{Event: 2, Percent: 100, Seed: 1},
+			History:   []history.Entry{batch},
+			Events:    events,
+			Recovered: oracle.State{"k": "v2"},
+		}
+		res := oracle.Check(ctx)
+		if res.Class != oracle.ClassValid {
+			t.Fatalf("expected valid for batch intra-key overwrite, got: %s (detail: %s)", res.Class, res.Detail)
+		}
+	})
+
+	t.Run("OverlappingRangeDeletes", func(t *testing.T) {
+		// Initial state has keys k0, k1, k2, k3, k4, k5
+		initial := oracle.State{
+			"k0": "v0", "k1": "v1", "k2": "v2", "k3": "v3", "k4": "v4", "k5": "v5",
+		}
+		// Op 1 deletes [k1, k4) -> removes k1, k2, k3
+		mut1 := history.Mutation{Kind: "range_delete", Key: []byte("k1"), End: []byte("k4")}
+		op1 := testEntry(1, 1, 2, true, "range_delete", mut1)
+
+		// Op 2 deletes [k3, k6) -> overlapping on k3; removes k4, k5
+		mut2 := history.Mutation{Kind: "range_delete", Key: []byte("k3"), End: []byte("k6")}
+		op2 := testEntry(2, 3, 4, true, "range_delete", mut2)
+
+		events := []trace.Event{
+			{ID: 1, Kind: trace.KindOpBegin, Op: 1, OpKind: "range_delete"},
+			{ID: 2, Kind: trace.KindOpEnd, Op: 1, OpKind: "range_delete"},
+			{ID: 3, Kind: trace.KindOpBegin, Op: 2, OpKind: "range_delete"},
+			{ID: 4, Kind: trace.KindOpEnd, Op: 2, OpKind: "range_delete"},
+		}
+
+		// After both operations, only "k0" should remain
+		ctxBoth := oracle.Context{
+			Candidate: candidate.Candidate{Event: 4, Percent: 100, Seed: 1},
+			History:   []history.Entry{op1, op2},
+			Events:    events,
+			Initial:   initial,
+			Recovered: oracle.State{"k0": "v0"},
+		}
+		resBoth := oracle.Check(ctxBoth)
+		if resBoth.Class != oracle.ClassValid {
+			t.Fatalf("expected valid for overlapping range deletes, got: %s (detail: %s)", resBoth.Class, resBoth.Detail)
+		}
+
+		// If Op 2 survived but Op 1 was lost (prefix hole):
+		// Recovered has deleted k4, k5, but k1, k2, k3 survived
+		ctxHole := oracle.Context{
+			Candidate:  candidate.Candidate{Event: 4, Percent: 100, Seed: 1},
+			History:    []history.Entry{op1, op2},
+			Events:     events,
+			Categories: []string{"pebble-manifest"},
+			Initial:    initial,
+			Recovered:  oracle.State{"k0": "v0", "k1": "v1", "k2": "v2", "k3": "v3"},
+		}
+		resHole := oracle.Check(ctxHole)
+		if resHole.Class != oracle.ClassViolation || resHole.Rule != "prefix" {
+			t.Fatalf("expected prefix violation for missing first range_delete, got %s / %s (detail: %s)",
+				resHole.Class, resHole.Rule, resHole.Detail)
+		}
+	})
+
+	t.Run("KeyResurrectionAfterDeleteAndSet", func(t *testing.T) {
+		initial := oracle.State{"k": "v0"}
+		// Op 1: delete k
+		op1 := testEntry(1, 1, 2, true, "delete", history.Mutation{Kind: "delete", Key: []byte("k")})
+		// Op 2: set k = v1
+		op2 := testEntry(2, 3, 4, true, "set", setMut("k", "v1"))
+		// Op 3: delete k
+		op3 := testEntry(3, 5, 6, true, "delete", history.Mutation{Kind: "delete", Key: []byte("k")})
+		// Op 4: set k = v2
+		op4 := testEntry(4, 7, 8, true, "set", setMut("k", "v2"))
+
+		events := []trace.Event{
+			{ID: 1, Kind: trace.KindOpBegin, Op: 1, OpKind: "delete"},
+			{ID: 2, Kind: trace.KindOpEnd, Op: 1, OpKind: "delete"},
+			{ID: 3, Kind: trace.KindOpBegin, Op: 2, OpKind: "set"},
+			{ID: 4, Kind: trace.KindOpEnd, Op: 2, OpKind: "set"},
+			{ID: 5, Kind: trace.KindOpBegin, Op: 3, OpKind: "delete"},
+			{ID: 6, Kind: trace.KindOpEnd, Op: 3, OpKind: "delete"},
+			{ID: 7, Kind: trace.KindOpBegin, Op: 4, OpKind: "set"},
+			{ID: 8, Kind: trace.KindOpEnd, Op: 4, OpKind: "set"},
+		}
+
+		// Valid final state: k = v2
+		ctxFinal := oracle.Context{
+			Candidate: candidate.Candidate{Event: 8, Percent: 100, Seed: 1},
+			History:   []history.Entry{op1, op2, op3, op4},
+			Events:    events,
+			Initial:   initial,
+			Recovered: oracle.State{"k": "v2"},
+		}
+		if res := oracle.Check(ctxFinal); res.Class != oracle.ClassValid {
+			t.Fatalf("expected valid for final state k=v2, got: %s (detail: %s)", res.Class, res.Detail)
+		}
+
+		// Resurrection violation: obsolete v0 resurrected when Op 4 durably committed
+		ctxResurrect := oracle.Context{
+			Candidate:  candidate.Candidate{Event: 8, Percent: 100, Seed: 1},
+			History:    []history.Entry{op1, op2, op3, op4},
+			Events:     events,
+			Categories: []string{"pebble-wal"},
+			Initial:    initial,
+			Recovered:  oracle.State{"k": "v0"},
+		}
+		resResurrect := oracle.Check(ctxResurrect)
+		if resResurrect.Class != oracle.ClassViolation {
+			t.Fatalf("expected violation for obsolete resurrected value v0, got: %s (detail: %s)",
+				resResurrect.Class, resResurrect.Detail)
+		}
+	})
+
+	t.Run("LongMutationChainOnSameKey", func(t *testing.T) {
+		const numOps = 40
+		entries := make([]history.Entry, numOps)
+		events := make([]trace.Event, numOps*2)
+
+		for i := 0; i < numOps; i++ {
+			opID := uint64(i + 1)
+			bEv := (opID-1)*2 + 1
+			eEv := bEv + 1
+			val := fmt.Sprintf("val-%d", i)
+			entries[i] = testEntry(opID, bEv, eEv, true, "set", setMut("hot_key", val))
+			events[(opID-1)*2] = trace.Event{ID: bEv, Kind: trace.KindOpBegin, Op: opID, OpKind: "set"}
+			events[(opID-1)*2+1] = trace.Event{ID: eEv, Kind: trace.KindOpEnd, Op: opID, OpKind: "set"}
+		}
+
+		// Final state has hot_key = val-39
+		ctxFinal := oracle.Context{
+			Candidate: candidate.Candidate{Event: uint64(numOps * 2), Percent: 100, Seed: 1},
+			History:   entries,
+			Events:    events,
+			Recovered: oracle.State{"hot_key": fmt.Sprintf("val-%d", numOps-1)},
+		}
+		resFinal := oracle.Check(ctxFinal)
+		if resFinal.Class != oracle.ClassValid {
+			t.Fatalf("expected valid for long mutation chain final state, got: %s (detail: %s)",
+				resFinal.Class, resFinal.Detail)
+		}
+
+		// Intermediate valid state hot_key = val-20 at cutoff event 42
+		ctxInter := oracle.Context{
+			Candidate: candidate.Candidate{Event: 42, Percent: 100, Seed: 1},
+			History:   entries[:21],
+			Events:    events[:42],
+			Recovered: oracle.State{"hot_key": "val-20"},
+		}
+		resInter := oracle.Check(ctxInter)
+		if resInter.Class != oracle.ClassValid {
+			t.Fatalf("expected valid for intermediate cutoff in long chain, got: %s (detail: %s)",
+				resInter.Class, resInter.Detail)
+		}
+	})
+
+	t.Run("DeleteNonexistentKey", func(t *testing.T) {
+		op := testEntry(1, 1, 2, true, "delete", history.Mutation{Kind: "delete", Key: []byte("never_existed")})
+		events := []trace.Event{
+			{ID: 1, Kind: trace.KindOpBegin, Op: 1, OpKind: "delete"},
+			{ID: 2, Kind: trace.KindOpEnd, Op: 1, OpKind: "delete"},
+		}
+		ctx := oracle.Context{
+			Candidate: candidate.Candidate{Event: 2, Percent: 100, Seed: 1},
+			History:   []history.Entry{op},
+			Events:    events,
+			Initial:   oracle.State{"other": "val"},
+			Recovered: oracle.State{"other": "val"},
+		}
+		res := oracle.Check(ctx)
+		if res.Class != oracle.ClassValid {
+			t.Fatalf("expected valid for deleting nonexistent key, got: %s (detail: %s)", res.Class, res.Detail)
+		}
+	})
+
+	t.Run("RangeDeleteEmptyRange", func(t *testing.T) {
+		initial := oracle.State{"a": "1", "z": "9"}
+		op := testEntry(1, 1, 2, true, "range_delete", history.Mutation{
+			Kind: "range_delete",
+			Key:  []byte("m"),
+			End:  []byte("p"),
+		})
+		events := []trace.Event{
+			{ID: 1, Kind: trace.KindOpBegin, Op: 1, OpKind: "range_delete"},
+			{ID: 2, Kind: trace.KindOpEnd, Op: 1, OpKind: "range_delete"},
+		}
+		ctx := oracle.Context{
+			Candidate: candidate.Candidate{Event: 2, Percent: 100, Seed: 1},
+			History:   []history.Entry{op},
+			Events:    events,
+			Initial:   initial,
+			Recovered: oracle.State{"a": "1", "z": "9"},
+		}
+		res := oracle.Check(ctx)
+		if res.Class != oracle.ClassValid {
+			t.Fatalf("expected valid for empty range delete, got: %s (detail: %s)", res.Class, res.Detail)
+		}
+	})
+
+	t.Run("SubsumedRangeDeletes", func(t *testing.T) {
+		initial := oracle.State{"a": "1", "b": "2", "c": "3", "d": "4", "e": "5"}
+		// Op 1 deletes ["b", "d") -> removes "b", "c"
+		op1 := testEntry(1, 1, 2, true, "range_delete", history.Mutation{
+			Kind: "range_delete",
+			Key:  []byte("b"),
+			End:  []byte("d"),
+		})
+		// Op 2 deletes ["a", "e") -> subsumes Op 1 and removes "a", "d"
+		op2 := testEntry(2, 3, 4, true, "range_delete", history.Mutation{
+			Kind: "range_delete",
+			Key:  []byte("a"),
+			End:  []byte("e"),
+		})
+		events := []trace.Event{
+			{ID: 1, Kind: trace.KindOpBegin, Op: 1, OpKind: "range_delete"},
+			{ID: 2, Kind: trace.KindOpEnd, Op: 1, OpKind: "range_delete"},
+			{ID: 3, Kind: trace.KindOpBegin, Op: 2, OpKind: "range_delete"},
+			{ID: 4, Kind: trace.KindOpEnd, Op: 2, OpKind: "range_delete"},
+		}
+		ctx := oracle.Context{
+			Candidate: candidate.Candidate{Event: 4, Percent: 100, Seed: 1},
+			History:   []history.Entry{op1, op2},
+			Events:    events,
+			Initial:   initial,
+			Recovered: oracle.State{"e": "5"},
+		}
+		res := oracle.Check(ctx)
+		if res.Class != oracle.ClassValid {
+			t.Fatalf("expected valid for subsumed range deletes, got: %s (detail: %s)", res.Class, res.Detail)
+		}
+	})
+
+	t.Run("BatchMixedSetAndDeleteSameKey", func(t *testing.T) {
+		// Single batch with multiple intra-batch operations on the same key:
+		// set k1=v1, delete k1, set k1=v2
+		batch := testEntry(1, 1, 2, true, "batch",
+			setMut("k1", "v1"),
+			history.Mutation{Kind: "delete", Key: []byte("k1")},
+			setMut("k1", "v2"),
+		)
+		events := []trace.Event{
+			{ID: 1, Kind: trace.KindOpBegin, Op: 1, OpKind: "batch"},
+			{ID: 2, Kind: trace.KindOpEnd, Op: 1, OpKind: "batch"},
+		}
+		ctx := oracle.Context{
+			Candidate: candidate.Candidate{Event: 2, Percent: 100, Seed: 1},
+			History:   []history.Entry{batch},
+			Events:    events,
+			Recovered: oracle.State{"k1": "v2"},
+		}
+		res := oracle.Check(ctx)
+		if res.Class != oracle.ClassValid {
+			t.Fatalf("expected valid for batch mixed set/delete/set, got: %s (detail: %s)", res.Class, res.Detail)
+		}
+	})
+
+	t.Run("CandidateAtCutoff0EmptyHistory", func(t *testing.T) {
+		ctx := oracle.Context{
+			Candidate: candidate.Candidate{Event: 0, Percent: 0, Seed: 1},
+			History:   nil,
+			Events:    nil,
+			Initial:   nil,
+			Recovered: oracle.State{},
+		}
+		res := oracle.Check(ctx)
+		if res.Class != oracle.ClassValid {
+			t.Fatalf("expected valid for candidate at cutoff 0 with empty history, got: %s (detail: %s)", res.Class, res.Detail)
+		}
+	})
+
+	t.Run("UntouchedKeyNoPanic", func(t *testing.T) {
+		entry := testEntry(1, 1, 2, true, "set", setMut("touched_key", "v1"))
+		events := []trace.Event{
+			{ID: 1, Kind: trace.KindOpBegin, Op: 1, OpKind: "set"},
+			{ID: 2, Kind: trace.KindOpEnd, Op: 1, OpKind: "set"},
+		}
+		ctx := oracle.Context{
+			Candidate: candidate.Candidate{Event: 2, Percent: 100, Seed: 1},
+			History:   []history.Entry{entry},
+			Events:    events,
+			Initial:   oracle.State{"untouched_init": "val0"},
+			Recovered: oracle.State{"untouched_init": "val0", "touched_key": "v1"},
+		}
+		res := oracle.Check(ctx)
+		if res.Class != oracle.ClassValid {
+			t.Fatalf("expected valid, got: %s (detail: %s)", res.Class, res.Detail)
+		}
+	})
 }

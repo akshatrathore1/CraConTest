@@ -23,6 +23,21 @@ type walWriteNotifier interface {
 	NotifyDroppedWALWrite()
 }
 
+func findWALWriteNotifier(target any) walWriteNotifier {
+	curr := target
+	for i := 0; i < 32 && curr != nil; i++ {
+		if w, ok := curr.(walWriteNotifier); ok {
+			return w
+		}
+		if u, ok := curr.(interface{ Unwrap() vfs.FS }); ok {
+			curr = u.Unwrap()
+		} else {
+			break
+		}
+	}
+	return nil
+}
+
 // Seeded fault IDs.
 const (
 	MUT0 = "MUT-0" // Null pass-through control
@@ -149,17 +164,17 @@ func NormalizeID(id string) (string, error) {
 }
 
 // IsSparse reports whether a fault model is a sparse, windowed, or selective
-// fault model (MUT-2..MUT-9 and MUT-X1..MUT-X6), as opposed to the null control
-// (MUT-0), the dense every-WAL-sync drop baseline (MUT-1), or barrier controls.
+// fault model (MUT-3..MUT-9 and MUT-X1..MUT-X6), as opposed to the null control
+// (MUT-0), dense baseline faults (MUT-1, MUT-2), or barrier controls.
 func IsSparse(id string) bool {
 	norm, err := NormalizeID(id)
 	if err != nil {
 		return false
 	}
 	switch norm {
-	case Barrier5825, BarrierCkpt, MUT0, MUT1:
+	case Barrier5825, BarrierCkpt, MUT0, MUT1, MUT2:
 		return false
-	case MUT2, MUT3, MUT4, MUT5, MUT6, MUT7, MUT8, MUT9,
+	case MUT3, MUT4, MUT5, MUT6, MUT7, MUT8, MUT9,
 		MUTX1, MUTX2, MUTX3, MUTX4, MUTX5, MUTX6:
 		return true
 	default:
@@ -172,9 +187,10 @@ type Config struct {
 	ID          string // Canonical ID (MUT-0..MUT-9) or descriptive alias
 	WALDropK    int    // Drop strictly the k-th WAL sync for MUT5 (default: 1)
 	DirDropK    int    // Drop strictly the k-th directory sync for MUT9 (default: 1)
-	TriggerName string // Lifecycle trigger event for MUT8 (default: "CompactionBegin")
+	TriggerName string // Lifecycle trigger event for synthetic MUT8 tests (default: "CompactionBegin")
 	DropBudget  int    // Number of syncs to drop after trigger for MUT8 (default: 1)
 	XK          int    // Parameterized k-th event drop for MUT-X1, MUT-X2, MUT-X3, MUT-X6 (used when XK > 0)
+	Seed        uint64 // Seed for probabilistic fault injection MUT-X4 and MUT-X5 (default: 1)
 }
 
 // DefaultConfig returns calibrated defaults for a given fault identifier.
@@ -190,6 +206,7 @@ func DefaultConfig(id string) Config {
 		DirDropK:    1,
 		TriggerName: "CompactionBegin",
 		DropBudget:  1,
+		Seed:        1,
 	}
 	if ok && k > 0 {
 		cfg.XK = k
@@ -225,9 +242,10 @@ type FS struct {
 	kDirSyncDropped bool
 
 	// sealed-holdout state
-	xN       [6]int
-	xDropped bool
-	xCall    int
+	xN         [6]int
+	xDropped   bool
+	xCall      int
+	xDropCount int
 }
 
 // Indices into FS.xN for k-th event hold-out fault models (MUT-X4 and MUT-X5
@@ -239,8 +257,8 @@ const (
 	xIdxX6 = 4
 )
 
-func flakyHash(seed, idx int) float64 {
-	z := uint64(seed)*0x9E3779B97F4A7C15 + uint64(idx)*0xBF58476D1CE4E5B9 + 0x94D049BB133111EB
+func flakyHash(seed uint64, idx int) float64 {
+	z := seed*0x9E3779B97F4A7C15 + uint64(idx)*0xBF58476D1CE4E5B9 + 0x94D049BB133111EB
 	z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9
 	z = (z ^ (z >> 27)) * 0x94D049BB133111EB
 	z ^= z >> 31
@@ -320,7 +338,7 @@ func (fs *FS) EndIngestSection() {
 
 // WALWriteCount forwards to the underlying recorder FS if supported.
 func (fs *FS) WALWriteCount() uint64 {
-	if w, ok := fs.inner.(walWriteNotifier); ok {
+	if w := findWALWriteNotifier(fs.inner); w != nil {
 		return w.WALWriteCount()
 	}
 	return 0
@@ -328,10 +346,33 @@ func (fs *FS) WALWriteCount() uint64 {
 
 // WaitForWALWrite forwards to the underlying recorder FS if supported.
 func (fs *FS) WaitForWALWrite(target uint64) {
-	if w, ok := fs.inner.(walWriteNotifier); ok {
+	if w := findWALWriteNotifier(fs.inner); w != nil {
 		w.WaitForWALWrite(target)
 	}
 }
+
+// CurrentEventID forwards to the inner filesystem if it or an unwrapped layer
+// implements CurrentEventID() uint64.
+func (fs *FS) CurrentEventID() uint64 {
+	curr := any(fs.inner)
+	for curr != nil {
+		if ep, ok := curr.(interface{ CurrentEventID() uint64 }); ok {
+			return ep.CurrentEventID()
+		}
+		if u, ok := curr.(interface{ Unwrap() vfs.FS }); ok {
+			curr = u.Unwrap()
+		} else {
+			break
+		}
+	}
+	return 0
+}
+
+// NeedWALWriteBarrier returns true: fault-injecting FSes may drop WAL writes
+// asynchronously, so callers must issue WaitForWALWrite barriers after Sync
+// (op.Sync) mutations to ensure the WAL write event appears in the trace before the next
+// operation marker.
+func (fs *FS) NeedWALWriteBarrier() bool { return true }
 
 // State inspection methods
 func (fs *FS) WALSyncCount() int {
@@ -388,6 +429,9 @@ func (fs *FS) ArmDirSyncDrop() {
 	fs.pendingDirSyncDrop = true
 }
 
+// Trigger manually activates the fault trigger for the given lifecycle event name.
+// In real workloads, MUT-8 triggers automatically via "pebble-compaction" category
+// in onFileCreate; Trigger provides programmatic lifecycle control for unit tests.
 func (fs *FS) Trigger(name string) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
@@ -419,6 +463,27 @@ func (fs *FS) TriggerDropCount() int {
 	return fs.triggerDropCount
 }
 
+// XDropped reports whether a parameterized MUT-X sync drop has occurred.
+func (fs *FS) XDropped() bool {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	return fs.xDropped
+}
+
+// XCall returns the count of flaky fault evaluations.
+func (fs *FS) XCall() int {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	return fs.xCall
+}
+
+// XDropCount returns the count of flaky faults dropped.
+func (fs *FS) XDropCount() int {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	return fs.xDropCount
+}
+
 func (fs *FS) Reset() {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
@@ -436,6 +501,7 @@ func (fs *FS) Reset() {
 	fs.xN = [6]int{}
 	fs.xDropped = false
 	fs.xCall = 0
+	fs.xDropCount = 0
 }
 
 func (fs *FS) onFileCreate(name string, category vfs.DiskWriteCategory) {
@@ -492,9 +558,7 @@ func (fs *FS) shouldDropSync(f *file, op string) bool {
 		if string(f.category) == "pebble-manifest" {
 			fs.manifestSyncCount++
 			if !fs.manSyncDropped {
-				// Note: walSyncCount is only incremented in case MUT5 (line 483),
-				// so walSyncCount is always 0 under MUT6; this drops the 2nd MANIFEST sync.
-				if fs.manifestCount > 1 || fs.manifestSyncCount >= 2 || fs.walSyncCount > 0 {
+				if fs.manifestCount > 1 || fs.manifestSyncCount >= 2 {
 					fs.manSyncDropped = true
 					return true
 				}
@@ -574,14 +638,30 @@ func (fs *FS) shouldDropSync(f *file, op string) bool {
 	case MUTX4:
 		if !f.isDir {
 			fs.xCall++
-			return flakyHash(1, fs.xCall) < 0.04
+			seed := fs.cfg.Seed
+			if seed == 0 {
+				seed = 1
+			}
+			if flakyHash(seed, fs.xCall) < 0.04 {
+				fs.xDropCount++
+				return true
+			}
+			return false
 		}
 		return false
 
 	case MUTX5:
 		if f.isDir {
 			fs.xCall++
-			return flakyHash(1, fs.xCall) < 0.12
+			seed := fs.cfg.Seed
+			if seed == 0 {
+				seed = 1
+			}
+			if flakyHash(seed, fs.xCall) < 0.12 {
+				fs.xDropCount++
+				return true
+			}
+			return false
 		}
 		return false
 
@@ -636,6 +716,14 @@ func (fs *FS) Create(name string, category vfs.DiskWriteCategory) (vfs.File, err
 		return nil, err
 	}
 	fs.onFileCreate(name, category)
+	fs.mu.Lock()
+	if fs.cfg.ID == MUT7 {
+		baseName := fs.inner.PathBase(name)
+		if isMetadataPointer(baseName, name) {
+			fs.pendingDirSyncDrop = true
+		}
+	}
+	fs.mu.Unlock()
 	return &file{
 		fs:       fs,
 		inner:    f,
@@ -646,15 +734,18 @@ func (fs *FS) Create(name string, category vfs.DiskWriteCategory) (vfs.File, err
 // Link implements vfs.FS.
 func (fs *FS) Link(oldname, newname string) error {
 	fs.maybeSyncParentDir(newname)
-	fs.mu.Lock()
-	if fs.cfg.ID == MUT7 {
-		baseNew := fs.inner.PathBase(newname)
-		if isMetadataPointer(baseNew, newname) {
-			fs.pendingDirSyncDrop = true
+	err := fs.inner.Link(oldname, newname)
+	if err == nil {
+		fs.mu.Lock()
+		if fs.cfg.ID == MUT7 {
+			baseNew := fs.inner.PathBase(newname)
+			if isMetadataPointer(baseNew, newname) {
+				fs.pendingDirSyncDrop = true
+			}
 		}
+		fs.mu.Unlock()
 	}
-	fs.mu.Unlock()
-	return fs.inner.Link(oldname, newname)
+	return err
 }
 
 // Open implements vfs.FS.
@@ -710,6 +801,27 @@ func (fs *FS) RemoveAll(name string) error {
 // Rename implements vfs.FS.
 func (fs *FS) Rename(oldname, newname string) error {
 	fs.maybeSyncParentDir(newname)
+	err := fs.inner.Rename(oldname, newname)
+	if err == nil {
+		fs.mu.Lock()
+		if fs.cfg.ID == MUT7 {
+			baseNew := fs.inner.PathBase(newname)
+			if isMetadataPointer(baseNew, newname) {
+				fs.pendingDirSyncDrop = true
+			}
+		}
+		fs.mu.Unlock()
+	}
+	return err
+}
+
+// ReuseForWrite implements vfs.FS.
+func (fs *FS) ReuseForWrite(oldname, newname string, category vfs.DiskWriteCategory) (vfs.File, error) {
+	fs.maybeSyncParentDir(newname)
+	f, err := fs.inner.ReuseForWrite(oldname, newname, category)
+	if err != nil {
+		return nil, err
+	}
 	fs.mu.Lock()
 	if fs.cfg.ID == MUT7 {
 		baseNew := fs.inner.PathBase(newname)
@@ -718,15 +830,6 @@ func (fs *FS) Rename(oldname, newname string) error {
 		}
 	}
 	fs.mu.Unlock()
-	return fs.inner.Rename(oldname, newname)
-}
-
-// ReuseForWrite implements vfs.FS.
-func (fs *FS) ReuseForWrite(oldname, newname string, category vfs.DiskWriteCategory) (vfs.File, error) {
-	f, err := fs.inner.ReuseForWrite(oldname, newname, category)
-	if err != nil {
-		return nil, err
-	}
 	fs.onFileCreate(newname, category)
 	return &file{
 		fs:       fs,
@@ -810,7 +913,7 @@ func (f *file) Write(p []byte) (int, error) {
 		}
 		f.fs.mu.Unlock()
 		if drop {
-			if w, ok := f.fs.inner.(walWriteNotifier); ok {
+			if w := findWALWriteNotifier(f.fs.inner); w != nil {
 				w.NotifyDroppedWALWrite()
 			}
 			return len(p), nil // acknowledged but never applied
@@ -820,6 +923,21 @@ func (f *file) Write(p []byte) (int, error) {
 }
 
 func (f *file) WriteAt(p []byte, off int64) (int, error) {
+	if f.fs != nil && f.fs.cfg.ID == MUTX6 && string(f.category) == "pebble-wal" {
+		f.fs.mu.Lock()
+		f.fs.xCall++
+		drop := f.fs.xCall == f.fs.xN[xIdxX6]
+		if drop {
+			f.fs.xDropCount++
+		}
+		f.fs.mu.Unlock()
+		if drop {
+			if w := findWALWriteNotifier(f.fs.inner); w != nil {
+				w.NotifyDroppedWALWrite()
+			}
+			return len(p), nil // acknowledged but never applied
+		}
+	}
 	return f.inner.WriteAt(p, off)
 }
 

@@ -37,8 +37,12 @@ type Weights struct {
 	Delta float64
 }
 
-// DefaultWeights are the initial combined-strategy weights.
-var DefaultWeights = Weights{Alpha: 1, Beta: 1, Gamma: 1, Delta: 1}
+// defaultWeights are the initial combined-strategy weights.
+var defaultWeights = Weights{Alpha: 1, Beta: 1, Gamma: 1, Delta: 1}
+
+// DefaultWeights returns the default combined-strategy weights.
+// A copy is returned so callers cannot mutate the package-level value.
+func DefaultWeights() Weights { return defaultWeights }
 
 // ValidatePermutation checks that ranking contains exactly the tuples of
 // universe, each once.
@@ -139,18 +143,16 @@ func (lifo) Rank(view *graph.View, universe []candidate.Candidate) []candidate.C
 	if _, ok := features(view, ordered); !ok {
 		return nil
 	}
-	result := make([]candidate.Candidate, len(ordered))
-	copy(result, ordered)
-	sort.Slice(result, func(i, j int) bool {
-		if result[i].Event != result[j].Event {
-			return result[i].Event > result[j].Event
+	sort.Slice(ordered, func(i, j int) bool {
+		if ordered[i].Event != ordered[j].Event {
+			return ordered[i].Event > ordered[j].Event
 		}
-		if result[i].Percent != result[j].Percent {
-			return result[i].Percent < result[j].Percent
+		if ordered[i].Percent != ordered[j].Percent {
+			return ordered[i].Percent < ordered[j].Percent
 		}
-		return result[i].Seed < result[j].Seed
+		return ordered[i].Seed < ordered[j].Seed
 	})
-	return result
+	return ordered
 }
 
 // --- B3: stride / even interval -----------------------------------------
@@ -290,6 +292,11 @@ type scoreHeap []scored
 
 func (h scoreHeap) Len() int { return len(h) }
 func (h scoreHeap) Less(left, right int) bool {
+	lNaN := math.IsNaN(h[left].score)
+	rNaN := math.IsNaN(h[right].score)
+	if lNaN != rNaN {
+		return !lNaN
+	}
 	if h[left].score != h[right].score {
 		return h[left].score > h[right].score
 	}
@@ -419,23 +426,23 @@ func ByName(name string, seed uint64, weights Weights) (Strategy, error) {
 		return NewCombined(weights)
 	case "representative", "b5":
 		return NewRepresentative(), nil
-	case "sync-boundary", "b6", "sync_boundary":
+	case "sync-boundary", "b6", "sync_boundary", "c1":
 		return NewSyncBoundary(), nil
 	case "rhg", "b7", "risk_horizon", "risk-horizon":
-		if weights != (Weights{}) && weights != DefaultWeights {
+		if weights != (Weights{}) {
 			w := RHGWeights{Risk: weights.Alpha, Barrier: weights.Beta, Semantic: weights.Gamma, Novelty: weights.Delta}
 			if err := validateRHGWeights(w); err != nil {
 				return nil, err
 			}
 			return NewRiskHorizon(w), nil
 		}
-		return NewRiskHorizon(DefaultRHGWeights), nil
+		return NewRiskHorizon(DefaultRHGWeights()), nil
 	case "r1", "r1-random", "r1_random", "r1_zero_retention_first", "r0_retention_first_random":
 		return NewR1(seed), nil
 	case "r2", "r2-representative", "r2_representative", "r2_state_representative", "state_representative_r1":
 		return NewR2(seed), nil
 	case "dcg", "b8", "durability_contract", "durability-contract":
-		if weights != (Weights{}) && weights != DefaultWeights {
+		if weights != (Weights{}) {
 			w := DCGWeights{
 				WALWeight:      weights.Alpha,
 				ManifestWeight: weights.Beta,

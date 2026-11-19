@@ -386,3 +386,179 @@ func TestBuildCollapsed(t *testing.T) {
 		t.Fatalf("BuildCollapsed (%d) did not reduce raw universe (%d)", len(collapsed), len(raw))
 	}
 }
+
+func TestStateHashReuseForWrite(t *testing.T) {
+	events := []trace.Event{
+		{ID: 1, Kind: trace.KindMkdirAll, File: "db", Mode: 0755},
+		{ID: 2, Kind: trace.KindCreate, File: "db/old.wal", Handle: 1, Cat: "pebble-wal"},
+		{ID: 3, Kind: trace.KindWrite, File: "db/old.wal", Handle: 1, Data: []byte("initial"), Len: 7},
+		{ID: 4, Kind: trace.KindSync, File: "db/old.wal", Handle: 1},
+		{ID: 5, Kind: trace.KindClose, File: "db/old.wal", Handle: 1},
+		{ID: 6, Kind: trace.KindReuseForWrite, File: "db/old.wal", File2: "db/new.wal", Handle: 2, Cat: "pebble-wal"},
+		{ID: 7, Kind: trace.KindWrite, File: "db/new.wal", Handle: 2, Data: []byte("recycled_data"), Len: 13},
+		{ID: 8, Kind: trace.KindSync, File: "db/new.wal", Handle: 2},
+	}
+
+	hPreReuse := candidate.StateHash(events, 5, 0)
+	hPostReuse := candidate.StateHash(events, 6, 0)
+	hPostWrite := candidate.StateHash(events, 7, 100)
+	hPostSync := candidate.StateHash(events, 8, 0)
+
+	if hPreReuse == hPostReuse {
+		t.Fatalf("ReuseForWrite must alter namespace state")
+	}
+	if hPostReuse == hPostWrite {
+		t.Fatalf("Write after reuse should change 100%% retention hash")
+	}
+	if hPostReuse == hPostSync {
+		t.Fatalf("Sync after reuse should change 0%% durable hash")
+	}
+}
+
+func TestStateHashScopedDirectorySync(t *testing.T) {
+	events := []trace.Event{
+		{ID: 1, Kind: trace.KindMkdirAll, File: "db", Mode: 0755},
+		{ID: 2, Kind: trace.KindMkdirAll, File: "staging", Mode: 0755},
+		{ID: 3, Kind: trace.KindCreate, File: "db/file1", Handle: 1},
+		{ID: 4, Kind: trace.KindCreate, File: "staging/file2", Handle: 2},
+		// Sync db directory only (handle 3)
+		{ID: 5, Kind: trace.KindSync, File: "db", Handle: 3, Dir: true},
+	}
+
+	// At cutoff 4, both db/file1 and staging/file2 are pending.
+	// At cutoff 5, db/file1 should be cleared, but staging/file2 MUST remain pending.
+	hCut4 := candidate.StateHash(events, 4, 0)
+	hCut5 := candidate.StateHash(events, 5, 0)
+	if hCut4 == hCut5 {
+		t.Fatalf("sync of db must alter pending set")
+	}
+
+	// Now if we sync staging (handle 4), state hash should advance again
+	events = append(events, trace.Event{ID: 6, Kind: trace.KindSync, File: "staging", Handle: 4, Dir: true})
+	hCut6 := candidate.StateHash(events, 6, 0)
+	if hCut5 == hCut6 {
+		t.Fatalf("subsequent sync of staging directory must clear remaining pending entry")
+	}
+}
+
+func TestStateHashHandleBasedDirectorySync(t *testing.T) {
+	// Verifies that when KindSync on a directory has an empty File field (handle-only sync),
+	// candidate.buildCutoffStates correctly resolves the directory path from the handle.
+	events := []trace.Event{
+		{ID: 1, Kind: trace.KindMkdirAll, File: "db", Mode: 0755},
+		{ID: 2, Kind: trace.KindMkdirAll, File: "staging", Mode: 0755},
+		{ID: 3, Kind: trace.KindCreate, File: "db/file1", Handle: 1},
+		{ID: 4, Kind: trace.KindCreate, File: "staging/file2", Handle: 2},
+		{ID: 5, Kind: trace.KindOpenDir, File: "db", Handle: 10, Dir: true},
+		// Sync directory via handle 10 with empty File:
+		{ID: 6, Kind: trace.KindSync, File: "", Handle: 10, Dir: true},
+	}
+
+	hCut4 := candidate.StateHash(events, 4, 0)
+	hCut6 := candidate.StateHash(events, 6, 0)
+	if hCut4 == hCut6 {
+		t.Fatalf("handle-based directory sync with empty File field must clear db pending entries")
+	}
+
+	// Staging pending op must still be present; syncing staging should advance hash again:
+	events = append(events,
+		trace.Event{ID: 7, Kind: trace.KindOpenDir, File: "staging", Handle: 20, Dir: true},
+		trace.Event{ID: 8, Kind: trace.KindSync, File: "", Handle: 20, Dir: true},
+	)
+	hCut8 := candidate.StateHash(events, 8, 0)
+	if hCut6 == hCut8 {
+		t.Fatalf("handle-based sync of staging directory must clear staging pending entries")
+	}
+}
+
+func TestZeroByteSyncedFileAndEmptyDirectoryStateHash(t *testing.T) {
+	// Defect 14 & 15: 0-byte synced files and empty synced directories must produce
+	// distinct state hashes at 0% retention compared to pre-creation state.
+	events := []trace.Event{
+		{ID: 1, Kind: trace.KindMkdirAll, File: "db", Mode: 0755},
+		{ID: 2, Kind: trace.KindOpenDir, File: "db", Handle: 10, Dir: true},
+		{ID: 3, Kind: trace.KindSync, File: ".", Handle: 1, Dir: true}, // sync root to persist "db" dir
+		{ID: 4, Kind: trace.KindCreate, File: "db/LOCK", Handle: 2},
+		{ID: 5, Kind: trace.KindSync, File: "db/LOCK", Handle: 2},
+		{ID: 6, Kind: trace.KindSync, File: "db", Handle: 10, Dir: true}, // sync db dir to persist "db/LOCK"
+	}
+
+	hPreCreation := candidate.StateHash(events, 0, 0)
+	hDirSynced := candidate.StateHash(events, 3, 0)
+	hLockSynced := candidate.StateHash(events, 6, 0)
+
+	if hPreCreation == hDirSynced {
+		t.Fatalf("empty synced directory must have distinct StateHash from pre-creation at 0%% retention")
+	}
+	if hDirSynced == hLockSynced {
+		t.Fatalf("0-byte synced file must have distinct StateHash from state before file creation at 0%% retention")
+	}
+}
+
+func TestStateHashReuseForWriteResetsSyncedAndLinkPropagates(t *testing.T) {
+	events := []trace.Event{
+		{ID: 1, Kind: trace.KindMkdirAll, File: "db", Mode: 0755},
+		{ID: 2, Kind: trace.KindSync, File: ".", Handle: 1, Dir: true},
+		{ID: 3, Kind: trace.KindCreate, File: "db/file1", Handle: 2},
+		{ID: 4, Kind: trace.KindSync, File: "db", Handle: 1, Dir: true},
+		{ID: 5, Kind: trace.KindSync, File: "db/file1", Handle: 2},
+		// db/file1 is now a 0-byte synced file in a synced dir
+		{ID: 6, Kind: trace.KindLink, File: "db/file1", File2: "db/file1_link"},
+		{ID: 7, Kind: trace.KindSync, File: "db", Handle: 1, Dir: true},
+		// Reuse db/file1 for db/file2
+		{ID: 8, Kind: trace.KindReuseForWrite, File: "db/file1", File2: "db/file2", Handle: 3},
+		{ID: 9, Kind: trace.KindWrite, File: "db/file2", Handle: 3, Data: []byte("dirty"), Len: 5},
+	}
+
+	hPreLink := candidate.StateHash(events, 5, 0)
+	hPostLink := candidate.StateHash(events, 7, 0)
+	if hPreLink == hPostLink {
+		t.Fatalf("hard-linked 0-byte synced file must produce distinct StateHash at 0%% retention")
+	}
+
+	// At cutoff 8 (reuse occurred, but no new sync) and cutoff 9 (unsynced write):
+	// db/file2 is NOT synced, so at 0% retention it should not have durable data.
+	hPostReuse0 := candidate.StateHash(events, 8, 0)
+	hPostWrite0 := candidate.StateHash(events, 9, 0)
+	if hPostReuse0 != hPostWrite0 {
+		t.Fatalf("unsynced write to reused file at 0%% retention should not change durable state")
+	}
+}
+
+func TestGapEventIDs(t *testing.T) {
+	// Defect 2.1: Events with gap IDs must not corrupt intermediate cutoff states.
+	events := []trace.Event{
+		{ID: 1, Kind: trace.KindCreate, File: "db/file1", Handle: 1},
+		{ID: 5, Kind: trace.KindCreate, File: "db/file2", Handle: 2},
+	}
+	h0 := candidate.StateHash(events, 0, 0)
+	h1 := candidate.StateHash(events, 1, 0)
+	h2 := candidate.StateHash(events, 2, 0)
+	h3 := candidate.StateHash(events, 3, 0)
+	h4 := candidate.StateHash(events, 4, 0)
+	h5 := candidate.StateHash(events, 5, 0)
+
+	if h1 == h0 {
+		t.Fatalf("cutoff 1 should reflect file1 creation")
+	}
+	if h2 != h1 || h3 != h1 || h4 != h1 {
+		t.Fatalf("cutoffs 2, 3, 4 before gap event 5 must match cutoff 1 state, got h2=%s h1=%s", h2, h1)
+	}
+	if h5 == h1 {
+		t.Fatalf("cutoff 5 should reflect file2 creation and differ from cutoff 1")
+	}
+}
+
+func TestCutoffCacheCollisionDifferentFiles(t *testing.T) {
+	trace1 := []trace.Event{
+		{ID: 1, Kind: trace.KindCreate, File: "db/file1", Handle: 1},
+	}
+	trace2 := []trace.Event{
+		{ID: 1, Kind: trace.KindCreate, File: "db/file2", Handle: 2},
+	}
+	h1 := candidate.StateHash(trace1, 1, 0)
+	h2 := candidate.StateHash(trace2, 1, 0)
+	if h1 == h2 {
+		t.Fatalf("different files must produce different state hashes, got same: %s", h1)
+	}
+}

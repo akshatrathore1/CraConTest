@@ -82,7 +82,7 @@ inherit it through the handle rather than repeating it on write/sync events.
 | `Read(p)` | No | Requested size, returned count and input cursor |
 | `ReadAt(p, off)` | No | — |
 | `Stat()` | No | — |
-| `Preallocate(off, len)` | No | — |
+| `Preallocate(off, len)` | Yes | `Preallocate` event (records allocation offset and length) |
 | `Prefetch(off, len)` | No | — |
 | `Fd()` | No | — |
 
@@ -168,6 +168,7 @@ calls and checks error presence while preserving their side effects.
 | `Sync` | `File.Sync` | Full file sync (metadata + data) |
 | `SyncData` | `File.SyncData` | Data-only sync |
 | `SyncTo` | `File.SyncTo` | Prefix sync (informational) |
+| `Preallocate` | `File.Preallocate` | File disk space preallocation |
 | `Close` | `File.Close` | File handle closed |
 | `Unlock` | Lock resource close | Lock resource released |
 | `Rename` | `FS.Rename` | Atomic file rename |
@@ -320,9 +321,14 @@ In addition to topological reachability and state-equivalence partitioning, CraC
 - **Manifest Version Staging and Commitment (`stagedInManifest` and `committedInManifest`):** SSTable creations mark tables as staged; subsequent manifest writes and syncs transition them to committed, asserting dangling table indicators (`DanglingTableCount`) if unpersisted tables are referenced by a durable manifest.
 - **Client Write Acknowledgment (`ackOps` and `ackSyncOps`):** Correlating client transaction markers (`trace.KindOpBegin`, `trace.KindOpEnd`) with WAL sync barriers, detecting unpersisted WAL bytes for acknowledged client mutations (`AckSyncMissing`).
 
+## Evaluation Trace Profile
+
+The revised evaluation profile at `v1.1-evaluation-freeze` records `Preallocate` using the existing `off` and `size` fields for allocation offset and length. It is a mutation attempt, not a durability barrier; in the pinned in-memory filesystem, preallocation does not alter file contents or the sequential write cursor. Existing traces remain readable by the revised implementation, but readers predating this event extension may reject traces containing `Preallocate`.
+
 ## Revision History
 
 | Date | Section | Correction |
 |---|---|---|
 | 2026-10-20 | Schema, ordering and format | Version-one handles, call results, cursor semantics and JSON envelope replace the path-only sketch and unversioned event stream. |
 | 2026-10-22 | Paths | The recorder applies only spelling changes that name the same in-memory file and refuses names without a faithful trace spelling, instead of resolving `..`, drive prefixes and backslashes. |
+| 2026-11-19 | Evaluation trace profile | Record preallocation attempts using existing offset/size fields; distinguish revised-reader compatibility from historical-reader rejection of the added event kind. |

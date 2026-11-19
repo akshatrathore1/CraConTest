@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -706,6 +707,212 @@ func TestAppendSyncEventStopsAtSameHandleCloseAndOpBoundary(t *testing.T) {
 	}
 }
 
+func TestAppendSyncEventBoundaryEdgeCases(t *testing.T) {
+	t.Run("EmptyTrace", func(t *testing.T) {
+		rec := vfsrec.New(vfs.NewMem())
+		rec.AppendSyncEventForTesting(trace.Event{Kind: trace.KindSync, Handle: 1, File: "wal.log"})
+		evs := rec.Events()
+		if len(evs) != 1 {
+			t.Fatalf("expected 1 event, got %d", len(evs))
+		}
+		if evs[0].ID != 1 || evs[0].Kind != trace.KindSync || evs[0].Handle != 1 {
+			t.Fatalf("unexpected event: %+v", evs[0])
+		}
+	})
+
+	t.Run("PrecedingWriteAt", func(t *testing.T) {
+		rec := vfsrec.New(vfs.NewMem())
+		rec.AppendEventForTesting(trace.Event{Kind: trace.KindWriteAt, Handle: 1, File: "manifest"})
+		rec.AppendEventForTesting(trace.Event{Kind: trace.KindRead, Handle: 2, File: "table.sst"})
+		rec.AppendSyncEventForTesting(trace.Event{Kind: trace.KindSync, Handle: 1, File: "manifest"})
+
+		evs := rec.Events()
+		if len(evs) != 3 {
+			t.Fatalf("expected 3 events, got %d", len(evs))
+		}
+		if evs[0].Kind != trace.KindWriteAt || evs[1].Kind != trace.KindSync || evs[2].Kind != trace.KindRead {
+			t.Fatalf("expected [WriteAt, Sync, Read], got kinds [%s, %s, %s]", evs[0].Kind, evs[1].Kind, evs[2].Kind)
+		}
+		for i, e := range evs {
+			if e.ID != uint64(i+1) {
+				t.Errorf("evs[%d].ID = %d, want %d", i, e.ID, i+1)
+			}
+		}
+	})
+
+	t.Run("ScanWindowExactBoundary", func(t *testing.T) {
+		// Case A: Exactly 8 trailing non-mutating events (within syncReorderScanWindow = 8)
+		recWithin := vfsrec.New(vfs.NewMem())
+		recWithin.AppendEventForTesting(trace.Event{Kind: trace.KindWrite, Handle: 1, File: "wal.log"})
+		for i := 0; i < 8; i++ {
+			recWithin.AppendEventForTesting(trace.Event{Kind: trace.KindRead, Handle: uint64(i + 2), File: "other"})
+		}
+		recWithin.AppendSyncEventForTesting(trace.Event{Kind: trace.KindSync, Handle: 1, File: "wal.log"})
+		evsWithin := recWithin.Events()
+		if len(evsWithin) != 10 {
+			t.Fatalf("expected 10 events, got %d", len(evsWithin))
+		}
+		if evsWithin[0].Kind != trace.KindWrite || evsWithin[1].Kind != trace.KindSync {
+			t.Fatalf("expected Sync repositioned immediately after Write within 8-event window, got [%s, %s]",
+				evsWithin[0].Kind, evsWithin[1].Kind)
+		}
+
+		// Case B: Exactly 9 trailing non-mutating events (exceeds syncReorderScanWindow = 8)
+		recExceed := vfsrec.New(vfs.NewMem())
+		recExceed.AppendEventForTesting(trace.Event{Kind: trace.KindWrite, Handle: 1, File: "wal.log"})
+		for i := 0; i < 9; i++ {
+			recExceed.AppendEventForTesting(trace.Event{Kind: trace.KindRead, Handle: uint64(i + 2), File: "other"})
+		}
+		recExceed.AppendSyncEventForTesting(trace.Event{Kind: trace.KindSync, Handle: 1, File: "wal.log"})
+		evsExceed := recExceed.Events()
+		if len(evsExceed) != 11 {
+			t.Fatalf("expected 11 events, got %d", len(evsExceed))
+		}
+		if evsExceed[len(evsExceed)-1].Kind != trace.KindSync {
+			t.Fatalf("expected Sync at the tail when window is exceeded, got %+v at end", evsExceed[len(evsExceed)-1])
+		}
+		if evsExceed[1].Kind == trace.KindSync {
+			t.Fatalf("Sync should NOT have repositioned when separated by 9 events")
+		}
+	})
+
+	t.Run("MultipleWritesSameHandle", func(t *testing.T) {
+		rec := vfsrec.New(vfs.NewMem())
+		rec.AppendEventForTesting(trace.Event{Kind: trace.KindWrite, Handle: 1, File: "wal.log", Off: 0, Len: 10})
+		rec.AppendEventForTesting(trace.Event{Kind: trace.KindWrite, Handle: 1, File: "wal.log", Off: 10, Len: 10})
+		rec.AppendEventForTesting(trace.Event{Kind: trace.KindRead, Handle: 2, File: "other"})
+		rec.AppendSyncEventForTesting(trace.Event{Kind: trace.KindSync, Handle: 1, File: "wal.log"})
+
+		evs := rec.Events()
+		if len(evs) != 4 {
+			t.Fatalf("expected 4 events, got %d", len(evs))
+		}
+		// Sync should be placed after the 2nd Write, not before it
+		if evs[0].Kind != trace.KindWrite || evs[1].Kind != trace.KindWrite || evs[2].Kind != trace.KindSync || evs[3].Kind != trace.KindRead {
+			t.Fatalf("expected [Write, Write, Sync, Read], got [%s, %s, %s, %s]",
+				evs[0].Kind, evs[1].Kind, evs[2].Kind, evs[3].Kind)
+		}
+	})
+
+	t.Run("HookInvocation", func(t *testing.T) {
+		rec := vfsrec.New(vfs.NewMem())
+		var hookedIDs []uint64
+		rec.SetHook(func(id uint64) {
+			hookedIDs = append(hookedIDs, id)
+		})
+		rec.AppendEventForTesting(trace.Event{Kind: trace.KindWrite, Handle: 1, File: "wal.log"})
+		rec.AppendEventForTesting(trace.Event{Kind: trace.KindRead, Handle: 2, File: "other"})
+		rec.AppendSyncEventForTesting(trace.Event{Kind: trace.KindSync, Handle: 1, File: "wal.log"})
+
+		// Write was ID 1, Read was ID 2. Sync was inserted at index 1 -> assigned ID 2.
+		// Hook for sync should receive ID 2.
+		if len(hookedIDs) != 3 {
+			t.Fatalf("expected 3 hook calls, got %v", hookedIDs)
+		}
+		if hookedIDs[2] != 2 {
+			t.Fatalf("expected hook for sync to receive ID 2, got %d", hookedIDs[2])
+		}
+	})
+
+	t.Run("LockBoundaryHardStop", func(t *testing.T) {
+		rec := vfsrec.New(vfs.NewMem())
+		rec.AppendEventForTesting(trace.Event{Kind: trace.KindWrite, Handle: 1, File: "wal.log"})
+		rec.AppendEventForTesting(trace.Event{Kind: trace.KindLock, Handle: 2, File: "db/LOCK"})
+		rec.AppendEventForTesting(trace.Event{Kind: trace.KindRead, Handle: 3, File: "other"})
+		rec.AppendSyncEventForTesting(trace.Event{Kind: trace.KindSync, Handle: 1, File: "wal.log"})
+
+		evs := rec.Events()
+		if len(evs) != 4 {
+			t.Fatalf("expected 4 events, got %d", len(evs))
+		}
+		if evs[len(evs)-1].Kind != trace.KindSync {
+			t.Fatalf("expected Sync to stay at tail past Lock boundary, got %v at tail", evs[len(evs)-1])
+		}
+	})
+
+	t.Run("UnlockBoundaryHardStop", func(t *testing.T) {
+		rec := vfsrec.New(vfs.NewMem())
+		rec.AppendEventForTesting(trace.Event{Kind: trace.KindWrite, Handle: 1, File: "wal.log"})
+		rec.AppendEventForTesting(trace.Event{Kind: trace.KindUnlock, Handle: 2, File: "db/LOCK"})
+		rec.AppendEventForTesting(trace.Event{Kind: trace.KindRead, Handle: 3, File: "other"})
+		rec.AppendSyncEventForTesting(trace.Event{Kind: trace.KindSync, Handle: 1, File: "wal.log"})
+
+		evs := rec.Events()
+		if len(evs) != 4 {
+			t.Fatalf("expected 4 events, got %d", len(evs))
+		}
+		if evs[len(evs)-1].Kind != trace.KindSync {
+			t.Fatalf("expected Sync to stay at tail past Unlock boundary, got %v at tail", evs[len(evs)-1])
+		}
+	})
+
+	t.Run("OpBeginBoundaryHardStop", func(t *testing.T) {
+		rec := vfsrec.New(vfs.NewMem())
+		rec.AppendEventForTesting(trace.Event{Kind: trace.KindWrite, Handle: 1, File: "wal.log"})
+		rec.AppendEventForTesting(trace.Event{Kind: trace.KindOpBegin, Op: 42, OpKind: "set"})
+		rec.AppendEventForTesting(trace.Event{Kind: trace.KindRead, Handle: 2, File: "other"})
+		rec.AppendSyncEventForTesting(trace.Event{Kind: trace.KindSync, Handle: 1, File: "wal.log"})
+
+		evs := rec.Events()
+		if len(evs) != 4 {
+			t.Fatalf("expected 4 events, got %d", len(evs))
+		}
+		if evs[len(evs)-1].Kind != trace.KindSync {
+			t.Fatalf("expected Sync to stay at tail past OpBegin boundary, got %v at tail", evs[len(evs)-1])
+		}
+	})
+
+	t.Run("OpEndBoundaryHardStop", func(t *testing.T) {
+		rec := vfsrec.New(vfs.NewMem())
+		rec.AppendEventForTesting(trace.Event{Kind: trace.KindWrite, Handle: 1, File: "wal.log"})
+		rec.AppendEventForTesting(trace.Event{Kind: trace.KindOpEnd, Op: 42, OpKind: "set"})
+		rec.AppendEventForTesting(trace.Event{Kind: trace.KindRead, Handle: 2, File: "other"})
+		rec.AppendSyncEventForTesting(trace.Event{Kind: trace.KindSync, Handle: 1, File: "wal.log"})
+
+		evs := rec.Events()
+		if len(evs) != 4 {
+			t.Fatalf("expected 4 events, got %d", len(evs))
+		}
+		if evs[len(evs)-1].Kind != trace.KindSync {
+			t.Fatalf("expected Sync to stay at tail past OpEnd boundary, got %v at tail", evs[len(evs)-1])
+		}
+	})
+
+	t.Run("CausalMutationBarrierOtherHandle", func(t *testing.T) {
+		rec := vfsrec.New(vfs.NewMem())
+		rec.AppendEventForTesting(trace.Event{Kind: trace.KindWrite, Handle: 1, File: "wal.log", Off: 0, Len: 10})
+		rec.AppendEventForTesting(trace.Event{Kind: trace.KindCreate, Handle: 2, File: "table.sst"})
+		rec.AppendEventForTesting(trace.Event{Kind: trace.KindRead, Handle: 3, File: "other"})
+		rec.AppendSyncEventForTesting(trace.Event{Kind: trace.KindSync, Handle: 1, File: "wal.log"})
+
+		evs := rec.Events()
+		if len(evs) != 4 {
+			t.Fatalf("expected 4 events, got %d", len(evs))
+		}
+		if evs[len(evs)-1].Kind != trace.KindSync {
+			t.Fatalf("expected Sync to stay at tail when crossing a mutating Create on another handle, got %v at tail", evs[len(evs)-1])
+		}
+	})
+
+	t.Run("EngineEventAndCloseAllowReorder", func(t *testing.T) {
+		rec := vfsrec.New(vfs.NewMem())
+		rec.AppendEventForTesting(trace.Event{Kind: trace.KindWrite, Handle: 1, File: "wal.log", Off: 0, Len: 10})
+		rec.AppendEventForTesting(trace.Event{Kind: trace.KindClose, Handle: 2, File: "closed.sst"})
+		rec.AppendEventForTesting(trace.Event{Kind: trace.KindEngineEvent, Note: "FlushBegin"})
+		rec.AppendSyncEventForTesting(trace.Event{Kind: trace.KindSync, Handle: 1, File: "wal.log"})
+
+		evs := rec.Events()
+		if len(evs) != 4 {
+			t.Fatalf("expected 4 events, got %d", len(evs))
+		}
+		// Sync should reposition immediately adjacent to Write at index 1
+		if evs[0].Kind != trace.KindWrite || evs[1].Kind != trace.KindSync || evs[2].Kind != trace.KindClose || evs[3].Kind != trace.KindEngineEvent {
+			t.Fatalf("expected [Write, Sync, Close, EngineEvent], got [%s, %s, %s, %s]",
+				evs[0].Kind, evs[1].Kind, evs[2].Kind, evs[3].Kind)
+		}
+	})
+}
+
 func TestRecFileConcurrentReadAtAndClose(t *testing.T) {
 	for iter := 0; iter < 50; iter++ {
 		mem := vfs.NewMem()
@@ -936,4 +1143,80 @@ func TestWaitForWALWriteAndFlushBeginDeadlinePanics(t *testing.T) {
 			t.Fatalf("FlushBegin panic mismatch: got %v, want %q", panicked, want)
 		}
 	})
+}
+
+func TestFSRemoveTimeoutReturnsError(t *testing.T) {
+	mem := vfs.NewMem()
+	rec := vfsrec.New(mem)
+	rec.SetWaitTimeoutForTesting(15 * time.Millisecond)
+
+	if id := rec.CurrentEventID(); id != 0 {
+		t.Fatalf("expected CurrentEventID() == 0 on empty FS, got %d", id)
+	}
+
+	// Create a dummy file
+	f, err := rec.Create("testfile.txt", vfs.WriteCategoryUnspecified)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	_ = f.Close()
+
+	if id := rec.CurrentEventID(); id == 0 {
+		t.Fatalf("expected non-zero CurrentEventID after create/close")
+	}
+
+	// Put in ingest section from main goroutine so Remove from background goroutine will wait
+	rec.BeginIngestSection()
+
+	// Call Remove on unrelated file from another goroutine
+	errCh := make(chan error, 1)
+	go func() {
+		err := rec.Remove("testfile.txt")
+		errCh <- err
+	}()
+
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatalf("expected timeout error from Remove, got nil")
+		}
+		if !strings.Contains(err.Error(), "ingestCond wait exceeded") {
+			t.Fatalf("unexpected error message: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for Remove to return error")
+	}
+
+	rec.EndIngestSection()
+}
+
+func TestCurGoroutineID(t *testing.T) {
+	id := vfsrec.CurGoroutineIDForTesting()
+	if id == 0 {
+		t.Fatalf("expected non-zero goroutine ID, got 0")
+	}
+
+	testCases := []struct {
+		name     string
+		input    string
+		expected uint64
+	}{
+		{"standard_stack", "goroutine 123 [running]:\nmain.main()", 123},
+		{"single_line_no_newline", "goroutine 42", 42},
+		{"extra_whitespace", "goroutine   789 [waiting]", 789},
+		{"zero_id", "goroutine 0 [running]", 0},
+		{"non_numeric", "goroutine abc [running]", 0},
+		{"no_goroutine_prefix", "runtime: unexpected return pc", 0},
+		{"empty_string", "", 0},
+		{"embedded_goroutine_word", "some prefix goroutine 9999 [sleep]", 9999},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := vfsrec.ParseGoroutineIDForTesting(tc.input)
+			if got != tc.expected {
+				t.Errorf("ParseGoroutineID(%q) = %d, want %d", tc.input, got, tc.expected)
+			}
+		})
+	}
 }

@@ -49,13 +49,9 @@ func TestCostCheck1000Ops(t *testing.T) {
 		}
 	}
 
-	// Final flush and close.
-	if err := db.Flush(); err != nil {
-		t.Fatalf("final flush: %v", err)
-	}
-	if err := db.Close(); err != nil {
-		t.Fatalf("close: %v", err)
-	}
+	// Do NOT flush or close db before CrashClone so that unsynced buffers
+	// in memFS are actually retained and tested across retention percentages.
+	defer db.Close()
 
 	// Measure costs at 20 evenly spaced "crash points" by using different
 	// retention percentages to simulate variety.

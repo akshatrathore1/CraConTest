@@ -15,7 +15,7 @@ import (
 
 func allStrategies(test *testing.T) []strategy.Strategy {
 	test.Helper()
-	combined, err := strategy.NewCombined(strategy.DefaultWeights)
+	combined, err := strategy.NewCombined(strategy.DefaultWeights())
 	if err != nil {
 		test.Fatal(err)
 	}
@@ -43,12 +43,41 @@ func TestNames(test *testing.T) {
 		if item.Name() != want[index] {
 			test.Fatalf("name %q, want %q", item.Name(), want[index])
 		}
-		built, err := strategy.ByName(want[index], 7, strategy.DefaultWeights)
+		built, err := strategy.ByName(want[index], 7, strategy.DefaultWeights())
 		if err != nil || built.Name() != want[index] {
 			test.Fatalf("ByName(%q) failed: %v", want[index], err)
 		}
 	}
-	if _, err := strategy.ByName("future", 0, strategy.DefaultWeights); err == nil {
+	// Extended coverage for all supported strategy codes (L-8)
+	allCodes := []struct {
+		code     string
+		expected string
+	}{
+		{"b0", "random"},
+		{"b1", "fifo"},
+		{"b2", "lifo"},
+		{"b3", "stride"},
+		{"b4", "combined"},
+		{"b5", "representative"},
+		{"b6", "sync-boundary"},
+		{"b7", "rhg"},
+		{"b8", "dcg"},
+		{"r1", "r1"},
+		{"r2", "r2"},
+		{"dcg", "dcg"},
+		{"dcg-pr", "dcg-pr"},
+		{"dcg-flag-only", "dcg-flag-only"},
+	}
+	for _, tc := range allCodes {
+		s, err := strategy.ByName(tc.code, 42, strategy.DefaultWeights())
+		if err != nil {
+			test.Fatalf("ByName(%q) failed: %v", tc.code, err)
+		}
+		if s.Name() != tc.expected {
+			test.Fatalf("ByName(%q).Name() = %q, want %q", tc.code, s.Name(), tc.expected)
+		}
+	}
+	if _, err := strategy.ByName("future", 0, strategy.DefaultWeights()); err == nil {
 		test.Fatal("unknown strategy accepted")
 	}
 }
@@ -56,7 +85,7 @@ func TestNames(test *testing.T) {
 func TestCombinedReferenceGreedyOrder(test *testing.T) {
 	view, universe := referenceView()
 	original := append([]candidate.Candidate(nil), universe...)
-	combined, _ := strategy.NewCombined(strategy.DefaultWeights)
+	combined, _ := strategy.NewCombined(strategy.DefaultWeights())
 	ranking := combined.Rank(view, universe)
 	var order []uint64
 	for _, item := range ranking {
@@ -124,7 +153,7 @@ func randomInstance(seed uint64, size int) (*graph.View, []candidate.Candidate) 
 
 func TestCombinedMatchesNaiveGreedy(test *testing.T) {
 	for _, weights := range []strategy.Weights{
-		strategy.DefaultWeights,
+		strategy.DefaultWeights(),
 		{Alpha: 1, Beta: 1, Gamma: 0, Delta: 1},   // persistence-only
 		{Alpha: 0, Beta: 0, Gamma: 1, Delta: 1},   // semantic-only
 		{Alpha: 0.5, Beta: 2, Gamma: 3, Delta: 0}, // no novelty
@@ -256,7 +285,7 @@ func TestValidatePermutationRejects(test *testing.T) {
 
 func TestExplainScoreAudit(t *testing.T) {
 	view, universe := referenceView()
-	w := strategy.DefaultWeights
+	w := strategy.DefaultWeights()
 
 	// Combined rank
 	comb, err := strategy.NewCombined(w)
@@ -430,7 +459,7 @@ func TestByNameAllBaselinesAndAliases(t *testing.T) {
 	}
 
 	for alias, expectedName := range testCases {
-		strat, err := strategy.ByName(alias, 42, strategy.DefaultWeights)
+		strat, err := strategy.ByName(alias, 42, strategy.DefaultWeights())
 		if err != nil {
 			t.Fatalf("ByName(%q) returned error: %v", alias, err)
 		}
@@ -604,7 +633,7 @@ func TestR2SelectsBoundaryRepresentatives(t *testing.T) {
 func TestR1AndR2ByNameAliases(t *testing.T) {
 	r1Aliases := []string{"r1", "r1-random", "r1_random", "r1_zero_retention_first", "r0_retention_first_random"}
 	for _, alias := range r1Aliases {
-		strat, err := strategy.ByName(alias, 7, strategy.DefaultWeights)
+		strat, err := strategy.ByName(alias, 7, strategy.DefaultWeights())
 		if err != nil {
 			t.Fatalf("ByName(%q) returned error: %v", alias, err)
 		}
@@ -615,7 +644,7 @@ func TestR1AndR2ByNameAliases(t *testing.T) {
 
 	r2Aliases := []string{"r2", "r2-representative", "r2_representative", "r2_state_representative", "state_representative_r1"}
 	for _, alias := range r2Aliases {
-		strat, err := strategy.ByName(alias, 7, strategy.DefaultWeights)
+		strat, err := strategy.ByName(alias, 7, strategy.DefaultWeights())
 		if err != nil {
 			t.Fatalf("ByName(%q) returned error: %v", alias, err)
 		}
@@ -645,7 +674,7 @@ func TestR1AndR2MissingFeatures(t *testing.T) {
 func TestDCGByNameAliases(t *testing.T) {
 	aliases := []string{"dcg", "b8", "durability_contract", "durability-contract"}
 	for _, alias := range aliases {
-		strat, err := strategy.ByName(alias, 0, strategy.DefaultWeights)
+		strat, err := strategy.ByName(alias, 0, strategy.DefaultWeights())
 		if err != nil {
 			t.Fatalf("ByName(%q) returned error: %v", alias, err)
 		}
@@ -763,7 +792,7 @@ func TestDCGMissingFeatures(t *testing.T) {
 func TestDCGFlagOnlyByNameAliases(t *testing.T) {
 	aliases := []string{"dcg-flag-only", "dcg_flag_only", "dcg-flagonly"}
 	for _, alias := range aliases {
-		strat, err := strategy.ByName(alias, 42, strategy.DefaultWeights)
+		strat, err := strategy.ByName(alias, 42, strategy.DefaultWeights())
 		if err != nil {
 			t.Fatalf("ByName(%q) returned error: %v", alias, err)
 		}
@@ -1040,7 +1069,7 @@ func TestDCGTier3OrderingViolatingBeforeClean(t *testing.T) {
 }
 
 func TestDCGPartialByNameAndRanking(t *testing.T) {
-	stratObj, err := strategy.ByName("dcg-pr", 0, strategy.DefaultWeights)
+	stratObj, err := strategy.ByName("dcg-pr", 0, strategy.DefaultWeights())
 	if err != nil {
 		t.Fatalf("ByName(\"dcg-pr\") failed: %v", err)
 	}
@@ -1094,5 +1123,29 @@ func TestDCGPartialByNameAndRanking(t *testing.T) {
 	rankingDCG := dcgBase.Rank(view, uWithMid)
 	if rankingDCG[0].Percent != 0 {
 		t.Fatalf("dcg expected position 0 to be 0%% candidate, got %+v", rankingDCG[0])
+	}
+
+	// 3. Verify H-10 tier ranking: intermediate representatives without high unsynced dir count
+	// (midRepsOther) must precede 0% non-representatives (Tier 3).
+	// Create a universe where cutoff 4 has two 0% candidates (one rep, one non-rep),
+	// and cutoff 4 also has a 50% candidate (intermediate rep with UnsyncedDirEntryCount == 0).
+	uTierOrder := []candidate.Candidate{
+		{Event: 4, Percent: 0, Seed: 1},  // 0% rep
+		{Event: 4, Percent: 0, Seed: 2},  // 0% non-rep
+		{Event: 4, Percent: 50, Seed: 3}, // intermediate rep (UnsyncedDirEntryCount == 0)
+		{Event: 4, Percent: 100, Seed: 4},
+	}
+	rankingTier := stratObj.Rank(view, uTierOrder)
+	if err := strategy.ValidatePermutation(uTierOrder, rankingTier); err != nil {
+		t.Fatalf("ValidatePermutation failed: %v", err)
+	}
+	// Expected order:
+	// rankingTier[0] -> 0% rep (Event 4, Percent 0, Seed 1)
+	// rankingTier[1] -> midRepsOther (Event 4, Percent 50, Seed 3)
+	// rankingTier[2] -> 0% non-rep (Event 4, Percent 0, Seed 2)
+	// rankingTier[3] -> 100% (Event 4, Percent 100, Seed 4)
+	if rankingTier[1].Percent != 50 {
+		t.Fatalf("expected intermediate rep (Percent 50) before 0%% non-rep at index 1, got %+v (full: %+v)",
+			rankingTier[1], rankingTier)
 	}
 }

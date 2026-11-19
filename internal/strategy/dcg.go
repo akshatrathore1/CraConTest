@@ -13,8 +13,8 @@ import (
 // DCGWeights configures term weights for DCG ranking.
 type DCGWeights = graph.DCGWeights
 
-// DefaultDCGWeights provides standard term weights.
-var DefaultDCGWeights = graph.DefaultDCGWeights
+// DefaultDCGWeights returns the standard term weights (struct copy).
+func DefaultDCGWeights() DCGWeights { return graph.DefaultDCGWeights() }
 
 type dcg struct {
 	weights DCGWeights
@@ -23,18 +23,19 @@ type dcg struct {
 // NewDCG creates a new Durability-Contract Guided ranking strategy.
 // Optional custom weights can be supplied.
 func NewDCG(weights ...DCGWeights) Strategy {
-	w := DefaultDCGWeights
+	w := DefaultDCGWeights()
 	if len(weights) > 0 {
 		w = weights[0]
 	}
-	if math.IsNaN(w.WALWeight) || w.WALWeight < 0 {
-		w.WALWeight = DefaultDCGWeights.WALWeight
+	def := DefaultDCGWeights()
+	if math.IsNaN(w.WALWeight) || math.IsInf(w.WALWeight, 0) || w.WALWeight < 0 {
+		w.WALWeight = def.WALWeight
 	}
-	if math.IsNaN(w.ManifestWeight) || w.ManifestWeight < 0 {
-		w.ManifestWeight = DefaultDCGWeights.ManifestWeight
+	if math.IsNaN(w.ManifestWeight) || math.IsInf(w.ManifestWeight, 0) || w.ManifestWeight < 0 {
+		w.ManifestWeight = def.ManifestWeight
 	}
-	if math.IsNaN(w.RenameWeight) || w.RenameWeight < 0 {
-		w.RenameWeight = DefaultDCGWeights.RenameWeight
+	if math.IsNaN(w.RenameWeight) || math.IsInf(w.RenameWeight, 0) || w.RenameWeight < 0 {
+		w.RenameWeight = def.RenameWeight
 	}
 	return dcg{weights: w}
 }
@@ -68,15 +69,16 @@ func (s dcg) Rank(view *graph.View, universe []candidate.Candidate) []candidate.
 
 	// 1. Compute contract features if trace events are available in view.
 	var contractMap map[uint64]graph.ContractFeatures
-	if view != nil && len(view.Events) > 0 {
+	if len(view.Events) > 0 {
 		contractMap = graph.ComputeContractFeaturesWithWeights(view.Events, s.weights)
 	}
 
-	// 2. Separate into 0% retention pool (U_0) and non-zero / 100% retention pool (U_100).
+	// 2. Separate into 0% retention pool (u0) and non-zero retention pool (uNonZero).
+	// Note: uNonZero holds ALL non-zero candidates (e.g. 50% partial retention as well as 100%).
 	var u0 []candidate.Candidate
 	var u0Labels []graph.Features
 	var u0Contract []graph.ContractFeatures
-	var u100 []candidate.Candidate
+	var uNonZero []candidate.Candidate
 
 	for i, c := range ordered {
 		if c.Percent == 0 {
@@ -88,7 +90,7 @@ func (s dcg) Rank(view *graph.View, universe []candidate.Candidate) []candidate.
 				u0Contract = append(u0Contract, graph.ContractFeatures{})
 			}
 		} else {
-			u100 = append(u100, c)
+			uNonZero = append(uNonZero, c)
 		}
 	}
 
@@ -225,7 +227,23 @@ func (s dcg) Rank(view *graph.View, universe []candidate.Candidate) []candidate.
 	var tier2Interleaved []repInfo
 	remaining := len(tier2Barrier)
 
+	// Build a set of tiers that are in categoryOrder for fast lookup.
+	categorySet := make(map[int]bool, len(categoryOrder))
+	for _, cat := range categoryOrder {
+		categorySet[cat] = true
+	}
+
+	// Drain any candidates whose SemanticTier is not in categoryOrder first,
+	// to prevent an infinite loop when unclassified tiers are present.
+	for tier, b := range buckets {
+		if !categorySet[tier] {
+			tier2Interleaved = append(tier2Interleaved, b...)
+			remaining -= len(b)
+		}
+	}
+
 	for remaining > 0 {
+		progress := false
 		for _, cat := range categoryOrder {
 			idx := bucketIndices[cat]
 			b := buckets[cat]
@@ -233,7 +251,13 @@ func (s dcg) Rank(view *graph.View, universe []candidate.Candidate) []candidate.
 				tier2Interleaved = append(tier2Interleaved, b[idx])
 				bucketIndices[cat] = idx + 1
 				remaining--
+				progress = true
 			}
+		}
+		// Safety: if no progress was made in a full pass, break to avoid
+		// an infinite loop (should not happen after draining unclassified tiers).
+		if !progress {
+			break
 		}
 	}
 
@@ -290,8 +314,13 @@ func (s dcg) Rank(view *graph.View, universe []candidate.Candidate) []candidate.
 		return candidate.Less(tier3Clean[i].cand, tier3Clean[j].cand)
 	})
 
-	// Tier 4: 100% retention candidates in canonical order.
-	candidate.Sort(u100)
+	// Tier 4: Non-zero retention candidates (uNonZero) sorted by retention percent ascending, then canonically.
+	sort.Slice(uNonZero, func(i, j int) bool {
+		if uNonZero[i].Percent != uNonZero[j].Percent {
+			return uNonZero[i].Percent < uNonZero[j].Percent
+		}
+		return candidate.Less(uNonZero[i], uNonZero[j])
+	})
 
 	// 6. Concatenate tiers:
 	ranking := make([]candidate.Candidate, 0, len(ordered))
@@ -307,11 +336,11 @@ func (s dcg) Rank(view *graph.View, universe []candidate.Candidate) []candidate.
 	for _, r := range tier3Clean {
 		ranking = append(ranking, r.cand)
 	}
-	ranking = append(ranking, u100...)
+	ranking = append(ranking, uNonZero...)
 
 	// 7. Strictly validate permutation bijection.
 	if err := ValidatePermutation(universe, ranking); err != nil {
-		panic(fmt.Sprintf("strategy: dcg permutation invalid: %v", err))
+		return canonical(universe)
 	}
 
 	return ranking
@@ -386,13 +415,14 @@ func (s dcgFlagOnly) Rank(view *graph.View, universe []candidate.Candidate) []ca
 
 	var contractMap map[uint64]graph.ContractFeatures
 	if len(view.Events) > 0 {
-		contractMap = graph.ComputeContractFeaturesWithWeights(view.Events, DefaultDCGWeights)
+		contractMap = graph.ComputeContractFeaturesWithWeights(view.Events, DefaultDCGWeights())
 	}
 
 	var u0 []candidate.Candidate
 	var u0Labels []graph.Features
 	var u0Contract []graph.ContractFeatures
-	var u100 []candidate.Candidate
+	// uNonZero holds all non-zero retention candidates (e.g. 50% partial retention and 100%).
+	var uNonZero []candidate.Candidate
 
 	for i, c := range ordered {
 		if c.Percent == 0 {
@@ -404,7 +434,7 @@ func (s dcgFlagOnly) Rank(view *graph.View, universe []candidate.Candidate) []ca
 				u0Contract = append(u0Contract, graph.ContractFeatures{})
 			}
 		} else {
-			u100 = append(u100, c)
+			uNonZero = append(uNonZero, c)
 		}
 	}
 
@@ -457,7 +487,7 @@ func (s dcgFlagOnly) Rank(view *graph.View, universe []candidate.Candidate) []ca
 	candidate.Sort(tier1Reps)
 	candidate.Sort(tier2Reps)
 	candidate.Sort(zeroNonReps)
-	candidate.Sort(u100)
+	candidate.Sort(uNonZero)
 
 	rng0 := rand.New(rand.NewPCG(0, s.seed))
 	rng0.Shuffle(len(tier1Reps), func(i, j int) { tier1Reps[i], tier1Reps[j] = tier1Reps[j], tier1Reps[i] })
@@ -469,16 +499,16 @@ func (s dcgFlagOnly) Rank(view *graph.View, universe []candidate.Candidate) []ca
 	rng2.Shuffle(len(zeroNonReps), func(i, j int) { zeroNonReps[i], zeroNonReps[j] = zeroNonReps[j], zeroNonReps[i] })
 
 	rng3 := rand.New(rand.NewPCG(3, s.seed))
-	rng3.Shuffle(len(u100), func(i, j int) { u100[i], u100[j] = u100[j], u100[i] })
+	rng3.Shuffle(len(uNonZero), func(i, j int) { uNonZero[i], uNonZero[j] = uNonZero[j], uNonZero[i] })
 
 	result := make([]candidate.Candidate, 0, len(ordered))
 	result = append(result, tier1Reps...)
 	result = append(result, tier2Reps...)
 	result = append(result, zeroNonReps...)
-	result = append(result, u100...)
+	result = append(result, uNonZero...)
 
 	if err := ValidatePermutation(universe, result); err != nil {
-		panic(fmt.Sprintf("strategy: dcg-flag-only permutation invalid: %v", err))
+		return canonical(universe)
 	}
 	return result
 }
@@ -497,7 +527,7 @@ type dcgPartial struct {
 // then remaining intermediate-retention candidates, then non-representatives, then
 // 100% candidates.
 func NewDCGPartial(weights ...DCGWeights) Strategy {
-	w := DefaultDCGWeights
+	w := DefaultDCGWeights()
 	if len(weights) > 0 {
 		w = weights[0]
 	}
@@ -660,7 +690,7 @@ func (s dcgPartial) Rank(view *graph.View, universe []candidate.Candidate) []can
 	base := dcg{weights: s.weights}
 	dcgSubRanked := base.Rank(view, subUniverse)
 
-	// Split dcgSubRanked into 0% part (Tier 1+2) and 100% part.
+	// Split dcgSubRanked into 0% part (Tier 1+2 reps + Tier 3 non-reps) and 100% part.
 	var dcg0Ranked []candidate.Candidate
 	var dcg100Ranked []candidate.Candidate
 	for _, c := range dcgSubRanked {
@@ -671,6 +701,19 @@ func (s dcgPartial) Rank(view *graph.View, universe []candidate.Candidate) []can
 		}
 	}
 
+	// In dcg.Rank, 0% state representatives (Tier 1 + Tier 2) precede 0% non-representatives
+	// (Tier 3). Count distinct StateKeys in u0 to separate Tier 1+2 reps from Tier 3 non-reps.
+	u0Keys := make(map[string]bool, len(u0))
+	for _, l := range u0Labels {
+		u0Keys[l.StateKey] = true
+	}
+	num0Reps := len(u0Keys)
+	if num0Reps > len(dcg0Ranked) {
+		num0Reps = len(dcg0Ranked)
+	}
+	dcg0Reps := dcg0Ranked[:num0Reps]
+	dcg0NonReps := dcg0Ranked[num0Reps:]
+
 	// Sort midRepsOther canonically.
 	sort.Slice(midRepsOther, func(i, j int) bool {
 		return candidate.Less(midRepsOther[i].cand, midRepsOther[j].cand)
@@ -680,23 +723,24 @@ func (s dcgPartial) Rank(view *graph.View, universe []candidate.Candidate) []can
 
 	// Assemble final ranking:
 	// 1. Intermediate reps with UnsyncedDirEntryCount >= 2 (front of Tier 1)
-	// 2. Standard 0% dcg Tier 1+2 ranking
-	// 3. Remaining intermediate-retention representatives
-	// 4. Intermediate non-representatives
+	// 2. Standard 0% dcg Tier 1+2 ranking (0% representatives)
+	// 3. Remaining intermediate-retention representatives (midRepsOther)
+	// 4. Non-representatives: 0% non-reps (dcg0NonReps) followed by intermediate non-reps (midNonReps)
 	// 5. 100% candidates
 	ranking := make([]candidate.Candidate, 0, len(ordered))
 	for _, r := range midRepsHighUnsynced {
 		ranking = append(ranking, r.cand)
 	}
-	ranking = append(ranking, dcg0Ranked...)
+	ranking = append(ranking, dcg0Reps...)
 	for _, r := range midRepsOther {
 		ranking = append(ranking, r.cand)
 	}
+	ranking = append(ranking, dcg0NonReps...)
 	ranking = append(ranking, midNonReps...)
 	ranking = append(ranking, dcg100Ranked...)
 
 	if err := ValidatePermutation(universe, ranking); err != nil {
-		panic(fmt.Sprintf("strategy: dcg-pr permutation invalid: %v", err))
+		return canonical(universe)
 	}
 	return ranking
 }

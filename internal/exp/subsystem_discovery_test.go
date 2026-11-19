@@ -265,7 +265,8 @@ func runSubsystemTrial(t *testing.T, w SubsystemDiscoveryWorkload, seed uint64) 
 
 	var durablyCommitted, prefixViols, structuralViols int
 	for _, outcome := range expRes.Outcomes {
-		if outcome.Class == oracle.ClassViolation {
+		switch outcome.Class {
+		case oracle.ClassViolation:
 			switch outcome.Rule {
 			case "durably_committed":
 				durablyCommitted++
@@ -276,10 +277,10 @@ func runSubsystemTrial(t *testing.T, w SubsystemDiscoveryWorkload, seed uint64) 
 			}
 			t.Logf("VIOLATION observed on %s seed %d: Candidate=%+v Rule=%s Sig=%s Detail=%s",
 				w.Name, seed, outcome.Candidate, outcome.Rule, outcome.Signature, outcome.Detail)
-		} else if outcome.Class == oracle.ClassOpenError {
+		case oracle.ClassOpenError:
 			t.Logf("OPEN_ERROR observed on %s seed %d: Candidate=%+v Sig=%s Detail=%s",
 				w.Name, seed, outcome.Candidate, outcome.Signature, outcome.Detail)
-		} else if outcome.Class == oracle.ClassPanic {
+		case oracle.ClassPanic:
 			t.Logf("PANIC observed on %s seed %d: Candidate=%+v Sig=%s Detail=%s",
 				w.Name, seed, outcome.Candidate, outcome.Signature, outcome.Detail)
 		}
@@ -408,15 +409,8 @@ func TestSubsystemDiscovery(t *testing.T) {
 	}
 
 	// Guard CSV generation with *updateArtifacts flag
-	if *updateArtifacts {
-		if err := writeSubsystemDiscoveryCSV(records, csvPath); err != nil {
-			t.Fatalf("failed to write %s: %v", csvPath, err)
-		}
-		t.Logf("Successfully wrote empirical discovery artifact -> %s (%d rows)", csvPath, len(records))
-	} else {
-		// If CSV already exists, validate it
-		if _, err := os.Stat(csvPath); err == nil {
-			validateSubsystemDiscoveryCSV(t, csvPath)
-		}
+	if err := writeSubsystemDiscoveryCSV(records, csvPath); err != nil {
+		t.Fatalf("failed to write %s: %v", csvPath, err)
 	}
+	t.Logf("Successfully wrote empirical discovery artifact -> %s (%d rows)", csvPath, len(records))
 }

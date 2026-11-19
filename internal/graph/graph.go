@@ -25,6 +25,7 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/akshatrathore1/CraConTest/internal/trace"
 )
@@ -82,6 +83,9 @@ type View struct {
 
 	successors map[uint64][]uint64
 	vertices   map[uint64]bool
+
+	contractOnce sync.Once
+	contractFeat map[uint64]ContractFeatures
 }
 
 // Successors returns the sorted direct successors of a persistence vertex.
@@ -198,16 +202,21 @@ func Build(input []trace.Event) (*View, error) {
 		riskScore      float64
 	}
 	parts := make([]partial, len(events)+1)
-	emptyKey, emptyCats := b.stateKey()
+	emptyKey, emptyCats, err := b.stateKey()
+	if err != nil {
+		return nil, err
+	}
 	parts[0] = partial{stateKey: emptyKey, categories: emptyCats, opKind: Background}
 	var anchor uint64
-	var uncommittedSyncOps uint64
+	// uncommittedMutatingOps counts mutating client operations since the last barrier
+	// event, tracking exposure of uncommitted mutating operations prior to persistence.
+	var uncommittedMutatingOps uint64
 	for _, event := range events {
 		if event.Kind == trace.KindOpEnd && trace.MutatingOperation(event.OpKind) && event.Err == "" {
-			uncommittedSyncOps++
+			uncommittedMutatingOps++
 		}
 		if event.IsBarrier() {
-			uncommittedSyncOps = 0
+			uncommittedMutatingOps = 0
 		}
 		opKind, err := b.apply(event)
 		if err != nil {
@@ -216,15 +225,18 @@ func Build(input []trace.Event) (*View, error) {
 		if b.isVertex(event) {
 			anchor = event.ID
 		}
-		key, categories := b.stateKey()
-		dirtyBytes, riskScore := computeRiskHorizon(b.resources, b.pending, uncommittedSyncOps)
+		key, categories, err := b.stateKey()
+		if err != nil {
+			return nil, err
+		}
+		dirtyBytes, riskScore := computeRiskHorizon(b.resources, b.pending, uncommittedMutatingOps)
 		parts[event.ID] = partial{
 			stateKey:       key,
 			categories:     categories,
 			opKind:         opKind,
 			anchor:         anchor,
 			dirtyBytes:     dirtyBytes,
-			uncommittedOps: uncommittedSyncOps,
+			uncommittedOps: uncommittedMutatingOps,
 			riskScore:      riskScore,
 		}
 	}
@@ -571,13 +583,19 @@ func (b *builder) apply(event trace.Event) (string, error) {
 			break
 		}
 		var removed []string
+		isRoot := event.File == "" || event.File == "."
+		prefix := strings.TrimSuffix(event.File, "/") + "/"
 		for name := range b.names {
-			if name == event.File || strings.HasPrefix(name, event.File+"/") {
+			if isRoot || name == event.File || strings.HasPrefix(name, prefix) {
 				removed = append(removed, name)
 			}
 		}
 		sort.Strings(removed)
-		touched := []uint64{b.ensureDir(parent(event.File))}
+		parentDir := ""
+		if !isRoot {
+			parentDir = parent(event.File)
+		}
+		touched := []uint64{b.ensureDir(parentDir)}
 		for _, name := range removed {
 			id := b.names[name]
 			b.dropName(name)
@@ -612,8 +630,14 @@ func (b *builder) apply(event trace.Event) (string, error) {
 		if event.Len <= 0 {
 			break
 		}
-		id := b.handles[event.Handle]
+		id, ok := b.handles[event.Handle]
+		if !ok || id == 0 {
+			break
+		}
 		r := b.resources[id]
+		if r == nil {
+			break
+		}
 		r.dirty = addInterval(r.dirty, interval{event.Off, event.Off + int64(event.Len)})
 		b.markVertex(event, id)
 	case trace.KindSync, trace.KindSyncData, trace.KindSyncTo:
@@ -623,16 +647,34 @@ func (b *builder) apply(event trace.Event) (string, error) {
 		if !event.IsBarrier() {
 			break
 		}
-		id := b.handles[event.Handle]
+		id, ok := b.handles[event.Handle]
+		if !ok || id == 0 {
+			break
+		}
 		r := b.resources[id]
+		if r == nil {
+			break
+		}
 		if r.directory {
-			kept := b.pending[:0:0]
+			// Allocate a new slice sized exactly to surviving entries so the old
+			// backing array is not retained unnecessarily.
+			count := 0
 			for _, entry := range b.pending {
 				if entry.dirID != id {
-					kept = append(kept, entry)
+					count++
 				}
 			}
-			b.pending = kept
+			if count == 0 {
+				b.pending = nil
+			} else {
+				kept := make([]pendingEntry, 0, count)
+				for _, entry := range b.pending {
+					if entry.dirID != id {
+						kept = append(kept, entry)
+					}
+				}
+				b.pending = kept
+			}
 		} else {
 			r.dirty = nil
 		}
@@ -741,7 +783,7 @@ type keyState struct {
 
 // stateKey returns the hash of the current persistence state and the sorted
 // categories of its dirty and pending resources.
-func (b *builder) stateKey() (string, []string) {
+func (b *builder) stateKey() (string, []string, error) {
 	included := make(map[uint64]bool)
 	for id, r := range b.resources {
 		if len(r.dirty) > 0 {
@@ -790,7 +832,7 @@ func (b *builder) stateKey() (string, []string) {
 	sort.Slice(state.Unknown, func(left, right int) bool { return state.Unknown[left] < state.Unknown[right] })
 	encoded, err := json.Marshal(state)
 	if err != nil {
-		panic(fmt.Sprintf("graph: state key encoding: %v", err))
+		return "", nil, fmt.Errorf("graph: state key encoding: %w", err)
 	}
 	digest := sha256.Sum256(encoded)
 	categories := make([]string, 0, len(categorySet))
@@ -798,19 +840,24 @@ func (b *builder) stateKey() (string, []string) {
 		categories = append(categories, category)
 	}
 	sort.Strings(categories)
-	return hex.EncodeToString(digest[:]), categories
+	return hex.EncodeToString(digest[:]), categories, nil
 }
 
 // reachability computes, for every vertex, the exact number of distinct
 // reachable later vertices and how many of them lie on another resource.
 func (b *builder) reachability() (map[uint64]uint64, map[uint64]uint64) {
 	count := len(b.order)
+	desc := make(map[uint64]uint64, count)
+	cross := make(map[uint64]uint64, count)
+	if count == 0 {
+		return desc, cross
+	}
 	index := make(map[uint64]int, count)
 	for position, vertex := range b.order {
 		index[vertex] = position
 	}
 	words := (count + 63) / 64
-	reach := make([][]uint64, count)
+	flatReach := make([]uint64, count*words)
 	masks := make(map[uint64][]uint64)
 	for position, vertex := range b.order {
 		res := b.vertexRes[vertex]
@@ -819,19 +866,17 @@ func (b *builder) reachability() (map[uint64]uint64, map[uint64]uint64) {
 		}
 		masks[res][position/64] |= 1 << (position % 64)
 	}
-	desc := make(map[uint64]uint64, count)
-	cross := make(map[uint64]uint64, count)
 	for position := count - 1; position >= 0; position-- {
 		vertex := b.order[position]
-		set := make([]uint64, words)
+		set := flatReach[position*words : (position+1)*words]
 		for successor := range b.successors[vertex] {
 			next := index[successor]
 			set[next/64] |= 1 << (next % 64)
-			for word, value := range reach[next] {
+			nextReach := flatReach[next*words : (next+1)*words]
+			for word, value := range nextReach {
 				set[word] |= value
 			}
 		}
-		reach[position] = set
 		var total, same int
 		mask := masks[b.vertexRes[vertex]]
 		for word, value := range set {

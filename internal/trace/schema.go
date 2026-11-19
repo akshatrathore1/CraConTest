@@ -45,6 +45,8 @@ func (event Event) IsMutation() bool {
 		return true
 	case KindWrite, KindWriteAt:
 		return event.Len > 0
+	case KindPreallocate:
+		return event.Size > 0
 	default:
 		return event.IsBarrier()
 	}
@@ -135,17 +137,23 @@ func Validate(events []Event) error {
 		if !canonicalPath(event.File) || !canonicalPath(event.File2) {
 			return fmt.Errorf("event %d: noncanonical VFS path", event.ID)
 		}
-		for _, name := range append(append([]string(nil), event.Inputs...), event.Outputs...) {
+		for _, name := range event.Inputs {
+			if name == "" || !canonicalPath(name) {
+				return fmt.Errorf("event %d: invalid engine file path", event.ID)
+			}
+		}
+		for _, name := range event.Outputs {
 			if name == "" || !canonicalPath(name) {
 				return fmt.Errorf("event %d: invalid engine file path", event.ID)
 			}
 		}
 		write := event.Kind == KindWrite || event.Kind == KindWriteAt
 		read := event.Kind == KindRead
+		preallocate := event.Kind == KindPreallocate
 		if event.Len < 0 || event.Off < 0 || event.Size < 0 ||
 			(!write && len(event.Data) != 0) || (!write && !read && event.Len != 0) ||
-			(!write && !read && event.Off != 0) ||
-			(event.Kind != KindSyncTo && !read && event.Size != 0) ||
+			(!write && !read && !preallocate && event.Off != 0) ||
+			(event.Kind != KindSyncTo && !read && !preallocate && event.Size != 0) ||
 			(event.Kind != KindMkdirAll && event.Mode != 0) ||
 			(event.Kind != KindSyncTo && event.FullSync) ||
 			(event.Kind != KindCreate && event.Kind != KindOpenReadWrite && event.Kind != KindReuseForWrite && event.Cat != "") ||
@@ -196,6 +204,9 @@ func Validate(events []Event) error {
 				if event.Handle != 0 || event.Created {
 					return fmt.Errorf("event %d: failed open returned a handle", event.ID)
 				}
+				if event.File == "" || (event.Kind == KindReuseForWrite && event.File2 == "") {
+					return fmt.Errorf("event %d: missing file path for failed open", event.ID)
+				}
 				continue
 			}
 			if event.Handle != lastHandle+1 || (event.Kind == KindOpenDir && !event.Dir) ||
@@ -211,14 +222,20 @@ func Validate(events []Event) error {
 				readable: event.Kind != KindReuseForWrite && event.Kind != KindLock && !event.Dir,
 				writable: event.Kind == KindCreate || event.Kind == KindOpenReadWrite || event.Kind == KindReuseForWrite}
 			lastHandle = event.Handle
-		case KindRead, KindWrite, KindWriteAt, KindSync, KindSyncData, KindSyncTo, KindClose, KindUnlock:
+		case KindRead, KindWrite, KindWriteAt, KindSync, KindSyncData, KindSyncTo, KindClose, KindUnlock, KindPreallocate:
 			state, exists := handles[event.Handle]
 			if !exists || event.File != state.name || event.Dir != state.directory ||
 				(state.lock && event.Kind != KindUnlock) || (!state.lock && event.Kind == KindUnlock) {
 				return fmt.Errorf("event %d: invalid handle reference", event.ID)
 			}
+			if (event.Kind == KindSyncData || event.Kind == KindSyncTo) && state.directory {
+				return fmt.Errorf("event %d: sync data or sync to on directory handle", event.ID)
+			}
 			if write && (event.Err == "" || event.Len > 0) && (!state.writable || state.directory) {
 				return fmt.Errorf("event %d: successful write to nonwritable handle", event.ID)
+			}
+			if preallocate && event.Err == "" && (!state.writable || state.directory) {
+				return fmt.Errorf("event %d: successful preallocate on nonwritable handle", event.ID)
 			}
 			if read && (event.Err == "" || event.Len > 0) && !state.readable {
 				return fmt.Errorf("event %d: successful read from nonreadable handle", event.ID)
@@ -237,7 +254,7 @@ func Validate(events []Event) error {
 			if event.Handle != 0 || event.Dir {
 				return fmt.Errorf("event %d: namespace event contains handle fields", event.ID)
 			}
-			if event.Err == "" && event.Kind != KindMkdirAll && (event.File == "" ||
+			if event.Err == "" && (event.File == "" ||
 				((event.Kind == KindLink || event.Kind == KindRename) && event.File2 == "")) {
 				return fmt.Errorf("event %d: missing namespace path", event.ID)
 			}

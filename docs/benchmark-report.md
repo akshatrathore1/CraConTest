@@ -5,7 +5,7 @@
 **Evaluation Engine:** CockroachDB Pebble v2.1.7 (Go runtime: 2026-11-07T03:13:57Z)  
 **Workload Seeds (32):** `[42 100 200 300 400 500 600 700 800 900 1001 1002 1003 1004 1005 1006 1007 1008 1009 1010 1011 1012 1013 1014 1015 1016 1017 1018 1019 1020 1021 1022]`  
 **Execution Time:** 195.35 seconds total  
-**Null Control (MUT-0):** 0 false alarms across all 32 seeds at 0%/100% retention  
+**Null Control (MUT-0):** 0 observed failures across 32 evaluated seeds at 0%/100% retention
 
 ---
 
@@ -17,9 +17,9 @@ This report documents the multi-seed empirical evaluation of crash-consistency r
 
 **DCG achieves lower cost-to-first-failure than R2 on sparse faults.**
 
-Empirical Confirmation:
-- **MUT-5 (Sparse $k$-th WAL Sync Drop):** DCG median $k_1 = 1.0$ (Mean $1.00$, 95% CI $[1.00, 1.00]$) vs R2 median $k_1 = 13.1$ (Mean $13.01$, 95% CI $[12.68, 13.34]$) vs B0 median $k_1 = 25.5$ (Mean $25.97$). DCG achieves **$13.1x$ faster fault discovery** than R2 and **$25.5x$ faster** than B0.
-- **Control Invariance (MUT-0):** 0 false alarms across all 32 seeds at 0%/100% retention.
+Observed comparison:
+- **MUT-5 (Sparse $k$-th WAL Sync Drop):** DCG median $k_1 = 1.0$ (mean $1.00$, 95% CI $[1.00, 1.00]$), R2 median $k_1 = 13.1$ (mean $13.01$, 95% CI $[12.68, 13.34]$), and B0 median $k_1 = 25.5$ (mean $25.97$). The ratios of median discovery positions are 13.1 for R2/DCG and 25.5 for B0/DCG; these are candidate-count ratios, not wall-clock speedups.
+- **Null-control observation (MUT-0):** 0 failures across 32 evaluated seeds at 0%/100% retention.
 - **MUT-8 (Compaction-Triggered SST Sync Drop):** DCG reaches the first failure at median $k_1 = 1.0$ (Mean 1.00) vs R2 median $k_1 = 3.6$ (Mean 3.58) and B0 median $k_1 = 4.0$ (Mean 4.41), discovers $S_{25} = 12.88$ mean distinct failing states at $B=25$ (vs R2 6.74 and B0 2.00), and matches R2 at full budget ($S_{100}$ Mean 12.88 vs R2 12.82 and B0 5.05).
 
 ---
@@ -31,13 +31,13 @@ Empirical Confirmation:
 - **Engine:** CockroachDB Pebble `v2.1.7` running in-memory with precise crashable virtual filesystem tracking (`internal/vfsrec`).
 - **Workload Architecture:** 120 client operations per seed with realistic distribution (50% Set, 20% Get, 10% Delete, 10% Two-Key Atomic Batch, 5% Range Delete, 5% Iteration).
 - **Sync Rhythm:** Synchronous barriers enforced every 8th operation (`SyncEvery = 8`), background memtable flushes triggered every 40 operations (`FlushEvery = 40`).
-- **Statistical Population:** 32 deterministic workload seeds (`42, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1001..1022`), generating over 11,000 candidate crash states.
+- **Evaluated Seed Set:** 32 deterministic workload seeds, generating over 11,000 candidate crash states.
 
 ### 2.2 Fault Model Taxonomy
 
 | Fault Model | Class | Target File / Trigger | Failure Signature | Failure Density |
 |---|---|---|---|---|
-| **MUT-0** | Control | Unfaulted filesystem | None (0 false alarms check) | 0.0% |
+| **MUT-0** | Control | Unfaulted filesystem | No failure observed in the evaluated null control | 0.0% |
 | **MUT-1** | Dense | All WAL `Sync()` calls suppressed | `v1:violation:durably_committed:lost_writes` | ~33% |
 | **MUT-2** | Dense/Sparse | MANIFEST `Sync()` calls suppressed | `v1:open_error:manifest_corrupt` | ~45% |
 | **MUT-3** | Dense/Sparse | Parent directory syncs suppressed | `v1:violation:durably_committed:lost_files` | ~37% |
@@ -51,7 +51,7 @@ Empirical Confirmation:
 ### 2.3 Evaluated Ranking Strategies
 
 1. **DCG (Durability-Contract Guided / B8):** Trace-derived durability-contract analysis that prioritizes concrete durability contract violations (dangling table references, uncommitted directory renames, dropped WAL sync records) before exploring uncontracted state representatives.
-2. **DCG-FlagOnly (Contract-Flag Ablation):** Partitions candidate space strictly by contract violation flags without secondary scoring heuristics. DCG-FlagOnly ties full DCG on nearly every setting, showing that the binary durability-contract flags combined with StateKey equivalence partitioning drive the speedup.
+2. **DCG-FlagOnly (Contract-Flag Ablation):** Partitions candidate space strictly by contract violation flags without secondary scoring heuristics. Its near-ties with full DCG attribute most of the observed rank-position difference to binary contract flags and StateKey equivalence partitioning.
 3. **RHG (Reachability-Hazard Guided / B7):** Scores cutoffs by reachable uncommitted mutations and hazard surfaces.
 4. **R2 (State-Representative Random):** Partitions 0% retention candidates into equivalence classes by canonical `StateKey`, selects boundary-adjacent representatives within each `StateKey` class using graph features (`BeforeBoundary`, `BarrierProximity`, and canonical order `candidate.Less`) before shuffling classes, and tests redundant cutoffs afterward.
 5. **R1 (0%-Retention-First Random):** Partitions universe into 0% unsynced data retention and 100% retention; evaluates 0% retention first in pure random order.

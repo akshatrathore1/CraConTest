@@ -2,6 +2,8 @@ package exp
 
 import (
 	"bufio"
+	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -31,11 +33,12 @@ const (
 
 // JournalRecord represents one append-only entry in the explore journal.
 type JournalRecord struct {
-	Stage     JournalStage        `json:"stage"`
-	Candidate candidate.Candidate `json:"candidate"`
-	Outcome   *oracle.Outcome     `json:"outcome,omitempty"`
-	Timings   *StageTimings       `json:"timings,omitempty"`
-	Time      time.Time           `json:"time"`
+	Stage       JournalStage        `json:"stage"`
+	Candidate   candidate.Candidate `json:"candidate"`
+	Outcome     *oracle.Outcome     `json:"outcome,omitempty"`
+	Timings     *StageTimings       `json:"timings,omitempty"`
+	Time        time.Time           `json:"time"`
+	ContextHash string              `json:"context_hash,omitempty"`
 }
 
 // StageTimings records the elapsed time spent across exploration pipeline stages.
@@ -85,8 +88,15 @@ type ExploreResult struct {
 
 // ReadJournal parses an append-only journal stream and returns the latest finished outcomes.
 func ReadJournal(reader io.Reader) (map[candidate.Candidate]oracle.Outcome, error) {
+	finished, _, err := readJournal(reader, "")
+	return finished, err
+}
+
+func readJournal(reader io.Reader, expectedContext string) (map[candidate.Candidate]oracle.Outcome, map[candidate.Candidate]StageTimings, error) {
 	scanner := bufio.NewScanner(reader)
+	scanner.Buffer(make([]byte, 4096), 1024*1024)
 	finished := make(map[candidate.Candidate]oracle.Outcome)
+	timings := make(map[candidate.Candidate]StageTimings)
 
 	for scanner.Scan() {
 		line := scanner.Bytes()
@@ -94,35 +104,73 @@ func ReadJournal(reader io.Reader) (map[candidate.Candidate]oracle.Outcome, erro
 			continue
 		}
 		var record JournalRecord
-		if err := json.Unmarshal(line, &record); err != nil {
-			return nil, fmt.Errorf("read journal: %w", err)
+		decoder := json.NewDecoder(bytes.NewReader(line))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&record); err != nil {
+			return nil, nil, fmt.Errorf("read journal: %w", err)
 		}
-		if record.Stage == StageFinished && record.Outcome != nil {
+		var extra any
+		if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+			return nil, nil, errors.New("read journal: trailing data in record")
+		}
+		if record.Candidate.Percent < 0 || record.Candidate.Percent > 100 {
+			return nil, nil, errors.New("read journal: candidate percent outside 0..100")
+		}
+		if expectedContext != "" && record.ContextHash != expectedContext {
+			return nil, nil, errors.New("read journal: execution context differs or legacy journal is unbound; use a fresh run directory")
+		}
+		switch record.Stage {
+		case StageStarted:
+			if record.Outcome != nil {
+				return nil, nil, errors.New("read journal: started record contains an outcome")
+			}
+		case StageFinished:
+			if record.Outcome == nil {
+				return nil, nil, errors.New("read journal: finished record missing outcome")
+			}
+			if record.Outcome.Class != oracle.ClassOracleError {
+				if err := ValidateTable([]candidate.Candidate{record.Candidate}, []oracle.Outcome{*record.Outcome}); err != nil {
+					return nil, nil, fmt.Errorf("read journal: %w", err)
+				}
+			}
+			if previous, present := finished[record.Candidate]; present && previous != *record.Outcome {
+				return nil, nil, errors.New("read journal: conflicting finished outcomes for one candidate")
+			}
 			finished[record.Candidate] = *record.Outcome
+			if record.Timings != nil {
+				timings[record.Candidate] = *record.Timings
+			}
+		default:
+			return nil, nil, fmt.Errorf("read journal: invalid stage %q", record.Stage)
 		}
 	}
 
 	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("read journal scan: %w", err)
+		return nil, nil, fmt.Errorf("read journal scan: %w", err)
 	}
-	return finished, nil
+	return finished, timings, nil
 }
 
 type journalWriter struct {
-	mu sync.Mutex
-	w  io.Writer
+	mu          sync.Mutex
+	w           io.Writer
+	contextHash string
 }
 
 func (jw *journalWriter) writeRecord(record JournalRecord) error {
 	jw.mu.Lock()
 	defer jw.mu.Unlock()
 
+	record.ContextHash = jw.contextHash
 	data, err := json.Marshal(record)
 	if err != nil {
 		return err
 	}
 	data = append(data, '\n')
-	_, err = jw.w.Write(data)
+	written, err := jw.w.Write(data)
+	if err == nil && written != len(data) {
+		return io.ErrShortWrite
+	}
 	return err
 }
 
@@ -136,6 +184,9 @@ func (jw *journalWriter) writeRecord(record JournalRecord) error {
 // - Appends started and finished entries to the journal.
 // - Returns validated outcomes with per-stage timings.
 func RunExplore(cfg RunnerConfig) (*ExploreResult, error) {
+	if err := candidate.Validate(cfg.Events, cfg.Universe); err != nil {
+		return nil, fmt.Errorf("runner: %w", err)
+	}
 	if len(cfg.Universe) == 0 {
 		return &ExploreResult{
 			Outcomes: []oracle.Outcome{},
@@ -173,6 +224,22 @@ func RunExplore(cfg RunnerConfig) (*ExploreResult, error) {
 	// Setup journal writer.
 	var jw *journalWriter
 	existingOutcomes := make(map[candidate.Candidate]oracle.Outcome)
+	existingTimings := make(map[candidate.Candidate]StageTimings)
+	contextHash := ""
+	if cfg.JournalPath != "" || cfg.Journal != nil {
+		contextData, err := json.Marshal(struct {
+			Domain     string
+			Events     []trace.Event
+			History    []history.Entry
+			Dir        string
+			Timeout    time.Duration
+			Categories map[uint64][]string
+		}{"cracontest/journal-context/v1", cfg.Events, cfg.History, dir, timeout, categories})
+		if err != nil {
+			return nil, fmt.Errorf("runner journal context: %w", err)
+		}
+		contextHash = fmt.Sprintf("%x", sha256.Sum256(contextData))
+	}
 
 	if cfg.JournalPath != "" {
 		// Read existing journal if present.
@@ -182,12 +249,13 @@ func RunExplore(cfg RunnerConfig) (*ExploreResult, error) {
 				return nil, err
 			}
 		} else {
-			pastOutcomes, err := ReadJournal(f)
+			pastOutcomes, pastTimings, err := readJournal(f, contextHash)
 			_ = f.Close()
 			if err != nil {
 				return nil, fmt.Errorf("runner read journal: %w", err)
 			}
 			existingOutcomes = pastOutcomes
+			existingTimings = pastTimings
 		}
 
 		jf, err := os.OpenFile(cfg.JournalPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
@@ -195,9 +263,9 @@ func RunExplore(cfg RunnerConfig) (*ExploreResult, error) {
 			return nil, fmt.Errorf("runner open journal: %w", err)
 		}
 		defer jf.Close()
-		jw = &journalWriter{w: jf}
+		jw = &journalWriter{w: jf, contextHash: contextHash}
 	} else if cfg.Journal != nil {
-		jw = &journalWriter{w: cfg.Journal}
+		jw = &journalWriter{w: cfg.Journal, contextHash: contextHash}
 	}
 
 	// Canonical order required for forward replay.
@@ -220,6 +288,9 @@ func RunExplore(cfg RunnerConfig) (*ExploreResult, error) {
 		// Check if already finished from existing journal.
 		if pastOutcome, ok := existingOutcomes[cand]; ok {
 			outcomes = append(outcomes, pastOutcome)
+			if pastTiming, ok := existingTimings[cand]; ok {
+				timingsMap[cand] = pastTiming
+			}
 			updateSummary(&summary, pastOutcome.Class)
 			continue
 		}
@@ -252,11 +323,24 @@ func RunExplore(cfg RunnerConfig) (*ExploreResult, error) {
 			continue
 		}
 
-		// Stage 1: Replay advance.
+		// Stage 1: Replay advance / rewind.
 		startReplay := time.Now()
 		if cand.Event > currentCut {
 			if err := replayer.Advance(cand.Event); err != nil {
 				return nil, fmt.Errorf("runner advance to %d: %w", cand.Event, err)
+			}
+			currentCut = cand.Event
+		} else if cand.Event < currentCut {
+			_ = replayer.Close()
+			var err error
+			replayer, err = replay.Build(cfg.Events, 0)
+			if err != nil {
+				return nil, fmt.Errorf("runner rebuild replay: %w", err)
+			}
+			if cand.Event > 0 {
+				if err := replayer.Advance(cand.Event); err != nil {
+					return nil, fmt.Errorf("runner advance to %d after rewind: %w", cand.Event, err)
+				}
 			}
 			currentCut = cand.Event
 		}
@@ -334,7 +418,16 @@ func RunExplore(cfg RunnerConfig) (*ExploreResult, error) {
 
 		// Stage 4: CheckIntegrity and DumpContents.
 		startDump := time.Now()
-		if err := recovery.CheckIntegrity(openRes.DB); err != nil {
+		var integrityErr error
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					integrityErr = fmt.Errorf("panic: %v", r)
+				}
+			}()
+			integrityErr = recovery.CheckIntegrity(openRes.DB)
+		}()
+		if integrityErr != nil {
 			_ = openRes.DB.Close()
 			stageTimings.Dump = time.Since(startDump)
 			terminalOutcome := oracle.Outcome{
@@ -342,7 +435,7 @@ func RunExplore(cfg RunnerConfig) (*ExploreResult, error) {
 				Class:     oracle.ClassViolation,
 				Rule:      "structural",
 				Signature: oracle.FormatSignature("structural", "unknown", cutCategories),
-				Detail:    err.Error(),
+				Detail:    integrityErr.Error(),
 			}
 			if err := finishCandidate(jw, cand, &terminalOutcome, &stageTimings, candStart, &outcomes, timingsMap, &summary); err != nil {
 				return nil, fmt.Errorf("runner write journal: %w", err)
@@ -350,14 +443,23 @@ func RunExplore(cfg RunnerConfig) (*ExploreResult, error) {
 			continue
 		}
 
-		dump, err := recovery.DumpContents(openRes.DB)
+		var dump map[string]string
+		var dumpErr error
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					dumpErr = fmt.Errorf("panic: %v", r)
+				}
+			}()
+			dump, dumpErr = recovery.DumpContents(openRes.DB)
+		}()
 		_ = openRes.DB.Close()
 		stageTimings.Dump = time.Since(startDump)
-		if err != nil {
+		if dumpErr != nil {
 			terminalOutcome := oracle.Outcome{
 				Candidate: cand,
 				Class:     oracle.ClassOpenError,
-				Detail:    fmt.Sprintf("DumpContents: %v", err),
+				Detail:    fmt.Sprintf("DumpContents: %v", dumpErr),
 			}
 			if err := finishCandidate(jw, cand, &terminalOutcome, &stageTimings, candStart, &outcomes, timingsMap, &summary); err != nil {
 				return nil, fmt.Errorf("runner write journal: %w", err)
@@ -460,6 +562,11 @@ func InspectCheckpointRecovery(clonedFS vfs.FS, timeout time.Duration, cutCatego
 		return
 	}
 	ckptRes := recovery.SafeOpen(clonedFS, "checkpoint", timeout)
+	if ckptRes.DB != nil {
+		defer func() {
+			_ = ckptRes.DB.Close()
+		}()
+	}
 	if ckptRes.Timeout {
 		terminalOutcome.Class = oracle.ClassHang
 		terminalOutcome.Detail = "checkpoint: open timeout"
@@ -474,7 +581,7 @@ func InspectCheckpointRecovery(clonedFS vfs.FS, timeout time.Duration, cutCatego
 		terminalOutcome.Class = oracle.ClassOpenError
 		terminalOutcome.Detail = "checkpoint: " + ckptRes.Err.Error()
 		terminalOutcome.Rule = ""
-		terminalOutcome.Signature = ""
+		terminalOutcome.Signature = FormatOpenErrorSignature(terminalOutcome.Detail)
 	} else if ckptRes.DB != nil {
 		var integrityErr error
 		func() {
@@ -490,7 +597,22 @@ func InspectCheckpointRecovery(clonedFS vfs.FS, timeout time.Duration, cutCatego
 			terminalOutcome.Rule = "structural"
 			terminalOutcome.Detail = "checkpoint integrity: " + integrityErr.Error()
 			terminalOutcome.Signature = oracle.FormatSignature("structural", "checkpoint", cutCategories)
+		} else {
+			var dumpErr error
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						dumpErr = fmt.Errorf("%v", r)
+					}
+				}()
+				_, dumpErr = recovery.DumpContents(ckptRes.DB)
+			}()
+			if dumpErr != nil {
+				terminalOutcome.Class = oracle.ClassViolation
+				terminalOutcome.Rule = "structural"
+				terminalOutcome.Detail = "checkpoint content dump: " + dumpErr.Error()
+				terminalOutcome.Signature = oracle.FormatSignature("structural", "checkpoint", cutCategories)
+			}
 		}
-		_ = ckptRes.DB.Close()
 	}
 }

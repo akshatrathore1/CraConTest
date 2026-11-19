@@ -637,7 +637,7 @@ func TestDeterministicPartialCloneStatisticalFidelity(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Create %s: %v", unsyncedFiles[i], err)
 		}
-		if _, err := uf.Write([]byte(fmt.Sprintf("unsynced content %d", i))); err != nil {
+		if _, err := uf.Write(fmt.Appendf(nil, "unsynced content %d", i)); err != nil {
 			t.Fatalf("Write %s: %v", unsyncedFiles[i], err)
 		}
 		if err := uf.Close(); err != nil {
@@ -725,7 +725,7 @@ func TestDeterministicPartialCloneStatisticalFidelity(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Create %s: %v", unsyncedFiles[i], err)
 			}
-			if _, err := uf.Write([]byte(fmt.Sprintf("unsynced content %d", i))); err != nil {
+			if _, err := uf.Write(fmt.Appendf(nil, "unsynced content %d", i)); err != nil {
 				t.Fatalf("Write %s: %v", unsyncedFiles[i], err)
 			}
 			if err := uf.Close(); err != nil {
@@ -1046,6 +1046,71 @@ func TestReplayPartialCloneInPlaceOverwriteAfterSync(t *testing.T) {
 	}
 	if !sawUnretainedUnsynced || !sawRetainedUnsynced {
 		t.Fatalf("expected both unretained (AAAA) and retained (BBBB) blocks for unsynced_dir across 64 seeds; sawUnretained=%v sawRetained=%v", sawUnretainedUnsynced, sawRetainedUnsynced)
+	}
+}
+
+func TestReplayPartialCloneSyncAfterNamespaceChange(t *testing.T) {
+	for _, operation := range []string{"rename", "link", "directory rename"} {
+		t.Run(operation, func(t *testing.T) {
+			recorder := vfsrec.New(vfs.NewCrashableMem())
+			if err := recorder.MkdirAll("before", 0755); err != nil {
+				t.Fatal(err)
+			}
+			file, err := recorder.Create("before/data", vfs.WriteCategoryUnspecified)
+			if err != nil {
+				t.Fatal(err)
+			}
+			payload := []byte("durable bytes after namespace change")
+			if _, err := file.Write(bytes.Clone(payload)); err != nil {
+				t.Fatal(err)
+			}
+			target := "before/alias"
+			switch operation {
+			case "rename":
+				err = recorder.Rename("before/data", target)
+			case "link":
+				err = recorder.Link("before/data", target)
+			case "directory rename":
+				err = recorder.Rename("before", "after")
+				target = "after/data"
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := file.Sync(); err != nil {
+				t.Fatal(err)
+			}
+			state, err := replay.Replay(recorder.Events())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer state.Close()
+			retained := 0
+			for seed := uint64(1); seed <= 64; seed++ {
+				cloned, err := state.Clone(50, seed)
+				if err != nil {
+					t.Fatal(err)
+				}
+				clonedFile, err := cloned.Open(target)
+				if err != nil {
+					continue
+				}
+				retained++
+				data, err := io.ReadAll(clonedFile)
+				if closeErr := clonedFile.Close(); closeErr != nil {
+					t.Fatal(closeErr)
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !bytes.Equal(data, payload) {
+					t.Fatalf("seed %d: retained %s lost synced bytes: got %q, want %q", seed, target, data, payload)
+				}
+			}
+			if retained == 0 {
+				t.Fatal("no retained alias was checked")
+			}
+		})
 	}
 }
 
@@ -1417,8 +1482,8 @@ func TestReplaySyncToNonFullSyncDoesNotSnapshot(t *testing.T) {
 	}
 
 	syncedMap2 := state2.FileSyncedBytesForTesting()
-	if snap2 := string(syncedMap2["syncto_test.dat"]); snap2 != "hello" {
-		t.Fatalf("expected syncto_test.dat prefix to be 'hello' in fileSyncedBytes when FullSync is true, got %q", snap2)
+	if snapshot := syncedMap2["syncto_test.dat"]; !bytes.Equal(snapshot, payload) {
+		t.Fatalf("FullSync must snapshot the entire file: got %q, want %q", snapshot, payload)
 	}
 }
 
@@ -1427,6 +1492,135 @@ type fullSyncTestFile struct {
 }
 
 func (f fullSyncTestFile) SyncTo(length int64) (bool, error) {
-	_, err := f.File.SyncTo(length)
-	return true, err
+	err := f.File.Sync()
+	return err == nil, err
+}
+
+func TestDeterministicPartialCloneUnsyncedTruncation(t *testing.T) {
+	mem := vfs.NewCrashableMem()
+	f, err := mem.Create("test.txt", vfs.WriteCategoryUnspecified)
+	if err != nil {
+		t.Fatal(err)
+	}
+	syncedData := []byte("original long content that was synced")
+	if _, err := f.Write(bytes.Clone(syncedData)); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	d, err := mem.OpenDir("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	_ = d.Close()
+
+	base0 := mem.CrashClone(vfs.CrashCloneCfg{UnsyncedDataPercent: 0})
+	full100 := mem.CrashClone(vfs.CrashCloneCfg{UnsyncedDataPercent: 100, RNG: rand.New(rand.NewPCG(0, 0))})
+	f2, err := full100.Create("test.txt", vfs.WriteCategoryUnspecified)
+	if err != nil {
+		t.Fatal(err)
+	}
+	shortData := []byte("short")
+	if _, err := f2.Write(bytes.Clone(shortData)); err != nil {
+		t.Fatal(err)
+	}
+	_ = f2.Close()
+
+	syncedMap := map[string][]byte{"test.txt": syncedData}
+
+	// With 0% retention, truncation must not persist
+	rng0 := rand.New(rand.NewPCG(0, 42))
+	clone0, err := replay.DeterministicPartialCloneForTesting(base0, full100, 0, rng0, syncedMap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cf, err := clone0.Open("test.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got0, _ := io.ReadAll(cf)
+	_ = cf.Close()
+	if !bytes.Equal(got0, syncedData) {
+		t.Fatalf("percent=0: expected synced data %q, got %q", string(syncedData), string(got0))
+	}
+
+	// With 100% retention, truncation must persist
+	rng100 := rand.New(rand.NewPCG(0, 42))
+	clone100, err := replay.DeterministicPartialCloneForTesting(base0, full100, 100, rng100, syncedMap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cf100, err := clone100.Open("test.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got100, _ := io.ReadAll(cf100)
+	_ = cf100.Close()
+	if !bytes.Equal(got100, shortData) {
+		t.Fatalf("percent=100: expected short data %q, got %q", string(shortData), string(got100))
+	}
+}
+
+func TestReplaySafeClose(t *testing.T) {
+	events := []trace.Event{
+		{ID: 1, Kind: trace.KindCreate, File: "f1.txt", Handle: 1},
+		{ID: 2, Kind: trace.KindCreate, File: "f2.txt", Handle: 2},
+	}
+	state, err := replay.Build(events, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := state.Close(); err != nil {
+		t.Fatalf("first Close failed: %v", err)
+	}
+	// Calling Close a second time must succeed without panic
+	if err := state.Close(); err != nil {
+		t.Fatalf("second Close failed: %v", err)
+	}
+}
+
+func TestReplayWriteBoundsCheck(t *testing.T) {
+	events := []trace.Event{
+		{ID: 1, Kind: trace.KindCreate, File: "f.txt", Handle: 1},
+	}
+	state, err := replay.Build(events, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer state.Close()
+
+	// Defect 2.9: KindWrite with event.Len > len(Data) must not panic with slice out of bounds.
+	corruptWrite := trace.Event{
+		ID:     2,
+		Kind:   trace.KindWrite,
+		File:   "f.txt",
+		Handle: 1,
+		Data:   []byte("hello"),
+		Len:    100, // exceeds len(Data) = 5
+	}
+	errWrite := state.AdvanceStepForTesting(corruptWrite)
+	if errWrite == nil {
+		t.Errorf("expected error on corrupt write length, got nil")
+	}
+
+	// KindWriteAt with event.Len > len(Data) must also error cleanly.
+	corruptWriteAt := trace.Event{
+		ID:     3,
+		Kind:   trace.KindWriteAt,
+		File:   "f.txt",
+		Handle: 1,
+		Data:   []byte("world"),
+		Len:    100, // exceeds len(Data) = 5
+	}
+	errWriteAt := state.AdvanceStepForTesting(corruptWriteAt)
+	if errWriteAt == nil {
+		t.Errorf("expected error on corrupt writeAt length, got nil")
+	}
 }

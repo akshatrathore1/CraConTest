@@ -2,6 +2,7 @@ package exp
 
 import (
 	"fmt"
+	"math"
 	"regexp"
 	"sort"
 
@@ -18,6 +19,9 @@ var digitRuns = regexp.MustCompile(`[0-9]+`)
 // numbers, sizes and line numbers differ between candidates that fail the
 // same way). Valid outcomes have no kind.
 func FailureKind(o oracle.Outcome) string {
+	if o.Signature != "" {
+		return o.Signature
+	}
 	switch o.Class {
 	case oracle.ClassViolation:
 		return o.Signature
@@ -128,7 +132,22 @@ func RandomPositions(universe []candidate.Candidate, outcomes []oracle.Outcome, 
 	}
 	sort.Ints(firsts)
 	sort.Ints(alls)
-	at := func(xs []int, q float64) int { return xs[int(q*float64(len(xs)-1))] }
+	at := func(xs []int, q float64) int {
+		if len(xs) == 0 {
+			return 0
+		}
+		if q <= 0 {
+			return xs[0]
+		}
+		if q >= 1 {
+			return xs[len(xs)-1]
+		}
+		idx := int(math.Round(q * float64(len(xs)-1)))
+		if idx >= len(xs) {
+			idx = len(xs) - 1
+		}
+		return xs[idx]
+	}
 	return RandomPositionSummary{
 		Seeds:          len(seeds),
 		FirstMedian:    at(firsts, 0.5),

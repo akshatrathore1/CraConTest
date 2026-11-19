@@ -189,12 +189,22 @@ func TestRHGWeightsValidation(t *testing.T) {
 	if _, err := strategy.NewRiskHorizonWithWeights(valid); err != nil {
 		t.Errorf("unexpected error for valid weights: %v", err)
 	}
+
+	// Defect 2.7: NewRiskHorizon panics on invalid weights instead of silently falling back to defaults.
+	func() {
+		defer func() {
+			if r := recover(); r == nil {
+				t.Errorf("expected panic for invalid weights in NewRiskHorizon, got none")
+			}
+		}()
+		_ = strategy.NewRiskHorizon(strategy.RHGWeights{Risk: -1})
+	}()
 }
 
 func TestRHGByNameRegistration(t *testing.T) {
 	aliases := []string{"rhg", "b7", "risk_horizon", "risk-horizon"}
 	for _, name := range aliases {
-		strat, err := strategy.ByName(name, 42, strategy.DefaultWeights)
+		strat, err := strategy.ByName(name, 42, strategy.DefaultWeights())
 		if err != nil {
 			t.Fatalf("ByName(%q) returned error: %v", name, err)
 		}

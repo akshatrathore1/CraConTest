@@ -67,6 +67,12 @@ func stateEqual(a, b State) bool {
 	return true
 }
 
+func keyStateEqual(left, right State, key string) bool {
+	leftValue, leftPresent := left[key]
+	rightValue, rightPresent := right[key]
+	return leftPresent == rightPresent && leftValue == rightValue
+}
+
 func isMutating(kind string) bool {
 	return kind == "set" || kind == "delete" || kind == "range_delete" || kind == "batch" || kind == "ingest"
 }
@@ -295,46 +301,87 @@ func Check(ctx Context) Outcome {
 	// Overwrite-aware divergence detection: identify the earliest operation i whose
 	// mutations are absent/divergent in recovered (and not overwritten by a later
 	// surviving operation) while a subsequent operation j > i is present.
-	rawKeyTouchedAfter := func(fromIdx int, key string) bool {
-		for k := fromIdx + 1; k < len(stateMeta); k++ {
+	maxTouchMemo := make(map[string]int)
+	maxTouch := func(key string) int {
+		if maxK, ok := maxTouchMemo[key]; ok {
+			return maxK
+		}
+		maxK := -1
+		for k := len(stateMeta) - 1; k >= 1; k-- {
 			entryK := ctx.History[stateMeta[k].entryIndex]
+			touched := false
 			for _, mk := range entryK.Mutations {
 				if mk.Kind == "range_delete" {
 					if key >= string(mk.Key) && key < string(mk.End) {
-						return true
+						touched = true
+						break
 					}
 				} else if string(mk.Key) == key {
-					return true
+					touched = true
+					break
 				}
 			}
+			if touched {
+				maxK = k
+				break
+			}
 		}
-		return false
+		maxTouchMemo[key] = maxK
+		return maxK
+	}
+
+	rawKeyTouchedAfter := func(fromIdx int, key string) bool {
+		return maxTouch(key) > fromIdx
+	}
+
+	satMemo := make([]int8, len(stateMeta))
+	for idx := range satMemo {
+		satMemo[idx] = -1
 	}
 
 	opSatisfiedModuloLater := func(idx int) bool {
+		if satMemo[idx] != -1 {
+			return satMemo[idx] == 1
+		}
 		entry := ctx.History[stateMeta[idx].entryIndex]
 		sIdx := states[idx]
+		satisfied := true
 		for _, m := range entry.Mutations {
 			if m.Kind == "range_delete" {
 				startKey := string(m.Key)
 				endKey := string(m.End)
 				for rk := range recovered {
 					if rk >= startKey && rk < endKey && !rawKeyTouchedAfter(idx, rk) {
-						return false
+						satisfied = false
+						break
 					}
 				}
 			} else {
 				k := string(m.Key)
-				if recovered[k] != sIdx[k] && !rawKeyTouchedAfter(idx, k) {
-					return false
+				if !keyStateEqual(recovered, sIdx, k) && !rawKeyTouchedAfter(idx, k) {
+					satisfied = false
+					break
 				}
 			}
+			if !satisfied {
+				break
+			}
 		}
-		return true
+		if satisfied {
+			satMemo[idx] = 1
+		} else {
+			satMemo[idx] = 0
+		}
+		return satisfied
 	}
 
 	keyOverwrittenToRecoveredAfter := func(fromIdx int, key string) bool {
-		sBefore := states[fromIdx-1]
+		var sBefore State
+		if fromIdx > 0 {
+			sBefore = states[fromIdx-1]
+		} else {
+			sBefore = make(State)
+		}
 		for k := fromIdx + 1; k < len(stateMeta); k++ {
 			entryK := ctx.History[stateMeta[k].entryIndex]
 			touched := false
@@ -349,7 +396,7 @@ func Check(ctx Context) Outcome {
 					break
 				}
 			}
-			if !touched || states[k][key] != recovered[key] {
+			if !touched || !keyStateEqual(states[k], recovered, key) {
 				continue
 			}
 			if !opSatisfiedModuloLater(k) {
@@ -357,12 +404,26 @@ func Check(ctx Context) Outcome {
 			}
 			// If k sets key to the exact value it already had before fromIdx,
 			// require k to have at least one witness key in recovered that differs from sBefore.
-			if recovered[key] == sBefore[key] {
+			if keyStateEqual(recovered, sBefore, key) {
 				hasWitness := false
 				for _, mk := range entryK.Mutations {
-					if mk.Kind != "range_delete" {
+					if mk.Kind == "range_delete" {
+						start := string(mk.Key)
+						end := string(mk.End)
+						for wk := range sBefore {
+							if wk >= start && wk < end {
+								if keyStateEqual(recovered, states[k], wk) && !keyStateEqual(recovered, sBefore, wk) {
+									hasWitness = true
+									break
+								}
+							}
+						}
+						if hasWitness {
+							break
+						}
+					} else {
 						wk := string(mk.Key)
-						if recovered[wk] == states[k][wk] && recovered[wk] != sBefore[wk] {
+						if keyStateEqual(recovered, states[k], wk) && !keyStateEqual(recovered, sBefore, wk) {
 							hasWitness = true
 							break
 						}
@@ -377,84 +438,135 @@ func Check(ctx Context) Outcome {
 		return false
 	}
 
+	divMemo := make([]int8, len(stateMeta))
+	for idx := range divMemo {
+		divMemo[idx] = -1
+	}
+
 	opDivergesInRecovered := func(idx int) bool {
+		if divMemo[idx] != -1 {
+			return divMemo[idx] == 1
+		}
 		entry := ctx.History[stateMeta[idx].entryIndex]
 		sIdx := states[idx]
+		diverges := false
 		for _, m := range entry.Mutations {
 			if m.Kind == "range_delete" {
 				startKey := string(m.Key)
 				endKey := string(m.End)
 				for rk := range recovered {
 					if rk >= startKey && rk < endKey && !keyOverwrittenToRecoveredAfter(idx, rk) {
-						return true
+						diverges = true
+						break
 					}
 				}
 			} else {
 				k := string(m.Key)
-				if recovered[k] != sIdx[k] && !keyOverwrittenToRecoveredAfter(idx, k) {
-					return true
+				if !keyStateEqual(recovered, sIdx, k) && !keyOverwrittenToRecoveredAfter(idx, k) {
+					diverges = true
+					break
 				}
 			}
+			if diverges {
+				break
+			}
 		}
-		return false
+		if diverges {
+			divMemo[idx] = 1
+		} else {
+			divMemo[idx] = 0
+		}
+		return diverges
+	}
+
+	presMemo := make([]int8, len(stateMeta))
+	for idx := range presMemo {
+		presMemo[idx] = -1
 	}
 
 	opPresentInRecovered := func(idx int) bool {
+		if presMemo[idx] != -1 {
+			return presMemo[idx] == 1
+		}
 		entry := ctx.History[stateMeta[idx].entryIndex]
 		if len(entry.Mutations) == 0 {
+			presMemo[idx] = 0
 			return false
 		}
 		sPrev := states[idx-1]
 		sIdx := states[idx]
 		if opDivergesInRecovered(idx) {
+			presMemo[idx] = 0
 			return false
 		}
+		present := false
 		for _, m := range entry.Mutations {
-			if m.Kind == "range_delete" {
+			switch m.Kind {
+			case "range_delete":
 				startKey := string(m.Key)
 				endKey := string(m.End)
 				for pk := range sPrev {
-					if pk >= startKey && pk < endKey && recovered[pk] == "" {
-						return true
+					_, pres := recovered[pk]
+					if pk >= startKey && pk < endKey && !pres {
+						present = true
+						break
 					}
 				}
-			} else if m.Kind == "set" {
+			case "set":
 				k := string(m.Key)
 				if val, ok := recovered[k]; ok && val == sIdx[k] {
-					return true
+					present = true
 				}
-			} else {
+			default:
 				k := string(m.Key)
-				if _, ok := recovered[k]; !ok && sPrev[k] != "" {
-					return true
+				_, previouslyPresent := sPrev[k]
+				if _, ok := recovered[k]; !ok && previouslyPresent {
+					present = true
 				}
 			}
+			if present {
+				break
+			}
 		}
-		return false
+		if present {
+			presMemo[idx] = 1
+		} else {
+			presMemo[idx] = 0
+		}
+		return present
+	}
+
+	lastPresent := -1
+	for j := len(stateMeta) - 1; j >= 1; j-- {
+		if opPresentInRecovered(j) {
+			lastPresent = j
+			break
+		}
 	}
 
 	divergentOpKind := "unknown"
 	for i := 1; i < len(stateMeta); i++ {
-		if opDivergesInRecovered(i) {
-			laterPresent := false
-			for j := i + 1; j < len(stateMeta); j++ {
-				if opPresentInRecovered(j) {
-					laterPresent = true
-					break
-				}
-			}
-			if laterPresent {
-				divergentOpKind = stateMeta[i].opKind
-				break
-			}
+		// Use >= so that when the diverging operation is also the last present
+		// operation (i == lastPresent), it is still correctly attributed.
+		if opDivergesInRecovered(i) && lastPresent >= i {
+			divergentOpKind = stateMeta[i].opKind
+			break
 		}
+	}
+
+	// Secondary fallback: attribute to the last-present operation if it itself
+	// diverges (covers tail-divergent uncommitted batches/ingests).
+	if divergentOpKind == "unknown" && lastPresent >= 1 && opDivergesInRecovered(lastPresent) {
+		divergentOpKind = stateMeta[lastPresent].opKind
 	}
 
 	if divergentOpKind == "unknown" && lower < len(states)-1 {
 		divergentOpKind = stateMeta[lower+1].opKind
 	}
 	if divergentOpKind == "unknown" && len(ctx.History) > 0 {
-		divergentOpKind = ctx.History[0].Kind
+		// Use the last history entry rather than the first to avoid
+		// misattributing tail violations to the initial operation.
+		divergentOpKind = ctx.History[len(ctx.History)-1].Kind
 	}
 
 	return Outcome{

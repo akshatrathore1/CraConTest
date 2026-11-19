@@ -3,10 +3,13 @@
 package vfsrec
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -21,10 +24,13 @@ type FS struct {
 	mu                       sync.Mutex
 	inner                    vfs.FS
 	nextHandle               uint64
+	nextEvent                uint64
 	events                   []trace.Event
 	hook                     func(id uint64)
 	waitTimeout              time.Duration
 	inIngestSection          bool
+	ingestGoroutineID        uint64
+	ingestGoroutines         map[uint64]int
 	ingestCond               *sync.Cond
 	walWrites                uint64
 	walCond                  *sync.Cond
@@ -45,7 +51,8 @@ var (
 // New constructs a recording filesystem wrapper around inner.
 func New(inner vfs.FS) *FS {
 	fs := &FS{
-		inner: inner,
+		inner:            inner,
+		ingestGoroutines: make(map[uint64]int),
 	}
 	fs.ingestCond = sync.NewCond(&fs.mu)
 	fs.walCond = sync.NewCond(&fs.mu)
@@ -95,6 +102,12 @@ func (fs *FS) WALWriteCount() uint64 {
 	return fs.walWrites
 }
 
+// NeedWALWriteBarrier reports whether WaitForWALWrite barriers should be
+// issued after Sync mutations (op.Sync). For plain recording FSes the WAL write
+// tracking is informational only and no barrier is needed; fault-injecting
+// wrappers override this to return true.
+func (fs *FS) NeedWALWriteBarrier() bool { return false }
+
 // NotifyDroppedWALWrite increments the WAL write counter and wakes any waiter
 // when a fault injector drops a primary-DB WAL write before it reaches vfsrec.FS.
 func (fs *FS) NotifyDroppedWALWrite() {
@@ -106,8 +119,17 @@ func (fs *FS) NotifyDroppedWALWrite() {
 	fs.mu.Unlock()
 }
 
-// WaitForWALWrite blocks until WALWriteCount() >= target, panicking if a 5-second
-// safety deadline expires before the expected WAL write is recorded.
+func defaultWaitTimeout() time.Duration {
+	if env := os.Getenv("CRACONTEST_WAIT_TIMEOUT"); env != "" {
+		if d, err := time.ParseDuration(env); err == nil && d > 0 {
+			return d
+		}
+	}
+	return 30 * time.Second
+}
+
+// WaitForWALWrite blocks until WALWriteCount() >= target, panicking if a safety
+// deadline expires before the expected WAL write is recorded.
 func (fs *FS) WaitForWALWrite(target uint64) {
 	fs.mu.Lock()
 	if fs.walWrites >= target {
@@ -119,7 +141,7 @@ func (fs *FS) WaitForWALWrite(target uint64) {
 	}
 	timeout := fs.waitTimeout
 	if timeout <= 0 {
-		timeout = 5 * time.Second
+		timeout = defaultWaitTimeout()
 	}
 	var timedOut bool
 	done := make(chan struct{})
@@ -149,6 +171,11 @@ func (fs *FS) WaitForWALWrite(target uint64) {
 
 // Begin records an OpBegin marker event for a client operation.
 func (fs *FS) Begin(op uint64, kind string) {
+	_ = fs.BeginEvent(op, kind)
+}
+
+// BeginEvent records an OpBegin marker event and returns the assigned event ID atomically.
+func (fs *FS) BeginEvent(op uint64, kind string) uint64 {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 	fs.appendEventLocked(trace.Event{
@@ -156,10 +183,16 @@ func (fs *FS) Begin(op uint64, kind string) {
 		Op:     op,
 		OpKind: kind,
 	})
+	return fs.events[len(fs.events)-1].ID
 }
 
 // End records an OpEnd marker event for a client operation.
 func (fs *FS) End(op uint64, kind string, err string) {
+	_ = fs.EndEvent(op, kind, err)
+}
+
+// EndEvent records an OpEnd marker event and returns the assigned event ID atomically.
+func (fs *FS) EndEvent(op uint64, kind string, err string) uint64 {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 	fs.appendEventLocked(trace.Event{
@@ -168,6 +201,17 @@ func (fs *FS) End(op uint64, kind string, err string) {
 		OpKind: kind,
 		Err:    err,
 	})
+	return fs.events[len(fs.events)-1].ID
+}
+
+// CurrentEventID returns the ID of the most recently recorded trace event (0 if none).
+func (fs *FS) CurrentEventID() uint64 {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	if len(fs.events) == 0 {
+		return 0
+	}
+	return fs.events[len(fs.events)-1].ID
 }
 
 // Events returns a deep copy of all recorded trace events.
@@ -198,12 +242,33 @@ func (fs *FS) appendEventLocked(event trace.Event) {
 // Write/WriteAt on the same handle.
 const syncReorderScanWindow = 8
 
+// appendSyncEventLocked repositions a Sync/SyncData/SyncTo barrier event adjacent
+// to its preceding Write/WriteAt on the same handle when only non-mutating events
+// (such as Read, Stat, Close on unrelated handles, or EngineEvent markers) intervene.
+//
+// Boundary Invariants:
+//  1. Causal & Mutation Barrier: Reordering stops immediately (breaks scan) upon
+//     encountering any mutating event (e.IsMutation() is true, excluding EngineEvent).
+//     A sync barrier is never moved before another handle's mutating operation.
+//  2. Same-Handle Boundary: Reordering stops immediately if another event on the
+//     same handle is encountered (e.Handle == event.Handle). A sync is never moved
+//     across earlier operations on the same file.
+//  3. Concurrency & Transaction Boundary: Reordering stops immediately upon encountering
+//     KindLock, KindUnlock, KindOpBegin, or KindOpEnd. Syncs are never reordered across
+//     synchronization or client-visible transaction boundaries.
+//  4. Bounded Scan Window: The backward scan checks at most syncReorderScanWindow (8)
+//     events. If the preceding Write/WriteAt is farther back, the event is appended
+//     to the trace tail without reordering.
+//  5. Sequential ID Invariant: If inserted, trailing events are shifted and all IDs
+//     from insertIdx onwards are re-indexed to strictly preserve the 1-based contiguous
+//     trace invariant: events[k].ID == k+1 for all k in [0, len(fs.events)).
+//     If a hook is registered, it is called with the final assigned event ID.
 func (fs *FS) appendSyncEventLocked(event trace.Event) {
 	insertIdx := -1
 	n := len(fs.events)
 	for i := n - 1; i >= 0 && (n-1-i) < syncReorderScanWindow; i-- {
 		e := fs.events[i]
-		if e.Handle == event.Handle || e.Kind == trace.KindUnlock || e.Kind == trace.KindOpBegin || e.Kind == trace.KindOpEnd {
+		if e.Handle == event.Handle || e.Kind == trace.KindLock || e.Kind == trace.KindUnlock || e.Kind == trace.KindOpBegin || e.Kind == trace.KindOpEnd {
 			break
 		}
 		isNonMutating := !e.IsMutation() || e.Kind == trace.KindEngineEvent
@@ -232,25 +297,88 @@ func (fs *FS) appendSyncEventLocked(event trace.Event) {
 	for j := insertIdx + 1; j < len(fs.events); j++ {
 		fs.events[j].ID = uint64(j + 1)
 	}
+	fs.nextEvent = uint64(len(fs.events))
 
 	if fs.hook != nil {
 		fs.hook(event.ID)
 	}
 }
 
+func curGoroutineID() uint64 {
+	var buf [64]byte
+	n := runtime.Stack(buf[:], false)
+	if n == 0 {
+		return 0
+	}
+	b := buf[:n]
+	prefix := []byte("goroutine ")
+	idx := bytes.Index(b, prefix)
+	if idx < 0 {
+		return 0
+	}
+	b = b[idx+len(prefix):]
+	for len(b) > 0 && b[0] == ' ' {
+		b = b[1:]
+	}
+	var id uint64
+	for len(b) > 0 && b[0] >= '0' && b[0] <= '9' {
+		id = id*10 + uint64(b[0]-'0')
+		b = b[1:]
+	}
+	return id
+}
+
+func parseGoroutineID(s string) uint64 {
+	idx := strings.Index(s, "goroutine ")
+	if idx < 0 {
+		return 0
+	}
+	s = strings.TrimLeft(s[idx+len("goroutine "):], " ")
+	end := strings.IndexFunc(s, func(r rune) bool {
+		return r < '0' || r > '9'
+	})
+	if end < 0 {
+		end = len(s)
+	}
+	if end == 0 {
+		return 0
+	}
+	id, err := strconv.ParseUint(s[:end], 10, 64)
+	if err != nil {
+		return 0
+	}
+	return id
+}
+
 // BeginIngestSection marks the start of an ingest section, pausing background flushes.
 func (fs *FS) BeginIngestSection() {
 	fs.mu.Lock()
+	gid := curGoroutineID()
+	if fs.ingestGoroutines == nil {
+		fs.ingestGoroutines = make(map[uint64]int)
+	}
+	fs.ingestGoroutines[gid]++
 	fs.inIngestSection = true
+	fs.ingestGoroutineID = gid
 	fs.mu.Unlock()
 }
 
 // EndIngestSection marks the end of an ingest section and unpauses background flushes.
 func (fs *FS) EndIngestSection() {
 	fs.mu.Lock()
-	fs.inIngestSection = false
-	if fs.ingestCond != nil {
-		fs.ingestCond.Broadcast()
+	gid := curGoroutineID()
+	if fs.ingestGoroutines != nil && fs.ingestGoroutines[gid] > 0 {
+		fs.ingestGoroutines[gid]--
+		if fs.ingestGoroutines[gid] == 0 {
+			delete(fs.ingestGoroutines, gid)
+		}
+	}
+	if len(fs.ingestGoroutines) == 0 {
+		fs.inIngestSection = false
+		fs.ingestGoroutineID = 0
+		if fs.ingestCond != nil {
+			fs.ingestCond.Broadcast()
+		}
 	}
 	fs.mu.Unlock()
 }
@@ -465,16 +593,82 @@ func (fs *FS) Remove(name string) error {
 		return err
 	}
 
-	if fs.inIngestSection && !strings.Contains(canon, "ingest_staging") && !strings.Contains(canon, "ingest_") && !strings.Contains(canon, "marker.manifest") {
-		if fs.ingestCond == nil {
-			fs.ingestCond = sync.NewCond(&fs.mu)
-		}
-		for fs.inIngestSection {
-			fs.ingestCond.Wait()
+	isIngestOp := false
+	if strings.Contains(canon, "ingest_staging") || strings.Contains(canon, "ingest_") {
+		isIngestOp = true
+	} else if fs.inIngestSection {
+		gid := curGoroutineID()
+		if (fs.ingestGoroutines != nil && fs.ingestGoroutines[gid] > 0) || (fs.ingestGoroutineID != 0 && gid == fs.ingestGoroutineID) {
+			isIngestOp = true
+		} else {
+			// Defensively walk stack frames to detect ingest callers.
+			var pcs [32]uintptr
+			n := runtime.Callers(2, pcs[:])
+			if n > 0 {
+				frames := runtime.CallersFrames(pcs[:n])
+				for {
+					frame, more := frames.Next()
+					fnLower := strings.ToLower(frame.Function)
+					fileLower := strings.ToLower(frame.File)
+					if strings.Contains(fnLower, "ingest") || strings.Contains(fileLower, "ingest") {
+						isIngestOp = true
+						break
+					}
+					if !more {
+						break
+					}
+				}
+			}
+			// Safe fallback: if stack frames could not be matched, check file path.
+			if !isIngestOp && strings.Contains(strings.ToLower(canon), "ingest") {
+				isIngestOp = true
+			}
 		}
 	}
 
+	if fs.inIngestSection && !isIngestOp && !strings.Contains(canon, "ingest_staging") && !strings.Contains(canon, "ingest_") && !strings.Contains(canon, "marker.manifest") {
+		if fs.ingestCond == nil {
+			fs.ingestCond = sync.NewCond(&fs.mu)
+		}
+		timeout := fs.waitTimeout
+		if timeout <= 0 {
+			timeout = defaultWaitTimeout()
+		}
+		var timedOut bool
+		done := make(chan struct{})
+		go func() {
+			timer := time.NewTimer(timeout)
+			defer timer.Stop()
+			select {
+			case <-timer.C:
+				fs.mu.Lock()
+				timedOut = true
+				fs.ingestCond.Broadcast()
+				fs.mu.Unlock()
+			case <-done:
+			}
+		}()
+		for fs.inIngestSection {
+			if timedOut {
+				close(done)
+				timeoutErr := fmt.Errorf("vfsrec: FS.Remove ingestCond wait exceeded %v deadline (ingest section never ended)", timeout)
+				event := trace.Event{
+					Kind: trace.KindRemove,
+					File: canon,
+					Err:  timeoutErr.Error(),
+				}
+				fs.appendEventLocked(event)
+				return timeoutErr
+			}
+			fs.ingestCond.Wait()
+		}
+		close(done)
+	}
+
 	err = fs.inner.Remove(name)
+	if err == nil && isDBManifestPath(canon) && fs.dbManifestCount > 0 {
+		fs.dbManifestCount--
+	}
 	event := trace.Event{
 		Kind: trace.KindRemove,
 		File: canon,

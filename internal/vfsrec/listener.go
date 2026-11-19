@@ -37,6 +37,10 @@ func (fs *FS) recordEngineEventLocked(note string, job uint64, inputs, outputs [
 			for i := insertIdx; i < len(fs.events); i++ {
 				fs.events[i].ID = uint64(i + 1)
 			}
+			fs.nextEvent = uint64(len(fs.events))
+			if fs.hook != nil {
+				fs.hook(event.ID)
+			}
 			return
 		}
 	}
@@ -73,7 +77,18 @@ func jobID(job int) uint64 {
 func (fs *FS) EventListener() pebble.EventListener {
 	return pebble.EventListener{
 		BackgroundError: func(err error) {
-			fs.recordEngineEvent("BackgroundError", 0, nil, nil)
+			errMsg := ""
+			if err != nil {
+				errMsg = err.Error()
+			}
+			fs.mu.Lock()
+			event := trace.Event{
+				Kind: trace.KindEngineEvent,
+				Note: "BackgroundError",
+				Err:  errMsg,
+			}
+			fs.appendEventLocked(event)
+			fs.mu.Unlock()
 		},
 		BlobFileCreated: func(info pebble.BlobFileCreateInfo) {
 			fs.recordEngineEvent("BlobFileCreated", jobID(info.JobID), nil, pathSlice(info.Path))
@@ -107,7 +122,7 @@ func (fs *FS) EventListener() pebble.EventListener {
 			if !fs.inIngestSection && fs.pendingManifestDeletions > 0 && fs.manifestCond != nil {
 				timeout := fs.waitTimeout
 				if timeout <= 0 {
-					timeout = 5 * time.Second
+					timeout = defaultWaitTimeout()
 				}
 				var timedOut bool
 				done := make(chan struct{})
@@ -126,8 +141,16 @@ func (fs *FS) EventListener() pebble.EventListener {
 				for !fs.inIngestSection && fs.pendingManifestDeletions > 0 {
 					if timedOut {
 						close(done)
+						msg := "FlushBegin manifestCond wait exceeded 5s deadline"
+						event := trace.Event{
+							Kind: trace.KindEngineEvent,
+							Note: "BackgroundError",
+							Job:  jobID(info.JobID),
+							Err:  msg,
+						}
+						fs.appendEventLocked(event)
 						fs.mu.Unlock()
-						panic("vfsrec: FlushBegin manifestCond wait exceeded 5s deadline")
+						panic("vfsrec: " + msg)
 					}
 					fs.manifestCond.Wait()
 				}
@@ -159,6 +182,9 @@ func (fs *FS) EventListener() pebble.EventListener {
 		ManifestDeleted: func(info pebble.ManifestDeleteInfo) {
 			fs.mu.Lock()
 			defer fs.mu.Unlock()
+			if fs.dbManifestCount > 0 {
+				fs.dbManifestCount--
+			}
 			if fs.pendingManifestDeletions > 0 {
 				fs.pendingManifestDeletions--
 				if fs.pendingManifestDeletions == 0 && fs.manifestCond != nil {

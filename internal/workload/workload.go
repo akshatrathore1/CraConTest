@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"os"
 	"runtime"
 	"time"
 
@@ -46,9 +47,20 @@ const (
 type walWriteSyncer interface {
 	WALWriteCount() uint64
 	WaitForWALWrite(target uint64)
+	// NeedWALWriteBarrier reports whether WaitForWALWrite barriers are
+	// meaningful for this FS. Only fault-injecting filesystems that may drop
+	// WAL writes asynchronously need this barrier; plain recording FSes do not.
+	NeedWALWriteBarrier() bool
 }
 
 // Config specifies the configuration for deterministic workload execution.
+//
+// Note on Operation Mix: When Preset is empty, the operation mix is standardized
+// in workload.Plan() (and DefaultConfig()): 50% set, 20% get, 10% delete, 10% two-key
+// batch, 5% range_delete, and 5% read/iteration. Config files (e.g. main.json, smoke.json)
+// specify operational parameters (seed, operations, key_count, value_bytes, sync_every,
+// flush_every), while the operation mix is governed by Plan() or selected via Preset
+// (ycsb-a, ycsb-b, ycsb-f, overwrite-heavy, delete-heavy).
 type Config struct {
 	Preset              string `json:"preset,omitempty"`
 	Seed                uint64 `json:"seed"`
@@ -111,14 +123,33 @@ func Validate(cfg Config) error {
 	if cfg.FlushEvery < 0 {
 		return fmt.Errorf("flush_every must be >= 0, got %d", cfg.FlushEvery)
 	}
+	if cfg.CompactAt < 0 {
+		return fmt.Errorf("compact_at must be >= 0, got %d", cfg.CompactAt)
+	}
 	if cfg.CheckpointAt < 0 {
 		return fmt.Errorf("checkpoint_at must be >= 0, got %d", cfg.CheckpointAt)
+	}
+	if cfg.MaxManifestFileSize < 0 {
+		return fmt.Errorf("max_manifest_file_size must be >= 0, got %d", cfg.MaxManifestFileSize)
 	}
 	if cfg.IngestEvery < 0 {
 		return fmt.Errorf("ingest_every must be >= 0, got %d", cfg.IngestEvery)
 	}
 	if cfg.RatchetAt < 0 {
 		return fmt.Errorf("ratchet_at must be >= 0, got %d", cfg.RatchetAt)
+	}
+	hasRangeDeleteOrIngest := cfg.Preset == "" || cfg.Preset == PresetDeleteHeavy || cfg.IngestEvery > 0
+	if hasRangeDeleteOrIngest {
+		effectiveKeys := cfg.KeyCount
+		if effectiveKeys <= 0 && cfg.Preset != "" {
+			effectiveKeys = 64
+			if cfg.Preset == PresetDeleteHeavy {
+				effectiveKeys = 128
+			}
+		}
+		if effectiveKeys < 2 {
+			return fmt.Errorf("key_count must be >= 2 when range deletes or ingest operations are enabled, got %d", cfg.KeyCount)
+		}
 	}
 	return nil
 }
@@ -147,7 +178,7 @@ type PlanOperation struct {
 }
 
 func formatKey(index int) []byte {
-	return []byte(fmt.Sprintf("key-%04d", index))
+	return fmt.Appendf(nil, "key-%04d", index)
 }
 
 func makeValue(rng *rand.Rand, size int, tag string) []byte {
@@ -259,27 +290,37 @@ func Plan(cfg Config) []PlanOperation {
 
 		case PresetYCSBF:
 			opID++
-			mutatingCount++
-			sync := (cfg.SyncEvery > 0 && mutatingCount%cfg.SyncEvery == 0)
-			kIdx1 := rng.IntN(keyCount)
-			kIdx2 := rng.IntN(keyCount)
-			if kIdx1 == kIdx2 {
-				kIdx2 = (kIdx1 + 1) % keyCount
+			if i%2 == 1 {
+				mutatingCount++
+				sync := (cfg.SyncEvery > 0 && mutatingCount%cfg.SyncEvery == 0)
+				kIdx1 := rng.IntN(keyCount)
+				kIdx2 := rng.IntN(keyCount)
+				if kIdx1 == kIdx2 {
+					kIdx2 = (kIdx1 + 1) % keyCount
+				}
+				k1 := formatKey(kIdx1)
+				k2 := formatKey(kIdx2)
+				v1 := makeValue(rng, valueBytes, fmt.Sprintf("%05da", opID))
+				v2 := makeValue(rng, valueBytes, fmt.Sprintf("%05db", opID))
+				plan = append(plan, PlanOperation{
+					Op:       opID,
+					Kind:     "batch",
+					Mutating: true,
+					Sync:     sync,
+					Key:      k1,
+					Value:    v1,
+					Key2:     k2,
+					Value2:   v2,
+				})
+			} else {
+				kIdx := rng.IntN(keyCount)
+				plan = append(plan, PlanOperation{
+					Op:       opID,
+					Kind:     "get",
+					Mutating: false,
+					Key:      formatKey(kIdx),
+				})
 			}
-			k1 := formatKey(kIdx1)
-			k2 := formatKey(kIdx2)
-			v1 := makeValue(rng, valueBytes, fmt.Sprintf("%05da", opID))
-			v2 := makeValue(rng, valueBytes, fmt.Sprintf("%05db", opID))
-			plan = append(plan, PlanOperation{
-				Op:       opID,
-				Kind:     "batch",
-				Mutating: true,
-				Sync:     sync,
-				Key:      k1,
-				Value:    v1,
-				Key2:     k2,
-				Value2:   v2,
-			})
 
 		case PresetOverwriteHeavy:
 			opID++
@@ -524,15 +565,21 @@ func Plan(cfg Config) []PlanOperation {
 	return plan
 }
 
-func drainBackgroundWork(db *pebble.DB) {
+func drainBackgroundWork(db *pebble.DB) error {
 	if db == nil {
-		return
+		return nil
 	}
-	deadline := time.Now().Add(5 * time.Second)
-	waitClean := func() {
+	timeout := 30 * time.Second
+	if env := os.Getenv("CRACONTEST_WAIT_TIMEOUT"); env != "" {
+		if d, err := time.ParseDuration(env); err == nil && d > 0 {
+			timeout = d
+		}
+	}
+	deadline := time.Now().Add(timeout)
+	waitClean := func() error {
 		rem := time.Until(deadline)
 		if rem <= 0 {
-			panic("workload: drainBackgroundWork exceeded 5s deadline")
+			return fmt.Errorf("workload: drainBackgroundWork exceeded %v deadline waiting for cleaning", timeout)
 		}
 		done := make(chan struct{})
 		go func() {
@@ -541,29 +588,87 @@ func drainBackgroundWork(db *pebble.DB) {
 		}()
 		select {
 		case <-done:
+			return nil
 		case <-time.After(rem):
-			panic("workload: drainBackgroundWork exceeded 5s deadline")
+			return fmt.Errorf("workload: drainBackgroundWork exceeded %v deadline waiting for cleaning", timeout)
 		}
 	}
+	yields := 0
 	for db.Metrics().MemTable.Count > 1 || db.Metrics().Flush.NumInProgress > 0 || db.Metrics().Compact.NumInProgress > 0 {
 		if time.Now().After(deadline) {
-			panic("workload: drainBackgroundWork exceeded 5s deadline")
+			return fmt.Errorf("workload: drainBackgroundWork exceeded %v deadline waiting for memtable/flush/compact", timeout)
 		}
-		runtime.Gosched()
+		yields++
+		if yields > 50 {
+			time.Sleep(100 * time.Microsecond)
+		} else {
+			runtime.Gosched()
+		}
 	}
-	waitClean()
+	if err := waitClean(); err != nil {
+		return err
+	}
+	yields = 0
 	for db.Metrics().MemTable.Count > 1 || db.Metrics().Flush.NumInProgress > 0 || db.Metrics().Compact.NumInProgress > 0 {
 		if time.Now().After(deadline) {
-			panic("workload: drainBackgroundWork exceeded 5s deadline")
+			return fmt.Errorf("workload: drainBackgroundWork exceeded %v deadline waiting for memtable/flush/compact", timeout)
 		}
-		runtime.Gosched()
+		yields++
+		if yields > 50 {
+			time.Sleep(100 * time.Microsecond)
+		} else {
+			runtime.Gosched()
+		}
 	}
-	waitClean()
+	if err := waitClean(); err != nil {
+		return err
+	}
+	time.Sleep(2 * time.Millisecond)
+	return nil
 }
 
 type ingestSectionGate interface {
 	BeginIngestSection()
 	EndIngestSection()
+}
+
+func findEventProvider(targets ...any) interface{ CurrentEventID() uint64 } {
+	for _, t := range targets {
+		curr := t
+		for curr != nil {
+			if ep, ok := curr.(interface{ CurrentEventID() uint64 }); ok {
+				return ep
+			}
+			if u, ok := curr.(interface{ Unwrap() vfs.FS }); ok {
+				curr = u.Unwrap()
+			} else {
+				break
+			}
+		}
+	}
+	return nil
+}
+
+type eventAwareMarker interface {
+	BeginEvent(op uint64, kind string) uint64
+	EndEvent(op uint64, kind string, err string) uint64
+}
+
+func findEventAwareMarker(targets ...any) eventAwareMarker {
+	for _, t := range targets {
+		curr := t
+		for curr != nil {
+			if em, ok := curr.(eventAwareMarker); ok {
+				return em
+			}
+			if u, ok := curr.(interface{ Unwrap() vfs.FS }); ok {
+				curr = u.Unwrap()
+			} else {
+				break
+			}
+		}
+	}
+	return nil
 }
 
 // Run executes the planned workload on db, calling marker methods around each
@@ -592,7 +697,9 @@ func Run(db *pebble.DB, marker Marker, cfg Config) ([]history.Entry, error) {
 		ingestGate = ig
 	}
 
-	drainBackgroundWork(db)
+	if err := drainBackgroundWork(db); err != nil {
+		return nil, err
+	}
 
 	var walSync walWriteSyncer
 	if ws, ok := cfg.FS.(walWriteSyncer); ok {
@@ -603,17 +710,28 @@ func Run(db *pebble.DB, marker Marker, cfg Config) ([]history.Entry, error) {
 		walSync = ws
 	}
 
+	evMarker := findEventAwareMarker(marker, targetFS, cfg.FS)
+	evProvider := findEventProvider(marker, targetFS, cfg.FS)
+
 	var eventTracker uint64
 
 	for _, op := range plan {
-		eventTracker++
-		beginEv := eventTracker
 		var prevWAL uint64
 		if walSync != nil {
 			prevWAL = walSync.WALWriteCount()
 		}
-		if marker != nil {
+		var beginEv uint64
+		if evMarker != nil {
+			beginEv = evMarker.BeginEvent(op.Op, op.Kind)
+		} else if marker != nil {
 			marker.Begin(op.Op, op.Kind)
+			if evProvider != nil {
+				beginEv = evProvider.CurrentEventID()
+			}
+		}
+		if beginEv == 0 {
+			eventTracker++
+			beginEv = eventTracker
 		}
 
 		var opErr error
@@ -643,21 +761,27 @@ func Run(db *pebble.DB, marker Marker, cfg Config) ([]history.Entry, error) {
 			if err1 == nil {
 				_ = closer1.Close()
 				_ = v1
+			} else if !errors.Is(err1, pebble.ErrNotFound) {
+				opErr = err1
 			}
 			v2, closer2, err2 := db.Get(op.Key2)
 			if err2 == nil {
 				_ = closer2.Close()
 				_ = v2
+			} else if opErr == nil && !errors.Is(err2, pebble.ErrNotFound) {
+				opErr = err2
 			}
-			b := db.NewBatch()
-			if err := b.Set(op.Key, op.Value, nil); err != nil {
-				opErr = err
-			} else if err := b.Set(op.Key2, op.Value2, nil); err != nil {
-				opErr = err
-			} else {
-				opErr = b.Commit(wo)
+			if opErr == nil {
+				b := db.NewBatch()
+				if err := b.Set(op.Key, op.Value, nil); err != nil {
+					opErr = err
+				} else if err := b.Set(op.Key2, op.Value2, nil); err != nil {
+					opErr = err
+				} else {
+					opErr = b.Commit(wo)
+				}
+				_ = b.Close()
 			}
-			_ = b.Close()
 
 		case "range_delete":
 			opErr = db.DeleteRange(op.Key, op.EndKey, wo)
@@ -687,7 +811,7 @@ func Run(db *pebble.DB, marker Marker, cfg Config) ([]history.Entry, error) {
 			}
 
 		case "checkpoint":
-			_ = db.Checkpoint("checkpoint")
+			opErr = db.Checkpoint("checkpoint")
 
 		case "ingest":
 			opErr = runIngest(db, targetFS, ingestGate, op, cfg.BarrierIngest)
@@ -696,25 +820,36 @@ func Run(db *pebble.DB, marker Marker, cfg Config) ([]history.Entry, error) {
 			opErr = db.RatchetFormatMajorVersion(pebble.FormatNewest)
 		}
 
-		if walSync != nil && opErr == nil && op.Sync {
+		if walSync != nil && opErr == nil && op.Sync && walSync.NeedWALWriteBarrier() {
 			switch op.Kind {
 			case OpSet, OpDelete, OpBatch, OpRangeDelete:
 				walSync.WaitForWALWrite(prevWAL + 1)
+				time.Sleep(2 * time.Millisecond)
 			}
 		}
 
 		if opErr == nil {
-			drainBackgroundWork(db)
+			if drainErr := drainBackgroundWork(db); drainErr != nil {
+				opErr = drainErr
+			}
 		}
 
-		eventTracker++
-		endEv := eventTracker
 		errStr := ""
 		if opErr != nil {
 			errStr = opErr.Error()
 		}
-		if marker != nil {
+		var endEv uint64
+		if evMarker != nil {
+			endEv = evMarker.EndEvent(op.Op, op.Kind, errStr)
+		} else if marker != nil {
 			marker.End(op.Op, op.Kind, errStr)
+			if evProvider != nil {
+				endEv = evProvider.CurrentEventID()
+			}
+		}
+		if endEv == 0 {
+			eventTracker++
+			endEv = eventTracker
 		}
 
 		// Build history entry with owned bytes.
@@ -796,7 +931,7 @@ func Correlate(entries []history.Entry, events []trace.Event) ([]history.Entry, 
 	return result, nil
 }
 
-func runIngest(db *pebble.DB, targetFS vfs.FS, ingestGate ingestSectionGate, op PlanOperation, barrierIngest bool) error {
+func runIngest(db *pebble.DB, targetFS vfs.FS, ingestGate ingestSectionGate, op PlanOperation, barrierIngest bool) (err error) {
 	if targetFS == nil {
 		return errors.New("workload: ingest requires a valid VFS")
 	}
@@ -822,27 +957,42 @@ func runIngest(db *pebble.DB, targetFS vfs.FS, ingestGate ingestSectionGate, op 
 	}
 
 	var paths []string
-	if !op.MultiFile {
+	if !op.MultiFile || len(op.Mutations) < 2 {
 		path := fmt.Sprintf("%s/ingest_%05d.sst", stagingDir, op.Op)
 		if err := writeSST(path, op.Mutations); err != nil {
 			return err
 		}
 		paths = []string{path}
 	} else {
+		mid := len(op.Mutations) / 2
 		path1 := fmt.Sprintf("%s/ingest_%05d_a.sst", stagingDir, op.Op)
 		path2 := fmt.Sprintf("%s/ingest_%05d_b.sst", stagingDir, op.Op)
-		if err := writeSST(path1, op.Mutations[:2]); err != nil {
+		if err := writeSST(path1, op.Mutations[:mid]); err != nil {
 			return err
 		}
-		if err := writeSST(path2, op.Mutations[2:]); err != nil {
+		if err := writeSST(path2, op.Mutations[mid:]); err != nil {
 			return err
 		}
 		paths = []string{path1, path2}
 	}
+	defer func() {
+		if err != nil {
+			for _, p := range paths {
+				_ = targetFS.Remove(p)
+			}
+		}
+	}()
 
-	if sDir, err := targetFS.OpenDir(stagingDir); err == nil {
-		_ = sDir.Sync()
+	sDir, err := targetFS.OpenDir(stagingDir)
+	if err != nil {
+		return fmt.Errorf("open staging dir %s: %w", stagingDir, err)
+	}
+	if syncErr := sDir.Sync(); syncErr != nil {
 		_ = sDir.Close()
+		return fmt.Errorf("sync staging dir %s: %w", stagingDir, syncErr)
+	}
+	if closeErr := sDir.Close(); closeErr != nil {
+		return fmt.Errorf("close staging dir %s: %w", stagingDir, closeErr)
 	}
 
 	if barrierIngest {
@@ -851,7 +1001,7 @@ func runIngest(db *pebble.DB, targetFS vfs.FS, ingestGate ingestSectionGate, op 
 		}
 	}
 
-	err := func() error {
+	err = func() error {
 		if ingestGate != nil {
 			ingestGate.BeginIngestSection()
 			defer ingestGate.EndIngestSection()
@@ -859,7 +1009,9 @@ func runIngest(db *pebble.DB, targetFS vfs.FS, ingestGate ingestSectionGate, op 
 		return db.Ingest(context.Background(), paths)
 	}()
 	if err == nil {
-		drainBackgroundWork(db)
+		if drainErr := drainBackgroundWork(db); drainErr != nil {
+			err = drainErr
+		}
 	}
 	return err
 }

@@ -47,6 +47,7 @@ func TestWorkloadDiversityNullControlSmoke(t *testing.T) {
 				},
 				Policies:        []int{0, 100},
 				SafeOpenTimeout: 3 * time.Second,
+				// B0PercentileCnt is set to 10 (vs DefaultB0PercentileCnt=100) for fast smoke preset execution.
 				B0PercentileCnt: 10,
 				Budgets:         []int{0, 1, 5, 10, 25},
 			}
@@ -72,6 +73,7 @@ func TestWorkloadDiversityNullControlSmoke(t *testing.T) {
 				},
 				Policies:        []int{0, 100},
 				SafeOpenTimeout: 3 * time.Second,
+				// B0PercentileCnt is set to 10 (vs DefaultB0PercentileCnt=100) for fast smoke preset execution.
 				B0PercentileCnt: 10,
 				Budgets:         []int{0, 1, 5, 10, 25},
 			}
@@ -300,6 +302,7 @@ func TestWorkloadDiversityBenchmark(t *testing.T) {
 					},
 					Policies:        []int{0, 100},
 					SafeOpenTimeout: 3 * time.Second,
+					// B0PercentileCnt is set to 50 (vs DefaultB0PercentileCnt=100) to keep multi-preset matrix test runtime fast.
 					B0PercentileCnt: 50,
 					Budgets:         []int{0, 1, 5, 10, 25},
 				}

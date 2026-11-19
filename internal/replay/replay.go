@@ -19,13 +19,17 @@ import (
 // State represents an active replay state holding an in-memory crashable filesystem,
 // open file/lock handles, and trace progress.
 type State struct {
-	events          []trace.Event
-	memFS           *vfs.MemFS
-	handles         map[uint64]vfs.File
-	locks           map[uint64]io.Closer
-	currentCut      uint64
-	handlePath      map[uint64]string
-	fileSyncedBytes map[string][]byte
+	events      []trace.Event
+	memFS       *vfs.MemFS
+	handles     map[uint64]vfs.File
+	locks       map[uint64]io.Closer
+	currentCut  uint64
+	handleFiles map[uint64]*fileSnapshot
+	filePaths   map[string]*fileSnapshot
+}
+
+type fileSnapshot struct {
+	bytes []byte
 }
 
 // Replay validates and executes the given trace events into a State replayed to completion.
@@ -43,12 +47,12 @@ func Build(events []trace.Event, cut uint64) (*State, error) {
 	}
 
 	s := &State{
-		events:          trace.Clone(events),
-		memFS:           vfs.NewCrashableMem(),
-		handles:         make(map[uint64]vfs.File),
-		locks:           make(map[uint64]io.Closer),
-		handlePath:      make(map[uint64]string),
-		fileSyncedBytes: make(map[string][]byte),
+		events:      trace.Clone(events),
+		memFS:       vfs.NewCrashableMem(),
+		handles:     make(map[uint64]vfs.File),
+		locks:       make(map[uint64]io.Closer),
+		handleFiles: make(map[uint64]*fileSnapshot),
+		filePaths:   make(map[string]*fileSnapshot),
 	}
 
 	if cut > 0 {
@@ -103,11 +107,7 @@ func (s *State) Clone(percent int, seed uint64) (vfs.FS, error) {
 
 	rng := rand.New(rand.NewPCG(0, seed))
 	base0 := s.memFS.CrashClone(vfs.CrashCloneCfg{UnsyncedDataPercent: 0})
-	full100 := s.memFS.CrashClone(vfs.CrashCloneCfg{
-		UnsyncedDataPercent: 100,
-		RNG:                 rand.New(rand.NewPCG(0, 0)),
-	})
-	return deterministicPartialClone(base0, full100, percent, rng, s.fileSyncedBytes)
+	return deterministicPartialClone(base0, s.memFS, percent, rng, s.syncedBytesByPath())
 }
 
 // deterministicPartialClone constructs a 100% deterministic, seed-reproducible partial-retention
@@ -205,6 +205,14 @@ func deterministicPartialClone(
 				}
 
 				out := bytes.Clone(syncedBytes)
+				// If the current file is shorter than the synced snapshot (e.g. rewrite
+				// to a shorter length), truncation is an unsynced metadata change that
+				// only persists if retained by the partial retention policy.
+				if len(currBytes) < len(syncedBytes) {
+					if rng.IntN(100) < percent {
+						out = out[:len(currBytes)]
+					}
+				}
 				if currSet[name] && !bytes.Equal(syncedBytes, currBytes) {
 					for offset := 0; offset < len(currBytes); offset += 4096 {
 						end := offset + 4096
@@ -276,15 +284,18 @@ func (s *State) Close() error {
 	for id, f := range s.handles {
 		if err := f.Close(); err != nil {
 			errs = append(errs, fmt.Errorf("close handle %d: %w", id, err))
+		} else {
+			delete(s.handles, id)
+			delete(s.handleFiles, id)
 		}
-		delete(s.handles, id)
 	}
 
 	for id, closer := range s.locks {
 		if err := closer.Close(); err != nil {
 			errs = append(errs, fmt.Errorf("unlock handle %d: %w", id, err))
+		} else {
+			delete(s.locks, id)
 		}
-		delete(s.locks, id)
 	}
 
 	return errors.Join(errs...)
@@ -314,8 +325,7 @@ func (s *State) applyEvent(event trace.Event) error {
 		}
 		if err == nil {
 			s.handles[event.Handle] = f
-			s.handlePath[event.Handle] = event.File
-			s.fileSyncedBytes[event.File] = nil
+			s.trackFile(event.Handle, event.File, true)
 		}
 		return nil
 
@@ -327,7 +337,9 @@ func (s *State) applyEvent(event trace.Event) error {
 		}
 		if err == nil {
 			s.handles[event.Handle] = f
-			s.handlePath[event.Handle] = event.File
+			if !event.Dir {
+				s.trackFile(event.Handle, event.File, false)
+			}
 		}
 		return nil
 
@@ -339,7 +351,9 @@ func (s *State) applyEvent(event trace.Event) error {
 		}
 		if err == nil {
 			s.handles[event.Handle] = f
-			s.handlePath[event.Handle] = event.File
+			if !event.Dir {
+				s.trackFile(event.Handle, event.File, event.Created)
+			}
 		}
 		return nil
 
@@ -351,7 +365,6 @@ func (s *State) applyEvent(event trace.Event) error {
 		}
 		if err == nil {
 			s.handles[event.Handle] = f
-			s.handlePath[event.Handle] = event.File
 		}
 		return nil
 
@@ -363,9 +376,8 @@ func (s *State) applyEvent(event trace.Event) error {
 		}
 		if err == nil {
 			s.handles[event.Handle] = f
-			s.handlePath[event.Handle] = event.File2
-			delete(s.fileSyncedBytes, event.File)
-			s.fileSyncedBytes[event.File2] = nil
+			s.renameFilePaths(event.File, event.File2)
+			s.trackFile(event.Handle, event.File2, true)
 		}
 		return nil
 
@@ -383,7 +395,9 @@ func (s *State) applyEvent(event trace.Event) error {
 			return fmt.Errorf("replay: infrastructure error: mismatch on event %d (%s %s): trace err=%q, replay err=%v",
 				event.ID, event.Kind, event.File, event.Err, err)
 		}
-		delete(s.fileSyncedBytes, event.File)
+		if err == nil {
+			delete(s.filePaths, event.File)
+		}
 		return nil
 
 	case trace.KindRemoveAll:
@@ -392,10 +406,11 @@ func (s *State) applyEvent(event trace.Event) error {
 			return fmt.Errorf("replay: infrastructure error: mismatch on event %d (%s %s): trace err=%q, replay err=%v",
 				event.ID, event.Kind, event.File, event.Err, err)
 		}
-		delete(s.fileSyncedBytes, event.File)
-		for p := range s.fileSyncedBytes {
-			if strings.HasPrefix(p, event.File+"/") {
-				delete(s.fileSyncedBytes, p)
+		for name := range s.filePaths {
+			if name == event.File || strings.HasPrefix(name, event.File+"/") || event.File == "" {
+				if _, statErr := s.memFS.Stat(name); statErr != nil {
+					delete(s.filePaths, name)
+				}
 			}
 		}
 		return nil
@@ -406,8 +421,11 @@ func (s *State) applyEvent(event trace.Event) error {
 			return fmt.Errorf("replay: infrastructure error: mismatch on event %d (%s %s -> %s): trace err=%q, replay err=%v",
 				event.ID, event.Kind, event.File, event.File2, event.Err, err)
 		}
-		s.fileSyncedBytes[event.File2] = s.fileSyncedBytes[event.File]
-		delete(s.fileSyncedBytes, event.File)
+		if err == nil {
+			s.renameFilePaths(event.File, event.File2)
+		} else if _, statErr := s.memFS.Stat(event.File2); statErr != nil {
+			delete(s.filePaths, event.File2)
+		}
 		return nil
 
 	case trace.KindLink:
@@ -416,8 +434,8 @@ func (s *State) applyEvent(event trace.Event) error {
 			return fmt.Errorf("replay: infrastructure error: mismatch on event %d (%s %s -> %s): trace err=%q, replay err=%v",
 				event.ID, event.Kind, event.File, event.File2, event.Err, err)
 		}
-		if b, ok := s.fileSyncedBytes[event.File]; ok {
-			s.fileSyncedBytes[event.File2] = bytes.Clone(b)
+		if err == nil {
+			s.filePaths[event.File2] = s.filePaths[event.File]
 		}
 		return nil
 
@@ -437,7 +455,14 @@ func (s *State) applyEvent(event trace.Event) error {
 		if !ok {
 			return fmt.Errorf("replay: handle %d not open on event %d", event.Handle, event.ID)
 		}
-		data := bytes.Clone(event.Data[:event.Len])
+		if event.Len < 0 || (event.Err == "" && event.Len > len(event.Data)) {
+			return fmt.Errorf("replay: corrupted write event %d: len %d exceeds data length %d", event.ID, event.Len, len(event.Data))
+		}
+		writeLen := event.Len
+		if writeLen > len(event.Data) {
+			writeLen = len(event.Data)
+		}
+		data := bytes.Clone(event.Data[:writeLen])
 		n, err := f.Write(data)
 		if (err != nil) != (event.Err != "") {
 			return fmt.Errorf("replay: infrastructure error: mismatch on write event %d: trace err=%q, replay err=%v",
@@ -453,7 +478,14 @@ func (s *State) applyEvent(event trace.Event) error {
 		if !ok {
 			return fmt.Errorf("replay: handle %d not open on event %d", event.Handle, event.ID)
 		}
-		data := bytes.Clone(event.Data[:event.Len])
+		if event.Len < 0 || (event.Err == "" && event.Len > len(event.Data)) {
+			return fmt.Errorf("replay: corrupted writeAt event %d: len %d exceeds data length %d", event.ID, event.Len, len(event.Data))
+		}
+		writeLen := event.Len
+		if writeLen > len(event.Data) {
+			writeLen = len(event.Data)
+		}
+		data := bytes.Clone(event.Data[:writeLen])
 		n, err := f.WriteAt(data, event.Off)
 		if (err != nil) != (event.Err != "") {
 			return fmt.Errorf("replay: infrastructure error: mismatch on writeAt event %d: trace err=%q, replay err=%v",
@@ -461,6 +493,18 @@ func (s *State) applyEvent(event trace.Event) error {
 		}
 		if event.Err == "" && n != event.Len {
 			return fmt.Errorf("replay: short writeAt on event %d: got %d, want %d", event.ID, n, event.Len)
+		}
+		return nil
+
+	case trace.KindPreallocate:
+		f, ok := s.handles[event.Handle]
+		if !ok {
+			return fmt.Errorf("replay: handle %d not open on event %d", event.Handle, event.ID)
+		}
+		err := f.Preallocate(event.Off, event.Size)
+		if (err != nil) != (event.Err != "") {
+			return fmt.Errorf("replay: infrastructure error: mismatch on preallocate event %d: trace err=%q, replay err=%v",
+				event.ID, event.Err, err)
 		}
 		return nil
 
@@ -492,8 +536,8 @@ func (s *State) applyEvent(event trace.Event) error {
 			return fmt.Errorf("replay: infrastructure error: mismatch on sync event %d: trace err=%q, replay err=%v",
 				event.ID, event.Err, err)
 		}
-		if p, ok := s.handlePath[event.Handle]; ok {
-			s.snapshotSyncedBytes(p, -1)
+		if err == nil {
+			return s.snapshotSyncedBytes(event.Handle)
 		}
 		return nil
 
@@ -507,8 +551,8 @@ func (s *State) applyEvent(event trace.Event) error {
 			return fmt.Errorf("replay: infrastructure error: mismatch on syncData event %d: trace err=%q, replay err=%v",
 				event.ID, event.Err, err)
 		}
-		if p, ok := s.handlePath[event.Handle]; ok {
-			s.snapshotSyncedBytes(p, -1)
+		if err == nil {
+			return s.snapshotSyncedBytes(event.Handle)
 		}
 		return nil
 
@@ -526,9 +570,15 @@ func (s *State) applyEvent(event trace.Event) error {
 			return fmt.Errorf("replay: syncTo fullSync mismatch on event %d: trace=%v, replay=%v",
 				event.ID, event.FullSync, fullSync)
 		}
-		if event.FullSync {
-			p := s.handlePath[event.Handle]
-			s.snapshotSyncedBytes(p, event.Size)
+		if err == nil {
+			// Only snapshot when FullSync=true (the entire file is durable).
+			// When FullSync=false, MemFS does not guarantee any bytes are
+			// durable to a specific offset, so we do not update the snapshot.
+			// This is consistent with ADR 2026-10-12-a which specifies that
+			// SyncTo in MemFS returns (false, nil) and is not a persistence boundary.
+			if event.FullSync {
+				return s.snapshotSyncedBytes(event.Handle)
+			}
 		}
 		return nil
 
@@ -539,7 +589,7 @@ func (s *State) applyEvent(event trace.Event) error {
 		}
 		err := f.Close()
 		delete(s.handles, event.Handle)
-		delete(s.handlePath, event.Handle)
+		delete(s.handleFiles, event.Handle)
 		if (err != nil) != (event.Err != "") {
 			return fmt.Errorf("replay: infrastructure error: mismatch on close event %d: trace err=%q, replay err=%v",
 				event.ID, event.Err, err)
@@ -564,19 +614,87 @@ func (s *State) applyEvent(event trace.Event) error {
 	}
 }
 
-func (s *State) snapshotSyncedBytes(p string, syncToSize int64) {
-	if fi, serr := s.memFS.Stat(p); serr == nil && !fi.IsDir() {
-		if sf, err := s.memFS.Open(p); err == nil {
-			b, _ := io.ReadAll(sf)
-			_ = sf.Close()
-			if syncToSize >= 0 {
-				if syncToSize < int64(len(b)) && int64(len(s.fileSyncedBytes[p])) < syncToSize {
-					b = b[:int(syncToSize)]
-				} else if int64(len(s.fileSyncedBytes[p])) >= syncToSize {
-					return
-				}
-			}
-			s.fileSyncedBytes[p] = bytes.Clone(b)
+func (s *State) trackFile(handle uint64, name string, replace bool) {
+	snapshot := s.filePaths[name]
+	if replace || snapshot == nil {
+		snapshot = &fileSnapshot{}
+		s.filePaths[name] = snapshot
+	}
+	s.handleFiles[handle] = snapshot
+}
+
+func (s *State) renameFilePaths(source, destination string) {
+	if source == destination {
+		return
+	}
+	moved := make(map[string]*fileSnapshot)
+	for name, snapshot := range s.filePaths {
+		if name == source || strings.HasPrefix(name, source+"/") {
+			moved[destination+strings.TrimPrefix(name, source)] = snapshot
+			delete(s.filePaths, name)
 		}
 	}
+	for name, snapshot := range moved {
+		s.filePaths[name] = snapshot
+	}
+}
+
+func (s *State) syncedBytesByPath() map[string][]byte {
+	result := make(map[string][]byte, len(s.filePaths))
+	for name, snapshot := range s.filePaths {
+		if snapshot != nil {
+			result[name] = bytes.Clone(snapshot.bytes)
+		}
+	}
+	return result
+}
+
+// snapshotSyncedBytes snapshots durable bytes for the file associated with handle.
+//
+// Hard-link determinism: multiple filePaths entries can share the same *fileSnapshot
+// (created by KindLink). To guarantee a reproducible pick among aliases, the
+// lexicographically smallest path is chosen. If the file has been unlinked (removed
+// from filePaths while the handle is still open), snapshot bytes are read directly
+// from the open handle.
+func (s *State) snapshotSyncedBytes(handle uint64) error {
+	snapshot := s.handleFiles[handle]
+	if snapshot == nil {
+		return nil
+	}
+
+	// Collect all path aliases that share this snapshot, then sort for determinism.
+	var names []string
+	for name, current := range s.filePaths {
+		if current == snapshot {
+			names = append(names, name)
+		}
+	}
+	if len(names) == 0 {
+		// File was unlinked while the handle was still open (POSIX temp-file pattern).
+		// Try reading directly from the open handle if available.
+		if f, ok := s.handles[handle]; ok {
+			if stat, err := f.Stat(); err == nil && stat.Size() > 0 {
+				buf := make([]byte, stat.Size())
+				if n, err := f.ReadAt(buf, 0); err == nil || errors.Is(err, io.EOF) {
+					snapshot.bytes = bytes.Clone(buf[:n])
+					return nil
+				}
+			}
+		}
+		return nil
+	}
+	sort.Strings(names)
+	name := names[0]
+
+	file, err := s.memFS.Open(name)
+	if err != nil {
+		return fmt.Errorf("replay: open synced file %q: %w", name, err)
+	}
+	data, readErr := io.ReadAll(file)
+	closeErr := file.Close()
+	if err := errors.Join(readErr, closeErr); err != nil {
+		return fmt.Errorf("replay: snapshot synced file %q: %w", name, err)
+	}
+	snapshot.bytes = data
+	return nil
 }

@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/akshatrathore1/CraConTest/internal/candidate"
 	"github.com/akshatrathore1/CraConTest/internal/exp"
@@ -178,6 +179,32 @@ func TestBenchmarkRunner_FastMultiSeed(t *testing.T) {
 	}
 }
 
+func TestBenchmarkCountsTimeoutsAndExistingControl(t *testing.T) {
+	config := exp.DefaultBenchmarkConfig()
+	config.WorkloadSeeds = []uint64{42}
+	config.FaultIDs = []string{faults.MUT0}
+	config.Workload.Operations = 1
+	config.SafeOpenTimeout = time.Nanosecond
+	config.B0PercentileCnt = 1
+	result, err := exp.RunBenchmark(config, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := result.FaultSummaries[faults.MUT0].Runs[0]
+	if run.Strategies["dcg"].K1Failure == 0 {
+		t.Fatal("test did not exercise a failing recovery")
+	}
+	if run.TotalFailures == 0 {
+		t.Fatal("timeout failures were omitted from the run total")
+	}
+	if result.MUT0Violations != run.TotalFailures {
+		t.Fatalf("MUT-0 control reports %d failures, want %d", result.MUT0Violations, run.TotalFailures)
+	}
+	if run.TheoreticalExpectation <= 0 {
+		t.Fatal("theoretical discovery expectation omitted timeout failures")
+	}
+}
+
 func TestGenerateEmpiricalReportMarkdown_B0PercentileSorted(t *testing.T) {
 	// Provide runs with deliberately unsorted P10 and P90 values across seeds: [9.0, 1.0, 5.0]
 	// The median of {1.0, 5.0, 9.0} is exactly 5.0.
@@ -262,6 +289,21 @@ func TestMultiSeed_CalculateS100(t *testing.T) {
 	})
 	if bugs100 != 2 {
 		t.Errorf("expected Bugs100=2, got %d", bugs100)
+	}
+
+	// Verify CalculateBugs100 and CalculateBFull with unnormalized open_error and panic outcomes
+	unnormOutcomes := []oracle.Outcome{
+		{Candidate: c1, Class: oracle.ClassViolation, Signature: "v1:sigA"},
+		{Candidate: c2, Class: oracle.ClassOpenError, Detail: "corrupt MANIFEST"}, // unnormalized empty sig
+		{Candidate: c3, Class: oracle.ClassPanic, Detail: "fatal crash"},          // unnormalized empty sig
+		{Candidate: c4, Class: oracle.ClassValid},
+	}
+	rUnnorm := []candidate.Candidate{c1, c2, c3, c4}
+	if b := exp.CalculateBFull(rUnnorm, unnormOutcomes); b != 3 {
+		t.Errorf("expected B_full=3 for unnormalized outcomes, got %d", b)
+	}
+	if b100 := exp.CalculateBugs100(rUnnorm, unnormOutcomes); b100 != 3 {
+		t.Errorf("expected Bugs100=3 for unnormalized outcomes, got %d", b100)
 	}
 }
 
@@ -373,7 +415,10 @@ func TestMultiSeed_CSV_And_Report_Generation(t *testing.T) {
 		t.Fatalf("read report: %v", err)
 	}
 	if !strings.Contains(string(reportData), "DCG achieves lower cost-to-first-failure than R2") {
-		t.Errorf("report missing expected superiority text: %s", string(reportData))
+		t.Errorf("report missing expected observed comparison: %s", string(reportData))
+	}
+	if strings.Contains(string(reportData), "faster fault discovery") || strings.Contains(string(reportData), "Statistical Population") {
+		t.Errorf("report contains an unsupported speed or population claim: %s", string(reportData))
 	}
 }
 
@@ -541,5 +586,26 @@ func TestWriteMultiSeedPerSeedCSV(t *testing.T) {
 	}
 	if !foundDCG {
 		t.Errorf("expected row for MUT-1, seed 42, dcg not found")
+	}
+}
+
+func TestMixShuffleSeedDistributionAndCollisionResistance(t *testing.T) {
+	seen := make(map[uint64]bool)
+	const numSeeds = 50
+	const numIters = 100
+	for s := uint64(0); s < numSeeds; s++ {
+		for i := 0; i < numIters; i++ {
+			mixed := exp.MixShuffleSeed(s, 0xb0, i)
+			if seen[mixed] {
+				t.Fatalf("collision detected for seed %d, iter %d: %x", s, i, mixed)
+			}
+			seen[mixed] = true
+		}
+	}
+	// Verify different domain separators produce distinct streams for the same base seed
+	streamA := exp.MixShuffleSeed(42, 0x1, 0)
+	streamB := exp.MixShuffleSeed(42, 0x2, 0)
+	if streamA == streamB {
+		t.Fatalf("expected distinct seeds for different domains: %x vs %x", streamA, streamB)
 	}
 }

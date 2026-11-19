@@ -4,6 +4,8 @@ import (
 	"math"
 	"sort"
 	"strings"
+	"sync"
+	"unsafe"
 
 	"github.com/akshatrathore1/CraConTest/internal/trace"
 )
@@ -87,7 +89,11 @@ func ResourceTier(categories map[string]bool, aliases map[string]bool, directory
 		return TierManifest, 10.0
 	}
 	for alias := range aliases {
-		if strings.Contains(alias, "MANIFEST") || strings.Contains(alias, "CURRENT") {
+		base := alias
+		if slash := strings.LastIndexByte(alias, '/'); slash >= 0 {
+			base = alias[slash+1:]
+		}
+		if base == "CURRENT" || strings.HasPrefix(base, "MANIFEST") {
 			return TierManifest, 10.0
 		}
 	}
@@ -191,7 +197,11 @@ func resourceCategoryWeight(r *resource) float64 {
 		return 10.0
 	}
 	for alias := range r.aliases {
-		if strings.Contains(alias, "MANIFEST") || strings.Contains(alias, "CURRENT") {
+		base := alias
+		if slash := strings.LastIndexByte(alias, '/'); slash >= 0 {
+			base = alias[slash+1:]
+		}
+		if base == "CURRENT" || strings.HasPrefix(base, "MANIFEST") {
 			return 10.0
 		}
 	}
@@ -213,11 +223,11 @@ func resourceCategoryWeight(r *resource) float64 {
 }
 
 // computeRiskHorizon calculates the backward unpersisted dirty byte volume,
-// pending namespace mutations, and active uncommitted synchronous client exposure.
+// pending namespace mutations, and active uncommitted mutating client exposure.
 // Formula:
 //
-//	RiskScore = sum_{r in dirty} w_cat(r) * ln(1 + DirtyBytes(r)) + 6.0 * len(pending) + 4.0 * uncommittedSyncOps
-func computeRiskHorizon(resources map[uint64]*resource, pending []pendingEntry, uncommittedSyncOps uint64) (uint64, float64) {
+//	RiskScore = sum_{r in dirty} w_cat(r) * ln(1 + DirtyBytes(r)) + 6.0 * len(pending) + 4.0 * uncommittedMutatingOps
+func computeRiskHorizon(resources map[uint64]*resource, pending []pendingEntry, uncommittedMutatingOps uint64) (uint64, float64) {
 	var totalDirtyBytes uint64
 	var dirtyRisk float64
 
@@ -241,7 +251,7 @@ func computeRiskHorizon(resources map[uint64]*resource, pending []pendingEntry, 
 	}
 
 	pendingRisk := 6.0 * float64(len(pending))
-	syncRisk := 4.0 * float64(uncommittedSyncOps)
+	syncRisk := 4.0 * float64(uncommittedMutatingOps)
 
 	riskScore := dirtyRisk + pendingRisk + syncRisk
 	return totalDirtyBytes, riskScore
@@ -261,11 +271,17 @@ type DCGWeights struct {
 	RenameWeight   float64 // weight for uncommitted critical directory renames (default 50.0)
 }
 
-// DefaultDCGWeights provides standard term weights calibrated from crash consistency models.
-var DefaultDCGWeights = DCGWeights{
+// defaultDCGWeights holds the standard term weights calibrated from crash consistency models.
+// Use DefaultDCGWeights() to obtain a copy; never reference this var directly from other packages.
+var defaultDCGWeights = DCGWeights{
 	WALWeight:      30.0,
 	ManifestWeight: 40.0,
 	RenameWeight:   50.0,
+}
+
+// DefaultDCGWeights returns the standard DCG term weights as a struct copy safe for caller modification.
+func DefaultDCGWeights() DCGWeights {
+	return defaultDCGWeights
 }
 
 // ContractFeatures captures durability-contract and dangling-dependency violations at a cutoff.
@@ -340,13 +356,130 @@ type renameRecord struct {
 	violating  bool
 }
 
+type contractCacheEntry struct {
+	ptr     uintptr
+	length  int
+	hash    uint64
+	weights DCGWeights
+	cuts    map[uint64]ContractFeatures
+}
+
+var (
+	contractCacheMu sync.Mutex
+	contractCache   = make([]contractCacheEntry, 0, 16)
+)
+
+func traceFingerprint(events []trace.Event) uint64 {
+	h := uint64(14695981039346656037)
+	const prime = 1099511628211
+	for i := range events {
+		h ^= uint64(events[i].ID)
+		h *= prime
+		for j := 0; j < len(events[i].Kind); j++ {
+			h ^= uint64(events[i].Kind[j])
+			h *= prime
+		}
+		for j := 0; j < len(events[i].File); j++ {
+			h ^= uint64(events[i].File[j])
+			h *= prime
+		}
+		for j := 0; j < len(events[i].File2); j++ {
+			h ^= uint64(events[i].File2[j])
+			h *= prime
+		}
+		for j := 0; j < len(events[i].Cat); j++ {
+			h ^= uint64(events[i].Cat[j])
+			h *= prime
+		}
+		for j := 0; j < len(events[i].Err); j++ {
+			h ^= uint64(events[i].Err[j])
+			h *= prime
+		}
+		for j := 0; j < len(events[i].Note); j++ {
+			h ^= uint64(events[i].Note[j])
+			h *= prime
+		}
+		for j := 0; j < len(events[i].OpKind); j++ {
+			h ^= uint64(events[i].OpKind[j])
+			h *= prime
+		}
+		h ^= uint64(events[i].Mode)
+		h *= prime
+		h ^= uint64(events[i].Off)
+		h *= prime
+		h ^= uint64(events[i].Len)
+		h *= prime
+		h ^= events[i].Handle
+		h *= prime
+		h ^= events[i].Op
+		h *= prime
+		h ^= events[i].Job
+		h *= prime
+		h ^= uint64(events[i].Size)
+		h *= prime
+		if events[i].Dir {
+			h ^= 1
+			h *= prime
+		}
+		if events[i].FullSync {
+			h ^= 2
+			h *= prime
+		}
+	}
+	return h
+}
+
 // ComputeContractFeatures computes ContractFeatures for every cutoff 0..len(events) using DefaultDCGWeights.
 func ComputeContractFeatures(events []trace.Event) map[uint64]ContractFeatures {
-	return ComputeContractFeaturesWithWeights(events, DefaultDCGWeights)
+	return ComputeContractFeaturesWithWeights(events, DefaultDCGWeights())
 }
 
 // ComputeContractFeaturesWithWeights computes ContractFeatures for every cutoff 0..len(events) using custom weights.
 func ComputeContractFeaturesWithWeights(events []trace.Event, weights DCGWeights) map[uint64]ContractFeatures {
+	if len(events) == 0 {
+		return computeContractFeaturesWithWeightsUncached(events, weights)
+	}
+
+	ptr := uintptr(unsafe.Pointer(&events[0]))
+	length := len(events)
+	fp := traceFingerprint(events)
+
+	contractCacheMu.Lock()
+	for i, entry := range contractCache {
+		if entry.length == length && entry.hash == fp && entry.weights == weights {
+			res := entry.cuts
+			if i > 0 {
+				copy(contractCache[1:i+1], contractCache[0:i])
+				contractCache[0] = entry
+			}
+			contractCacheMu.Unlock()
+			return res
+		}
+	}
+	contractCacheMu.Unlock()
+
+	cuts := computeContractFeaturesWithWeightsUncached(events, weights)
+
+	contractCacheMu.Lock()
+	newEntry := contractCacheEntry{
+		ptr:     ptr,
+		length:  length,
+		hash:    fp,
+		weights: weights,
+		cuts:    cuts,
+	}
+	if len(contractCache) < 16 {
+		contractCache = append([]contractCacheEntry{newEntry}, contractCache...)
+	} else {
+		copy(contractCache[1:], contractCache[:15])
+		contractCache[0] = newEntry
+	}
+	contractCacheMu.Unlock()
+
+	return cuts
+}
+
+func computeContractFeaturesWithWeightsUncached(events []trace.Event, weights DCGWeights) map[uint64]ContractFeatures {
 	cuts := make(map[uint64]ContractFeatures, len(events)+1)
 	cuts[0] = ContractFeatures{}
 
@@ -705,6 +838,23 @@ func ComputeContractFeaturesWithWeights(events []trace.Event, weights DCGWeights
 				}
 			}
 			delete(files, event.File)
+			if event.Kind == trace.KindRemoveAll {
+				isRoot := event.File == "" || event.File == "."
+				prefix := strings.TrimSuffix(event.File, "/") + "/"
+				for childPath := range files {
+					if isRoot || strings.HasPrefix(childPath, prefix) {
+						if strings.HasSuffix(childPath, ".log") || strings.HasSuffix(childPath, ".sst") {
+							for _, mf := range files {
+								if mf.isManifest && (mf.dirtyBytes > 0 || !mf.dirEntrySynced) {
+									fileRetiredWhileManifestDirty = true
+									break
+								}
+							}
+						}
+						delete(files, childPath)
+					}
+				}
+			}
 		case trace.KindClose:
 			fi := handles[event.Handle]
 			if fi == nil && event.File != "" {
@@ -1032,5 +1182,8 @@ func (view *View) AllContractFeatures() map[uint64]ContractFeatures {
 	if view == nil || len(view.Events) == 0 {
 		return nil
 	}
-	return ComputeContractFeatures(view.Events)
+	view.contractOnce.Do(func() {
+		view.contractFeat = ComputeContractFeatures(view.Events)
+	})
+	return view.contractFeat
 }

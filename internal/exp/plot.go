@@ -4,9 +4,11 @@ import (
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
+	"html"
 	"io"
 	"math"
 	"os"
+	"path/filepath"
 	"strconv"
 
 	"github.com/akshatrathore1/CraConTest/internal/candidate"
@@ -120,7 +122,7 @@ func EvaluateG4(
 	}
 
 	// 2. Evaluate deterministic strategies: B4 (combined), B5 (representative), B6 (sync-boundary).
-	combStrat, err := strategy.NewCombined(strategy.DefaultWeights)
+	combStrat, err := strategy.NewCombined(strategy.DefaultWeights())
 	if err != nil {
 		return nil, fmt.Errorf("init combined: %w", err)
 	}
@@ -180,7 +182,10 @@ func WriteG4CSV(w io.Writer, report *G4RunReport) error {
 		}
 	}
 
-	// Deterministic strategy rows
+	// Deterministic strategy rows: For deterministic strategies, failures_mean, failures_min,
+	// and failures_max (and likewise distinct_bugs_*) are identical by definition, as a single
+	// ranking has zero variance across identical evaluations (unlike b0_random which aggregates
+	// over multiple shuffle seeds).
 	for _, c := range report.Curves {
 		for _, pt := range c.Points {
 			row := []string{
@@ -200,7 +205,8 @@ func WriteG4CSV(w io.Writer, report *G4RunReport) error {
 		}
 	}
 
-	return nil
+	writer.Flush()
+	return writer.Error()
 }
 
 // WriteG4PlotSVG generates an SVG discovery-curve plot.
@@ -251,10 +257,19 @@ func WriteG4PlotSVG(w io.Writer, report *G4RunReport) error {
     .b4-line { stroke: #2563eb; stroke-width: 2.5; fill: none; }
     .b5-line { stroke: #10b981; stroke-width: 2.5; fill: none; }
     .b6-line { stroke: #f59e0b; stroke-width: 2.5; fill: none; }
+    .dcg-line { stroke: #dc2626; stroke-width: 3; fill: none; }
+    .dcg-pr-line { stroke: #991b1b; stroke-width: 3; stroke-dasharray: 6,2; fill: none; }
+    .dcg-flag-line { stroke: #ea580c; stroke-width: 2.5; fill: none; }
+    .r1-line { stroke: #db2777; stroke-width: 2.5; fill: none; }
+    .r2-line { stroke: #7c3aed; stroke-width: 2.5; fill: none; }
+    .rhg-line { stroke: #0891b2; stroke-width: 2.5; fill: none; }
+    .fifo-line { stroke: #9ca3af; stroke-width: 2; fill: none; }
+    .lifo-line { stroke: #475569; stroke-width: 2; fill: none; }
+    .stride-line { stroke: #d97706; stroke-width: 2; fill: none; }
   </style>
   <rect width="100%%" height="100%%" fill="#ffffff" />
   <text x="%d" y="35" class="title" text-anchor="middle">Discovery Curves: %s (%s)</text>
-`, width, height, width, height, width/2, report.RunID, report.FaultID)
+`, width, height, width, height, width/2, html.EscapeString(report.RunID), html.EscapeString(report.FaultID))
 
 	// Grid & Axes
 	for i := 0; i <= 5; i++ {
@@ -295,14 +310,29 @@ func WriteG4PlotSVG(w io.Writer, report *G4RunReport) error {
 	fmt.Fprintf(w, `" />
 `)
 
-	// Plot B4, B5, B6 curves
+	// Plot strategy curves (supports both baseline and modern strategies)
 	classes := map[string]string{
 		"b4_combined":       "b4-line",
+		"combined":          "b4-line",
 		"b5_representative": "b5-line",
+		"representative":    "b5-line",
 		"b6_sync_boundary":  "b6-line",
+		"sync-boundary":     "b6-line",
+		"dcg":               "dcg-line",
+		"dcg-pr":            "dcg-pr-line",
+		"dcg-flag-only":     "dcg-flag-line",
+		"r1":                "r1-line",
+		"r2":                "r2-line",
+		"rhg":               "rhg-line",
+		"fifo":              "fifo-line",
+		"lifo":              "lifo-line",
+		"stride":            "stride-line",
 	}
 	for _, c := range report.Curves {
-		cls := classes[c.Name]
+		cls, ok := classes[c.Name]
+		if !ok {
+			cls = "b0-line"
+		}
 		fmt.Fprintf(w, `  <path class="%s" d="`, cls)
 		for i, pt := range c.Points {
 			cmd := "L"
@@ -315,24 +345,56 @@ func WriteG4PlotSVG(w io.Writer, report *G4RunReport) error {
 `)
 	}
 
-	// Legend
+	// Dynamic legend based on curves present
+	type legendItem struct {
+		label string
+		class string
+	}
+	var legendItems []legendItem
+	if len(report.B0Summary) > 0 {
+		legendItems = append(legendItems, legendItem{label: "B0 Random (mean)", class: "b0-line"})
+	}
+	for _, c := range report.Curves {
+		cls, ok := classes[c.Name]
+		if !ok {
+			cls = "b0-line"
+		}
+		label := c.Name
+		switch c.Name {
+		case "b4_combined", "combined":
+			label = "B4 Combined"
+		case "b5_representative", "representative":
+			label = "B5 Representative"
+		case "b6_sync_boundary", "sync-boundary":
+			label = "B6 Sync-Boundary"
+		case "dcg":
+			label = "DCG"
+		case "dcg-pr":
+			label = "DCG-PR"
+		case "dcg-flag-only":
+			label = "DCG Flag-Only"
+		case "r1":
+			label = "R1 (0%-First)"
+		case "r2":
+			label = "R2 (State-Rep)"
+		case "rhg":
+			label = "RHG"
+		}
+		legendItems = append(legendItems, legendItem{label: label, class: cls})
+	}
+
 	legX := width - margin - 180
 	legY := margin + 15
-	fmt.Fprintf(w, `  <rect x="%d" y="%d" width="175" height="95" fill="#f9fafb" stroke="#d1d5db" rx="4" />
-  <line x1="%d" y1="%d" x2="%d" y2="%d" class="b0-line" />
-  <text x="%d" y="%d" class="legend">B0 Random (mean)</text>
-  <line x1="%d" y1="%d" x2="%d" y2="%d" class="b4-line" />
-  <text x="%d" y="%d" class="legend">B4 Combined</text>
-  <line x1="%d" y1="%d" x2="%d" y2="%d" class="b5-line" />
-  <text x="%d" y="%d" class="legend">B5 Representative</text>
-  <line x1="%d" y1="%d" x2="%d" y2="%d" class="b6-line" />
-  <text x="%d" y="%d" class="legend">B6 Sync-Boundary</text>
-</svg>
-`, legX, legY,
-		legX+10, legY+20, legX+35, legY+20, legX+42, legY+24,
-		legX+10, legY+40, legX+35, legY+40, legX+42, legY+44,
-		legX+10, legY+60, legX+35, legY+60, legX+42, legY+64,
-		legX+10, legY+80, legX+35, legY+80, legX+42, legY+84)
+	legHeight := len(legendItems)*20 + 15
+	fmt.Fprintf(w, `  <rect x="%d" y="%d" width="175" height="%d" fill="#f9fafb" stroke="#d1d5db" rx="4" />
+`, legX, legY, legHeight)
+	for idx, item := range legendItems {
+		itemY := legY + 20*(idx+1)
+		fmt.Fprintf(w, `  <line x1="%d" y1="%d" x2="%d" y2="%d" class="%s" />
+  <text x="%d" y="%d" class="legend">%s</text>
+`, legX+10, itemY, legX+35, itemY, item.class, legX+42, itemY+4, html.EscapeString(item.label))
+	}
+	fmt.Fprintln(w, `</svg>`)
 
 	return nil
 }
@@ -340,7 +402,7 @@ func WriteG4PlotSVG(w io.Writer, report *G4RunReport) error {
 // GenerateG4Artifacts loads cached outcomes and universe from runDir, executes EvaluateG4,
 // and saves CSV and SVG discovery curves to csvOut and svgOut without candidate re-execution.
 func GenerateG4Artifacts(runDir, csvOut, svgOut string) (*G4RunReport, error) {
-	metaFile, err := os.Open(fmt.Sprintf("%s/run.json", runDir))
+	metaFile, err := os.Open(filepath.Join(runDir, "run.json"))
 	if err != nil {
 		return nil, fmt.Errorf("open run.json: %w", err)
 	}
@@ -351,9 +413,11 @@ func GenerateG4Artifacts(runDir, csvOut, svgOut string) (*G4RunReport, error) {
 		FaultID  string `json:"fault_id"`
 		BaseSeed uint64 `json:"base_seed"`
 	}
-	_ = json.NewDecoder(metaFile).Decode(&meta)
+	if err := json.NewDecoder(metaFile).Decode(&meta); err != nil {
+		return nil, fmt.Errorf("decode run.json: %w", err)
+	}
 
-	traceFile, err := os.Open(fmt.Sprintf("%s/trace.json", runDir))
+	traceFile, err := os.Open(filepath.Join(runDir, "trace.json"))
 	if err != nil {
 		return nil, fmt.Errorf("open trace.json: %w", err)
 	}
@@ -363,7 +427,7 @@ func GenerateG4Artifacts(runDir, csvOut, svgOut string) (*G4RunReport, error) {
 		return nil, fmt.Errorf("decode trace.json: %w", err)
 	}
 
-	univFile, err := os.Open(fmt.Sprintf("%s/universe.json", runDir))
+	univFile, err := os.Open(filepath.Join(runDir, "universe.json"))
 	if err != nil {
 		return nil, fmt.Errorf("open universe.json: %w", err)
 	}
@@ -373,7 +437,7 @@ func GenerateG4Artifacts(runDir, csvOut, svgOut string) (*G4RunReport, error) {
 		return nil, fmt.Errorf("decode universe.json: %w", err)
 	}
 
-	outcomesFile, err := os.Open(fmt.Sprintf("%s/outcomes.json", runDir))
+	outcomesFile, err := os.Open(filepath.Join(runDir, "outcomes.json"))
 	if err != nil {
 		return nil, fmt.Errorf("open outcomes.json: %w", err)
 	}
@@ -382,6 +446,7 @@ func GenerateG4Artifacts(runDir, csvOut, svgOut string) (*G4RunReport, error) {
 	if err != nil {
 		return nil, fmt.Errorf("decode outcomes.json: %w", err)
 	}
+	outcomes = NormalizeTable(outcomes)
 
 	view, err := graph.Build(events)
 	if err != nil {
@@ -405,6 +470,9 @@ func GenerateG4Artifacts(runDir, csvOut, svgOut string) (*G4RunReport, error) {
 	}
 
 	if csvOut != "" {
+		if err := os.MkdirAll(filepath.Dir(csvOut), 0755); err != nil {
+			return nil, fmt.Errorf("create csv dir: %w", err)
+		}
 		cf, err := os.Create(csvOut)
 		if err != nil {
 			return nil, fmt.Errorf("create csv: %w", err)
@@ -416,6 +484,9 @@ func GenerateG4Artifacts(runDir, csvOut, svgOut string) (*G4RunReport, error) {
 	}
 
 	if svgOut != "" {
+		if err := os.MkdirAll(filepath.Dir(svgOut), 0755); err != nil {
+			return nil, fmt.Errorf("create svg dir: %w", err)
+		}
 		sf, err := os.Create(svgOut)
 		if err != nil {
 			return nil, fmt.Errorf("create svg: %w", err)

@@ -29,17 +29,42 @@ var DefaultWorkloadSeeds = []uint64{42, 100, 200, 300, 400, 500, 600, 700, 800, 
 // DefaultFaultModels provides the 4 mutation models evaluated in baseline benchmarks.
 var DefaultFaultModels = []string{faults.MUT1, faults.MUT2, faults.MUT3, faults.MUT4}
 
-// CanonicalB0Seeds are the 10 fixed random seeds for curve averaging.
-var CanonicalB0Seeds = []uint64{1, 2, 3, 4, 5, 42, 100, 777, 1337, 2026}
+// canonicalB0Seeds are the 10 fixed random seeds for curve averaging.
+// Use CanonicalB0Seeds() to obtain a fresh copy safe for mutation.
+var canonicalB0Seeds = []uint64{1, 2, 3, 4, 5, 42, 100, 777, 1337, 2026}
+
+// CanonicalB0Seeds returns a fresh copy of the 10 fixed random seeds for curve averaging.
+// Callers must not retain or mutate the returned slice across goroutines; use the copy.
+func CanonicalB0Seeds() []uint64 {
+	out := make([]uint64, len(canonicalB0Seeds))
+	copy(out, canonicalB0Seeds)
+	return out
+}
 
 // BenchmarkConfig defines parameters for multi-seed empirical benchmarking.
+// DefaultB0PercentileCnt defines the standard number of shuffle seeds (100)
+// used for computing B0 / random baseline percentiles (p10..p90) and empirical means.
+// Test suites may deliberately configure smaller values (e.g. 10 or 50) to keep test
+// execution runtimes fast while exercising the shuffle percentile logic.
+const DefaultB0PercentileCnt = 100
+
+// MixShuffleSeed hashes a base seed, a domain separator (e.g. strategy hash or stream ID),
+// and a shuffle iteration index into a high-entropy 64-bit seed using SplitMix64 mixing
+// to eliminate seed collision risks and avoid linear stride patterns.
+func MixShuffleSeed(baseSeed uint64, domain uint64, iter int) uint64 {
+	z := baseSeed ^ (domain * 0x9e3779b97f4a7c15) + uint64(iter)*0xbf58476d1ce4e5b9 + 0xd2a80a39e703936f
+	z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9
+	z = (z ^ (z >> 27)) * 0x94d049bb133111eb
+	return z ^ (z >> 31)
+}
+
 type BenchmarkConfig struct {
 	WorkloadSeeds   []uint64
 	FaultIDs        []string
 	Workload        workload.Config
 	Policies        []int
 	SafeOpenTimeout time.Duration
-	B0PercentileCnt int // number of shuffle seeds for B0 percentiles (e.g. 100)
+	B0PercentileCnt int // number of shuffle seeds for B0 percentiles (defaults to DefaultB0PercentileCnt = 100)
 	Budgets         []int
 	TrackMUT0       bool // run MUT-0 control check to verify 0 false alarms
 	WALDropK        int  // Drop strictly the k-th WAL sync for MUT5 (default 1)
@@ -61,7 +86,7 @@ func DefaultBenchmarkConfig() BenchmarkConfig {
 		},
 		Policies:        []int{0, 100},
 		SafeOpenTimeout: 3 * time.Second,
-		B0PercentileCnt: 100,
+		B0PercentileCnt: DefaultB0PercentileCnt,
 		Budgets:         []int{0, 1, 5, 10, 25, 50, 100, 150, 200},
 		TrackMUT0:       true,
 	}
@@ -186,6 +211,7 @@ type BenchmarkResult struct {
 	Config         BenchmarkConfig              `json:"config"`
 	FaultSummaries map[string]FaultModelSummary `json:"fault_summaries"`
 	MUT0Violations int                          `json:"mut0_violations"`
+	MUT0Runs       int                          `json:"mut0_runs"`
 	TotalDuration  time.Duration                `json:"total_duration_ns"`
 }
 
@@ -251,10 +277,11 @@ func CalculateAUCNorm(points []Point, universeSize int, totalTarget int, useBugs
 // CalculateBFull computes the budget required to discover all unique bug signatures.
 // Returns 0 if there are no bug signatures in outcomes.
 func CalculateBFull(ranking []candidate.Candidate, outcomes []oracle.Outcome) int {
+	outcomes = NormalizeTable(outcomes)
 	// 1. Collect all target signatures in universe
 	targetSigs := make(map[string]bool)
 	for _, o := range outcomes {
-		if (o.Class == oracle.ClassViolation || o.Class == oracle.ClassOpenError) && o.Signature != "" {
+		if (o.Class == oracle.ClassViolation || o.Class == oracle.ClassOpenError || o.Class == oracle.ClassPanic || o.Class == oracle.ClassHang) && o.Signature != "" {
 			targetSigs[o.Signature] = true
 		}
 	}
@@ -270,7 +297,7 @@ func CalculateBFull(ranking []candidate.Candidate, outcomes []oracle.Outcome) in
 	seenSigs := make(map[string]bool)
 	for i, c := range ranking {
 		o := outcomeMap[c]
-		if (o.Class == oracle.ClassViolation || o.Class == oracle.ClassOpenError) && o.Signature != "" {
+		if (o.Class == oracle.ClassViolation || o.Class == oracle.ClassOpenError || o.Class == oracle.ClassPanic || o.Class == oracle.ClassHang) && o.Signature != "" {
 			seenSigs[o.Signature] = true
 			if len(seenSigs) == len(targetSigs) {
 				return i + 1 // 1-based budget
@@ -339,6 +366,7 @@ func RunSingleSeedFault(seed uint64, faultID string, cfg BenchmarkConfig) (*Sing
 	mem := vfs.NewCrashableMem()
 	rec := vfsrec.New(mem)
 	fCfg := faults.DefaultConfig(faultID)
+	fCfg.Seed = seed
 	if cfg.WALDropK > 0 {
 		fCfg.WALDropK = cfg.WALDropK
 	}
@@ -427,6 +455,10 @@ func RunSingleSeedFault(seed uint64, faultID string, cfg BenchmarkConfig) (*Sing
 	}
 
 	normOutcomes := NormalizeTable(expRes.Outcomes)
+	if err := ValidateTable(universe, normOutcomes); err != nil {
+		return nil, fmt.Errorf("validate explored outcomes: %w", err)
+	}
+	totalFailures := expRes.Summary.Violations + expRes.Summary.OpenErrors + expRes.Summary.Panics + expRes.Summary.Hangs
 
 	// Determine budgets
 	var budgets []int
@@ -453,7 +485,7 @@ func RunSingleSeedFault(seed uint64, faultID string, cfg BenchmarkConfig) (*Sing
 	// 1. Evaluate B0 across shuffle seeds
 	numShuffle := cfg.B0PercentileCnt
 	if numShuffle <= 0 {
-		numShuffle = 100
+		numShuffle = DefaultB0PercentileCnt
 	}
 
 	k1Fails := make([]float64, numShuffle)
@@ -465,7 +497,7 @@ func RunSingleSeedFault(seed uint64, faultID string, cfg BenchmarkConfig) (*Sing
 	aucBugs := make([]float64, numShuffle)
 
 	for i := 0; i < numShuffle; i++ {
-		shuffleSeed := uint64(i*31 + 17)
+		shuffleSeed := MixShuffleSeed(seed, 0xb0, i)
 		b0Strat := strategy.NewRandom(shuffleSeed)
 		ranked := b0Strat.Rank(view, universe)
 
@@ -476,13 +508,12 @@ func RunSingleSeedFault(seed uint64, faultID string, cfg BenchmarkConfig) (*Sing
 		s100 := CalculateS100(ranked, normOutcomes, view)
 		pts, _ := Evaluate(universe, ranked, normOutcomes, budgets)
 
-		totalFail := expRes.Summary.Violations + expRes.Summary.OpenErrors
 		distinctBugs := 0
 		if len(pts) > 0 {
 			distinctBugs = pts[len(pts)-1].DistinctBugs
 		}
 
-		aucF := CalculateAUCNorm(pts, len(universe), totalFail, false)
+		aucF := CalculateAUCNorm(pts, len(universe), totalFailures, false)
 		aucB := CalculateAUCNorm(pts, len(universe), distinctBugs, true)
 
 		k1Fails[i] = float64(k1F)
@@ -510,7 +541,7 @@ func RunSingleSeedFault(seed uint64, faultID string, cfg BenchmarkConfig) (*Sing
 
 	// Canonical B0 curve points (averaged across 10 canonical seeds)
 	var canonicalB0Points [][]Point
-	for _, canonSeed := range CanonicalB0Seeds {
+	for _, canonSeed := range CanonicalB0Seeds() {
 		b0Strat := strategy.NewRandom(canonSeed)
 		ranked := b0Strat.Rank(view, universe)
 		pts, _ := Evaluate(universe, ranked, normOutcomes, budgets)
@@ -578,7 +609,7 @@ func RunSingleSeedFault(seed uint64, faultID string, cfg BenchmarkConfig) (*Sing
 	}
 
 	// 2. Evaluate deterministic strategies
-	combStrat, err := strategy.NewCombined(strategy.DefaultWeights)
+	combStrat, err := strategy.NewCombined(strategy.DefaultWeights())
 	if err != nil {
 		return nil, fmt.Errorf("init combined: %w", err)
 	}
@@ -593,12 +624,11 @@ func RunSingleSeedFault(seed uint64, faultID string, cfg BenchmarkConfig) (*Sing
 		{"b4", combStrat},
 		{"b5", strategy.NewRepresentative()},
 		{"b6", strategy.NewSyncBoundary()},
-		{"b7", strategy.NewRiskHorizon(strategy.DefaultRHGWeights)},
+		{"b7", strategy.NewRiskHorizon(strategy.DefaultRHGWeights())},
 		{"dcg", NewDCGStrategy()},
 		{"dcg-pr", NewDCGPartialStrategy()},
 	}
 
-	totalFailures := expRes.Summary.Violations + expRes.Summary.OpenErrors
 	stratMap := make(map[string]StrategyMetrics, len(deterministicStrats)+2)
 	var dcgRankDuration time.Duration
 
@@ -664,8 +694,12 @@ func RunSingleSeedFault(seed uint64, faultID string, cfg BenchmarkConfig) (*Sing
 		rAUCBugs := make([]float64, numShuffle)
 		var canonicalPts []Point
 
+		var domain uint64
+		for _, ch := range []byte(code) {
+			domain = domain*31 + uint64(ch)
+		}
 		for i := 0; i < numShuffle; i++ {
-			shuffleSeed := seed*1000 + uint64(i*31+17)
+			shuffleSeed := MixShuffleSeed(seed, domain, i)
 			strat := makeStrat(shuffleSeed)
 			ranked := strat.Rank(view, universe)
 			if err := strategy.ValidatePermutation(universe, ranked); err != nil {
@@ -794,26 +828,49 @@ func RunSingleSeedFault(seed uint64, faultID string, cfg BenchmarkConfig) (*Sing
 	}, nil
 }
 
-// CurrentGitCommit returns the 12-character short git commit hash of HEAD, or "unknown".
+// CurrentGitCommit returns the 12-character short git commit hash of HEAD
+// (with "-dirty" suffix when the working tree has uncommitted changes), or "unknown".
 func CurrentGitCommit() string {
-	cmd := exec.Command("git", "rev-parse", "--short=12", "HEAD")
-	out, err := cmd.Output()
-	if err == nil {
-		s := strings.TrimSpace(string(out))
-		if s != "" {
-			return s
-		}
+	hash, dir := tryGitCommit("", "")
+	if hash == "" {
+		hash, dir = tryGitCommit("-C", "CraConTest")
 	}
-	// Fallback to checking within CraConTest if invoked from workspace root
-	cmd2 := exec.Command("git", "-C", "CraConTest", "rev-parse", "--short=12", "HEAD")
-	out2, err2 := cmd2.Output()
-	if err2 == nil {
-		s2 := strings.TrimSpace(string(out2))
-		if s2 != "" {
-			return s2
-		}
+	if hash == "" {
+		return "unknown"
 	}
-	return "unknown"
+	if isWorkingTreeDirty(dir) {
+		return hash + "-dirty"
+	}
+	return hash
+}
+
+// tryGitCommit runs git rev-parse in the given directory (empty = cwd).
+// Returns the 12-char hash and the -C arg used (empty string = cwd).
+func tryGitCommit(flag, dir string) (string, string) {
+	var args []string
+	if flag != "" && dir != "" {
+		args = append(args, flag, dir)
+	}
+	args = append(args, "rev-parse", "--short=12", "HEAD")
+	out, err := exec.Command("git", args...).Output()
+	if err != nil {
+		return "", ""
+	}
+	return strings.TrimSpace(string(out)), dir
+}
+
+// isWorkingTreeDirty returns true when git status --porcelain reports any change.
+func isWorkingTreeDirty(dir string) bool {
+	var args []string
+	if dir != "" {
+		args = append(args, "-C", dir)
+	}
+	args = append(args, "status", "--porcelain")
+	out, err := exec.Command("git", args...).Output()
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(out)) != ""
 }
 
 // RunBenchmark executes empirical benchmarking across all configured workload seeds and fault models.
@@ -862,14 +919,16 @@ func RunBenchmark(cfg BenchmarkConfig, progress func(string)) (*BenchmarkResult,
 
 	// MUT-0 null control check if enabled
 	mut0Violations := 0
-	// If MUT-0 or MUT-0-FIX5825 is already in FaultIDs, extract violations from the fault summaries
-	// rather than re-running a separate control pass.
+	mut0Runs := 0
 	mut0AlreadyRun := false
 	for _, fid := range cfg.FaultIDs {
 		norm, _ := faults.NormalizeID(fid)
-		if norm == faults.MUT0 || norm == faults.Barrier5825 || norm == faults.BarrierCkpt {
+		if norm == faults.MUT0 {
 			mut0AlreadyRun = true
-			break
+			for _, run := range faultSummaries[fid].Runs {
+				mut0Violations += run.TotalFailures
+				mut0Runs++
+			}
 		}
 	}
 	if cfg.TrackMUT0 && !mut0AlreadyRun {
@@ -881,9 +940,8 @@ func RunBenchmark(cfg BenchmarkConfig, progress func(string)) (*BenchmarkResult,
 			if err != nil {
 				return nil, fmt.Errorf("control run seed %d: %w", seed, err)
 			}
-			if res.TotalViolations > 0 || res.TotalOpenErrors > 0 {
-				mut0Violations += res.TotalViolations + res.TotalOpenErrors
-			}
+			mut0Violations += res.TotalFailures
+			mut0Runs++
 		}
 	}
 
@@ -893,6 +951,7 @@ func RunBenchmark(cfg BenchmarkConfig, progress func(string)) (*BenchmarkResult,
 		Config:         cfg,
 		FaultSummaries: faultSummaries,
 		MUT0Violations: mut0Violations,
+		MUT0Runs:       mut0Runs,
 		TotalDuration:  time.Since(benchStart),
 	}, nil
 }
@@ -948,13 +1007,21 @@ func aggregateFaultSummary(fs *FaultModelSummary) {
 		for _, r := range fs.Runs {
 			if code == "b0" {
 				if r.TotalFailures > 0 {
-					k1FailVals = append(k1FailVals, r.B0.K1FailureMedian)
+					val := r.B0.K1FailureMedian
+					if r.B0.K1SingleSeed > 0 {
+						val = float64(r.B0.K1SingleSeed)
+					}
+					k1FailVals = append(k1FailVals, val)
 					bFullVals = append(bFullVals, r.B0.BFullMedian)
 				}
 				if r.TotalViolations > 0 {
 					k1ViolVals = append(k1ViolVals, r.B0.K1ViolationMedian)
 				}
-				s25Vals = append(s25Vals, r.B0.S25Median)
+				s25Val := r.B0.S25Median
+				if r.B0.S25SingleSeed > 0 {
+					s25Val = float64(r.B0.S25SingleSeed)
+				}
+				s25Vals = append(s25Vals, s25Val)
 				s100Vals = append(s100Vals, r.B0.S100Median)
 				sumAUCF += r.B0.AUCNormFailures
 				sumAUCB += r.B0.AUCNormBugs
@@ -1061,7 +1128,12 @@ func aggregateFaultSummary(fs *FaultModelSummary) {
 		} else if code == "dcg-flag-only" {
 			sName = "DCG Flag-Only (Ablation)"
 		} else if len(fs.Runs) > 0 {
-			sName = fs.Runs[0].Strategies[code].StrategyName
+			if strat, ok := fs.Runs[0].Strategies[code]; ok && strat.StrategyName != "" {
+				sName = strat.StrategyName
+			}
+		}
+		if sName == "" {
+			sName = code
 		}
 
 		fs.StrategySummaries[code] = AggregatedStrategyStats{
@@ -1127,7 +1199,7 @@ func GenerateEmpiricalReportMarkdown(res *BenchmarkResult) string {
 	sb.WriteString(fmt.Sprintf("**Evaluation Engine:** Pebble v2.1.7 (Go runtime: %s)  \n", time.Now().UTC().Format(time.RFC3339)))
 	sb.WriteString(fmt.Sprintf("**Workload Seeds (%d):** `%v`  \n", len(res.Config.WorkloadSeeds), res.Config.WorkloadSeeds))
 	sb.WriteString(fmt.Sprintf("**Execution Time:** %.2f seconds total  \n", res.TotalDuration.Seconds()))
-	sb.WriteString(fmt.Sprintf("**Null Control (MUT-0):** %d false alarms across all seeds (100%% oracle accuracy)  \n\n", res.MUT0Violations))
+	sb.WriteString(fmt.Sprintf("**Null Control (MUT-0):** %d observed failures across the evaluated seeds  \n\n", res.MUT0Violations))
 	sb.WriteString("---\n\n")
 
 	sb.WriteString("## 1. Executive Summary\n\n")
@@ -1158,9 +1230,10 @@ func GenerateEmpiricalReportMarkdown(res *BenchmarkResult) string {
 	}
 
 	if sparseRHGWins {
-		sb.WriteString("**RHG outperforms uniform random on sparse faults.**\n\n")
+		sb.WriteString("**RHG has lower measured discovery cost than uniform random on at least one evaluated sparse fault.**\n\n")
 		for _, ev := range sparseEvidence {
-			sb.WriteString(ev + "\n")
+			sb.WriteString(ev)
+			sb.WriteString("\n")
 		}
 	} else {
 		sb.WriteString("**Empirical trial data summarized below.**\n")
@@ -1213,7 +1286,7 @@ func GenerateEmpiricalReportMarkdown(res *BenchmarkResult) string {
 		sb.WriteString("| Strategy | First Failure $k_1$ (Median) | First Failure $k_1$ (Mean) | Full Budget $B_{\\text{full}}$ (Median) | Full Budget $B_{\\text{full}}$ (Mean) | $\\text{AUC}_{\\text{norm}}$ (Failures) | $\\text{AUC}_{\\text{norm}}$ (Bugs) |\n")
 		sb.WriteString("|---|---|---|---|---|---|---|\n")
 
-		codes := []string{"b0", "b7", "b6", "b4", "b5", "b1", "b2", "b3"}
+		codes := []string{"dcg", "dcg-pr", "dcg-flag-only", "r2", "r1", "b0", "b7", "b6", "b4", "b5", "b1", "b2", "b3"}
 		for _, c := range codes {
 			s, exists := summ.StrategySummaries[c]
 			if !exists {
@@ -1228,7 +1301,10 @@ func GenerateEmpiricalReportMarkdown(res *BenchmarkResult) string {
 					b0MedStr, s.K1FailureMean, s.BFullMedian, s.BFullMean, s.AUCNormFailuresMean, s.AUCNormBugsMean))
 			} else {
 				highlight := ""
-				if c == "b7" {
+				switch c {
+				case "dcg":
+					highlight = " **(DCG)**"
+				case "b7":
 					highlight = " **(RHG)**"
 				}
 				sb.WriteString(fmt.Sprintf("| %s%s | %.1f | %.2f | %.1f | %.2f | %.4f | %.4f |\n",
@@ -1281,7 +1357,7 @@ func GenerateEmpiricalReportMarkdown(res *BenchmarkResult) string {
 	sb.WriteString("     - **MUT-3 (Directory):** Parent directory syncs occur strictly during file creation/rename boundaries.\n")
 	sb.WriteString("     - **MUT-4 (SST Flush):** Memtable SST flushes occur strictly when memtables fill or explicit flush markers execute.\n")
 	sb.WriteString("   - On sparse faults, 80-95% of candidates are benign routine appends. Uniform random search (B0) wastes precious test budget sampling harmless mid-epoch cutoffs, requiring tens or hundreds of trials to hit a vulnerable boundary.\n")
-	sb.WriteString("   - **RHG (B7)** fundamentally solves this via its 4-tier design:\n")
+	sb.WriteString("   - **RHG (B7)** addresses these measured cases through four ranking components:\n")
 	sb.WriteString("     1. **5-Tier Discriminative Semantics:** Upweights Manifest (10), WAL (8), and Directory (6) operations above routine data writes, ensuring critical metadata mutations are tested first.\n")
 	sb.WriteString("     2. **Barrier Proximity:** Weights candidates by $1/(1+\\Delta)$ proximity to the enclosing sync barrier, focusing directly on the cutoffs immediately preceding durable boundaries where data loss causes inconsistency.\n")
 	sb.WriteString("     3. **Reverse Risk Horizon:** Directly tracks unpersisted dirty byte volume rather than downstream reach, avoiding the early-trace trap of B4.\n")
@@ -1290,17 +1366,10 @@ func GenerateEmpiricalReportMarkdown(res *BenchmarkResult) string {
 	sb.WriteString("### 4.2 Comprehensive Strategy Comparison Matrix\n\n")
 	sb.WriteString("| Strategy | Traps / Pathology | Sparse Fault Performance | Dense Fault Performance |\n")
 	sb.WriteString("|---|---|---|---|\n")
-	sb.WriteString("| **B0 Random** | Samples blind draws; inefficient when fault density $< 5\\%$ | Slow ($k_1 > 10$, high $B_{\\text{full}}$) | Optimal ($k_1 \\approx 2-3$) |\n")
-	sb.WriteString("| **B4 Combined** | Downstream reachability favors early events before first sync | Severe early-trace trap ($k_1 \\ge 50$) | Poor ($k_1 \\approx 50$) |\n")
-	sb.WriteString("| **B6 Sync-Boundary** | Ignores semantic criticality; tests all boundaries indiscriminately | Moderate ($k_1 \\approx 5-10$) | Good ($k_1 \\approx 10-17$) |\n")
-	sb.WriteString("| **B7 RHG** | None observed; dynamically balances risk, barrier proximity, and semantics | **Superior ($k_1 = 1.0$, lowest $B_{\\text{full}}$)** | **Superior ($k_1 = 1.0$, maximal AUC)** |\n\n")
-
-	sb.WriteString("---\n\n")
-	sb.WriteString("## 5. Cleanliness & Integrity Attestation\n\n")
-	sb.WriteString("1. **Integrity Mandate:** All benchmark runs, traces, recovery checks, and outcome evaluations were genuinely executed in-process on Pebble v2.1.7. No results or metrics were hardcoded or fabricated.\n")
-	sb.WriteString("2. **Zero Forbidden Terms:** Verified that the restricted string does not occur in any codebase files, test names, comments, or documentation.\n")
-	sb.WriteString("3. **Local Isolation:** All experiments executed strictly within the local workspace; zero remote git pushes.\n")
-	sb.WriteString("4. **Platform Safety:** Executed under Windows 64-bit with `$env:CGO_ENABLED=\"0\"`.\n")
+	sb.WriteString("| **B0 Random** | Samples without semantic guidance | Higher measured $k_1$ on sparse settings | Low measured $k_1$ on dense settings |\n")
+	sb.WriteString("| **B4 Combined** | Downstream reachability favors early events before first sync | Early-trace bias in evaluated settings | Early-trace bias in evaluated settings |\n")
+	sb.WriteString("| **B6 Sync-Boundary** | Tests boundaries without file-class severity | Intermediate measured ranks | Intermediate measured ranks |\n")
+	sb.WriteString("| **B7 RHG** | Balances risk, barrier proximity, and semantics | $k_1 = 1.0$ in evaluated sparse settings | $k_1 = 1.0$ in evaluated dense settings |\n\n")
 
 	return sb.String()
 }
@@ -1360,7 +1429,7 @@ func WriteEmpiricalCSV(res *BenchmarkResult, csvPath string) error {
 		if !ok {
 			continue
 		}
-		stratCodes := []string{"b0", "b1", "b2", "b3", "b4", "b5", "b6", "b7"}
+		stratCodes := []string{"dcg", "dcg-pr", "dcg-flag-only", "r2", "r1", "b0", "b1", "b2", "b3", "b4", "b5", "b6", "b7"}
 		for _, c := range stratCodes {
 			s, exists := summ.StrategySummaries[c]
 			if !exists {
@@ -1384,5 +1453,6 @@ func WriteEmpiricalCSV(res *BenchmarkResult, csvPath string) error {
 		}
 	}
 
-	return nil
+	w.Flush()
+	return w.Error()
 }

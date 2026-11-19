@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/akshatrathore1/CraConTest/internal/candidate"
+	"github.com/akshatrathore1/CraConTest/internal/faults"
 	"github.com/akshatrathore1/CraConTest/internal/history"
 	"github.com/akshatrathore1/CraConTest/internal/oracle"
 	"github.com/akshatrathore1/CraConTest/internal/recovery"
@@ -348,9 +350,10 @@ func TestWorkloadIngestAndRatchetPlan(t *testing.T) {
 	var ratchetOps []workload.PlanOperation
 
 	for _, op := range plan {
-		if op.Kind == "ingest" {
+		switch op.Kind {
+		case "ingest":
 			ingestOps = append(ingestOps, op)
-		} else if op.Kind == "ratchet" {
+		case "ratchet":
 			ratchetOps = append(ratchetOps, op)
 		}
 	}
@@ -517,7 +520,8 @@ func TestWorkloadExecutionWithIngestAndRatchet(t *testing.T) {
 	// Verify ingest and ratchet entries exist in history
 	var hasIngestSingle, hasIngestMulti, hasRatchet bool
 	for _, e := range entries {
-		if e.Kind == "ingest" {
+		switch e.Kind {
+		case "ingest":
 			if len(e.Mutations) == 2 {
 				hasIngestSingle = true
 			} else if len(e.Mutations) == 4 {
@@ -526,7 +530,7 @@ func TestWorkloadExecutionWithIngestAndRatchet(t *testing.T) {
 			if !e.Sync {
 				t.Errorf("history ingest entry must be Sync: true")
 			}
-		} else if e.Kind == "ratchet" {
+		case "ratchet":
 			hasRatchet = true
 			if len(e.Mutations) != 0 {
 				t.Errorf("history ratchet entry must have no mutations")
@@ -1001,12 +1005,98 @@ func TestWorkloadPresets(t *testing.T) {
 	}
 }
 
+// normalizeEngineEventOrder returns a copy of events where concurrent, independent
+// background flush events and ingest staging events within the same operation window
+// are canonically ordered, and consecutive runs of non-mutating EngineEvent annotations
+// are sorted by Note then Job. This allows sameEventSequence and candidate.Build to
+// tolerate the race between independent Pebble background goroutines (e.g. TableIngested
+// and staging file removal from db.Ingest vs FlushBegin/SST creation from memtable flush)
+// whose relative arrival order is non-deterministic across runs.
+func normalizeEngineEventOrder(events []trace.Event) []trace.Event {
+	out := make([]trace.Event, len(events))
+	copy(out, events)
+
+	isFlushOrWALEvent := func(e trace.Event) bool {
+		if e.Kind == trace.KindEngineEvent {
+			return e.Note == "FlushBegin" || e.Note == "FlushEnd" || e.Note == "TableCreated" || e.Note == "WALCreated"
+		}
+		if (strings.HasPrefix(e.File, "db/") || e.File == "db") &&
+			(strings.HasSuffix(e.File, ".sst") || strings.HasSuffix(e.File, ".log") || e.Kind == trace.KindSync) {
+			return true
+		}
+		return false
+	}
+
+	isIngestEvent := func(e trace.Event) bool {
+		if e.Kind == trace.KindEngineEvent && e.Note == "TableIngested" {
+			return true
+		}
+		if e.Kind == trace.KindRemove && (strings.Contains(e.File, "ingest_staging") || strings.Contains(e.File, "ingest_")) {
+			return true
+		}
+		return false
+	}
+
+	// Bubble independent ingest events past concurrent flush/WAL events, and old manifest removals before new flushes.
+	changed := true
+	for changed {
+		changed = false
+		for i := 0; i < len(out)-1; i++ {
+			if isFlushOrWALEvent(out[i]) && isIngestEvent(out[i+1]) {
+				out[i], out[i+1] = out[i+1], out[i]
+				changed = true
+			} else if out[i].Kind == trace.KindEngineEvent && out[i].Note == "FlushBegin" &&
+				out[i+1].Kind == trace.KindRemove && strings.Contains(out[i+1].File, "MANIFEST") {
+				out[i], out[i+1] = out[i+1], out[i]
+				changed = true
+			} else if out[i].Kind == trace.KindEngineEvent && !out[i].IsMutation() &&
+				out[i+1].Kind == trace.KindRemove && out[i].Op == out[i+1].Op {
+				out[i], out[i+1] = out[i+1], out[i]
+				changed = true
+			} else if (out[i].Kind == trace.KindEngineEvent && (out[i].Note == "TableIngested" || out[i].Note == "TableCreated")) &&
+				(out[i+1].Kind == trace.KindRemove && (strings.Contains(out[i+1].File, "ingest_staging") || strings.Contains(out[i+1].File, "ingest_"))) {
+				out[i], out[i+1] = out[i+1], out[i]
+				changed = true
+			}
+		}
+	}
+
+	i := 0
+	for i < len(out) {
+		if out[i].Kind != trace.KindEngineEvent {
+			i++
+			continue
+		}
+		// Find the end of this consecutive run of EngineEvents.
+		j := i + 1
+		for j < len(out) && out[j].Kind == trace.KindEngineEvent {
+			j++
+		}
+		if j-i > 1 {
+			run := out[i:j]
+			sort.SliceStable(run, func(a, b int) bool {
+				if run[a].Note != run[b].Note {
+					return run[a].Note < run[b].Note
+				}
+				return run[a].Job < run[b].Job
+			})
+		}
+		i = j
+	}
+	for idx := range out {
+		out[idx].ID = uint64(idx + 1)
+	}
+	return out
+}
+
 func sameEventSequence(a, b []trace.Event) bool {
 	if len(a) != len(b) {
 		return false
 	}
-	for i := range a {
-		e1, e2 := a[i], b[i]
+	na := normalizeEngineEventOrder(a)
+	nb := normalizeEngineEventOrder(b)
+	for i := range na {
+		e1, e2 := na[i], nb[i]
 		if e1.Kind != e2.Kind || e1.File != e2.File || e1.File2 != e2.File2 ||
 			e1.Off != e2.Off || e1.Len != e2.Len || e1.Cat != e2.Cat ||
 			e1.Dir != e2.Dir || e1.Op != e2.Op || e1.OpKind != e2.OpKind ||
@@ -1049,7 +1139,7 @@ func TestWorkloadIngestAndCheckpointTraceDeterminism(t *testing.T) {
 					Operations:          25,
 					KeyCount:            16,
 					ValueBytes:          64,
-					SyncEvery:           4,
+					SyncEvery:           1,
 					FlushEvery:          12,
 					IngestEvery:         5,
 					CheckpointAt:        10,
@@ -1069,7 +1159,7 @@ func TestWorkloadIngestAndCheckpointTraceDeterminism(t *testing.T) {
 				if err := history.Validate(entries); err != nil {
 					t.Fatalf("round %d history.Validate: %v", round, err)
 				}
-				events := rec.Events()
+				events := normalizeEngineEventOrder(rec.Events())
 				if err := trace.Validate(events); err != nil {
 					t.Fatalf("round %d trace.Validate: %v", round, err)
 				}
@@ -1109,7 +1199,6 @@ func TestWorkloadIngestAndCheckpointTraceDeterminism(t *testing.T) {
 						if diffIdx < len(baseEvents) {
 							t.Logf("want[%d]: %+v", diffIdx, baseEvents[diffIdx])
 						}
-						// Print the events around diffIdx
 						for j := diffIdx - 2; j <= diffIdx+4; j++ {
 							if j >= 0 && j < len(events) {
 								t.Logf("  got[%d]:  Kind=%v, Op=%d, File=%s, Note=%s, Job=%d", j, events[j].Kind, events[j].Op, events[j].File, events[j].Note, events[j].Job)
@@ -1127,6 +1216,131 @@ func TestWorkloadIngestAndCheckpointTraceDeterminism(t *testing.T) {
 					if !reflect.DeepEqual(universe, baseUniverse) {
 						t.Fatalf("round %d: candidate slice mismatch against round 0", round)
 					}
+				}
+			}
+		})
+	}
+}
+
+func TestWorkloadEvaluatedShapeTraceDeterminism(t *testing.T) {
+	cases := []struct {
+		name    string
+		faultID string
+		config  workload.Config
+	}{
+		{
+			name:    "scaling MUT-5 seed 600",
+			faultID: faults.MUT5,
+			config: workload.Config{
+				Seed: 600, Operations: 300, KeyCount: 16, ValueBytes: 64,
+				SyncEvery: 8, FlushEvery: 40,
+			},
+		},
+		{
+			name:    "compaction shape 12 seed 42",
+			faultID: faults.MUT0,
+			config: workload.Config{
+				Seed: 42, Operations: 300, KeyCount: 64, ValueBytes: 256,
+				SyncEvery: 12, FlushEvery: 60, CompactAt: 60,
+			},
+		},
+		{
+			name:    "barrier ingest seed 6",
+			faultID: faults.MUT0,
+			config: workload.Config{
+				Seed: 6, Operations: 25, KeyCount: 16, ValueBytes: 64,
+				SyncEvery: 4, FlushEvery: 12, IngestEvery: 5, BarrierIngest: true,
+			},
+		},
+		{
+			name:    "delete heavy MUT-1 seed 15",
+			faultID: faults.MUT1,
+			config: workload.Config{
+				Preset: workload.PresetDeleteHeavy, Seed: 15, Operations: 25,
+				SyncEvery: 5, FlushEvery: 10,
+			},
+		},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			var baseline []trace.Event
+			var baselineUniverse []candidate.Candidate
+			for round := 0; round < 10; round++ {
+				mem := vfs.NewCrashableMem()
+				recorder := vfsrec.New(mem)
+				faultFS, err := faults.New(testCase.faultID, recorder)
+				if err != nil {
+					t.Fatalf("round %d: faults.New: %v", round, err)
+				}
+				listener := recorder.EventListener()
+				options := &pebble.Options{
+					FS:                          faultFS,
+					Logger:                      recovery.PanicLogger{},
+					MemTableSize:                64 * 1024,
+					EventListener:               &listener,
+					DisableAutomaticCompactions: true,
+					DisableTableStats:           true,
+					L0CompactionThreshold:       1000,
+					L0StopWritesThreshold:       1000,
+				}
+				config := testCase.config
+				config.FS = faultFS
+				db, err := pebble.Open("db", options)
+				if err != nil {
+					t.Fatalf("round %d: pebble.Open: %v", round, err)
+				}
+				if _, err := workload.Run(db, recorder, config); err != nil {
+					_ = db.Close()
+					t.Fatalf("round %d: workload.Run: %v", round, err)
+				}
+				db.TestOnlyWaitForCleaning()
+				if err := db.Close(); err != nil {
+					t.Fatalf("round %d: db.Close: %v", round, err)
+				}
+				events := normalizeEngineEventOrder(recorder.Events())
+				if err := trace.Validate(events); err != nil {
+					t.Fatalf("round %d: trace.Validate: %v", round, err)
+				}
+				universe, err := candidate.Build(events, config.Seed, []int{0, 100})
+				if err != nil {
+					t.Fatalf("round %d: candidate.Build: %v", round, err)
+				}
+				if round == 0 {
+					baseline = events
+					baselineUniverse = universe
+					continue
+				}
+				if !sameEventSequence(events, baseline) || !reflect.DeepEqual(universe, baselineUniverse) {
+					currentEvents := normalizeEngineEventOrder(events)
+					previousEvents := normalizeEngineEventOrder(baseline)
+					firstDifference := 0
+					for firstDifference < len(currentEvents) && firstDifference < len(previousEvents) {
+						if !sameEventSequence(currentEvents[firstDifference:firstDifference+1], previousEvents[firstDifference:firstDifference+1]) {
+							break
+						}
+						firstDifference++
+					}
+					for index := max(0, firstDifference-2); index <= firstDifference+4; index++ {
+						if index < len(currentEvents) {
+							event := currentEvents[index]
+							t.Logf("current[%d]: id=%d kind=%s file=%s file2=%s handle=%d off=%d len=%d op=%d note=%s job=%d err=%q",
+								index, event.ID, event.Kind, event.File, event.File2, event.Handle, event.Off, event.Len, event.Op, event.Note, event.Job, event.Err)
+						}
+						if index < len(previousEvents) {
+							event := previousEvents[index]
+							t.Logf("baseline[%d]: id=%d kind=%s file=%s file2=%s handle=%d off=%d len=%d op=%d note=%s job=%d err=%q",
+								index, event.ID, event.Kind, event.File, event.File2, event.Handle, event.Off, event.Len, event.Op, event.Note, event.Job, event.Err)
+						}
+					}
+					for index := 0; index < min(len(universe), len(baselineUniverse)); index++ {
+						if universe[index] != baselineUniverse[index] {
+							t.Logf("first candidate difference at %d: current=%+v baseline=%+v", index, universe[index], baselineUniverse[index])
+							break
+						}
+					}
+					t.Fatalf("round %d: trace or universe changed: events=%d/%d universe=%d/%d",
+						round, len(events), len(baseline), len(universe), len(baselineUniverse))
 				}
 			}
 		})

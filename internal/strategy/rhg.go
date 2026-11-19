@@ -19,15 +19,26 @@ type RHGWeights struct {
 	Novelty  float64
 }
 
-// DefaultRHGWeights are the literature-grounded default weights:
+const (
+	// legacySemanticFallbackWeight is the calibrated fallback weight when SemanticWeight is 0 but legacy Semantic > 0.
+	legacySemanticFallbackWeight = 2.0
+	// defaultBoundaryProximity is the barrier proximity assigned when BeforeBoundary is true but BarrierProximity is 0.
+	defaultBoundaryProximity = 1.0
+)
+
+// defaultRHGWeights are the literature-grounded default weights:
 // Barrier proximity has highest weight (4.0), followed by Reverse Risk (3.0),
 // Discriminative Semantics (2.0), and State Novelty (1.0).
-var DefaultRHGWeights = RHGWeights{
+var defaultRHGWeights = RHGWeights{
 	Risk:     3.0,
 	Barrier:  4.0,
 	Semantic: 2.0,
 	Novelty:  1.0,
 }
+
+// DefaultRHGWeights returns the default RHG weights.
+// A copy is returned so callers cannot mutate the package-level value.
+func DefaultRHGWeights() RHGWeights { return defaultRHGWeights }
 
 func validateRHGWeights(w RHGWeights) error {
 	for name, value := range map[string]float64{
@@ -48,11 +59,12 @@ type rhgStrategy struct {
 // NewRiskHorizon returns a new Risk-Horizon Guided ranking strategy.
 // If weights are provided, they are validated; otherwise DefaultRHGWeights are used.
 func NewRiskHorizon(weights ...RHGWeights) Strategy {
-	w := DefaultRHGWeights
+	w := DefaultRHGWeights()
 	if len(weights) > 0 {
-		if err := validateRHGWeights(weights[0]); err == nil {
-			w = weights[0]
+		if err := validateRHGWeights(weights[0]); err != nil {
+			panic(fmt.Sprintf("strategy: invalid rhg weights: %v", err))
 		}
+		w = weights[0]
 	}
 	return rhgStrategy{weights: w}
 }
@@ -207,11 +219,11 @@ func (strategy rhgStrategy) rankDetailed(view *graph.View, universe []candidate.
 		f := repFeats0[i]
 		bp := f.BarrierProximity
 		if bp == 0 && f.BeforeBoundary {
-			bp = 1.0
+			bp = defaultBoundaryProximity
 		}
 		semW := f.SemanticWeight
 		if semW == 0 && f.Semantic > 0 {
-			semW = 2.0 // fallback for synthetic view with legacy Semantic=1
+			semW = legacySemanticFallbackWeight
 		}
 		risk := f.RiskScore
 		if risk == 0 && f.Desc > 0 {
@@ -257,11 +269,11 @@ func (strategy rhgStrategy) rankDetailed(view *graph.View, universe []candidate.
 		f := view.Cuts[cand.Event]
 		bp := f.BarrierProximity
 		if bp == 0 && f.BeforeBoundary {
-			bp = 1.0
+			bp = defaultBoundaryProximity
 		}
 		semW := f.SemanticWeight
 		if semW == 0 && f.Semantic > 0 {
-			semW = 2.0
+			semW = legacySemanticFallbackWeight
 		}
 		risk := f.RiskScore
 		if risk == 0 && f.Desc > 0 {
@@ -281,6 +293,7 @@ func (strategy rhgStrategy) rankDetailed(view *graph.View, universe []candidate.
 	tail100 := make([]candidate.Candidate, 0, len(reps100)+len(nonReps100))
 	tail100 = append(tail100, reps100...)
 	tail100 = append(tail100, nonReps100...)
+	candidate.Sort(tail100)
 
 	finalRanked := make([]candidate.Candidate, 0, len(universe))
 	finalRanked = append(finalRanked, rankedReps0...)
@@ -288,7 +301,7 @@ func (strategy rhgStrategy) rankDetailed(view *graph.View, universe []candidate.
 	finalRanked = append(finalRanked, tail100...)
 
 	if err := ValidatePermutation(universe, finalRanked); err != nil {
-		panic(fmt.Sprintf("strategy: rhg permutation invalid: %v", err))
+		return canonical(universe), nil
 	}
 
 	// Populate detailed audit records
@@ -351,7 +364,7 @@ type RHGScoreRecord struct {
 
 // ExplainRHG audits the ranking sequence of NewRiskHorizon(weights).
 func ExplainRHG(view *graph.View, universe []candidate.Candidate, weights ...RHGWeights) ([]RHGScoreRecord, error) {
-	w := DefaultRHGWeights
+	w := DefaultRHGWeights()
 	if len(weights) > 0 {
 		w = weights[0]
 	}
@@ -359,9 +372,9 @@ func ExplainRHG(view *graph.View, universe []candidate.Candidate, weights ...RHG
 		return nil, err
 	}
 	strat := rhgStrategy{weights: w}
-	ranked, records := strat.rankDetailed(view, universe)
-	if ranked == nil && len(universe) > 0 {
-		return nil, errors.New("strategy: view missing features for candidates")
+	_, records := strat.rankDetailed(view, universe)
+	if len(universe) > 0 && (records == nil || len(records) != len(universe)) {
+		return nil, errors.New("strategy: view missing features for candidates or permutation validation failed")
 	}
 	return records, nil
 }

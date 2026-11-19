@@ -1,7 +1,7 @@
 # Reproduction Runbook
 
 This runbook lists the commands that regenerate every table, figure and acceptance check
-in CraConTest, with the outputs and runtimes measured on Linux (go1.27.3, amd64).
+in CraConTest, with the outputs and runtimes measured on Linux (go1.27.1 / go1.27.3, amd64).
 
 **Determinism.** Exploring, ranking and evaluating a *stored* run directory is fully
 deterministic: the same `trace.json` and `universe.json` always give the same outcomes,
@@ -16,8 +16,10 @@ under `results/` are the reference data for every figure and table.
 
 ## 1. Build
 
-Prerequisites: Go as pinned in `go.mod`. On Windows set `CGO_ENABLED=0`; run the race
-detector on Linux or WSL2.
+Prerequisites are Go 1.27.1 (or compatible go1.27.x, as declared in `go.mod`), and Python 3.12 or newer
+for statistical analysis. The analysis dependencies are pinned to NumPy 2.5.4 and SciPy 1.18.1
+in `analysis/requirements.txt`; the reference statistical results were verified with CPython 3.15.2.
+On Windows set `CGO_ENABLED=0` and use `python` or `py` in place of `python3`; run the race detector on Linux or WSL2.
 
 ```bash
 go build -o cracontest ./cmd/cracontest
@@ -38,8 +40,8 @@ The CLI has five subcommands. Flags use a single dash:
 ```
 CraConTest/
 ├── analysis/
-│   ├── paired_stats.py        # Paired per-seed Wilcoxon & t-test analysis
-│   └── requirements.txt       # Python dependencies (scipy>=1.11.0)
+│   ├── paired_stats.py        # Paired sign/Wilcoxon tests and bootstrap ratios
+│   └── requirements.txt       # Pinned NumPy 2.5.4 and SciPy 1.18.1
 ├── results/
 │   ├── README.md              # Organization of Stage 1 & Stage 2 results artifacts
 │   ├── benchmark_summary.csv  # Aggregated 32-seed benchmark metrics (MUT-0..9)
@@ -158,6 +160,8 @@ The multi-seed benchmark runs 32 deterministic workload seeds (`42, 100..900, 10
 | **MUT-8** | Compaction SST Sync Drop | 15.2% | **1.00** | 3.58 | 4.41 | **12.88** / **12.88** | 6.74 / 12.82 | 2.00 / 5.05 |
 | **MUT-9** | Single $k$-th Directory Sync Drop | 41.4% | **1.00** | 1.40 | 1.95 | **25.00** / **27.00** | 17.78 / **27.00** | 3.03 / 9.83 |
 
+> **Note on MUT-6 $S_{25}$ Denominator:** In `benchmark_summary.csv` and the summary tables above, $S_{25}$ and $S_{100}$ are averaged across all 32 evaluated seeds ($52/32 = 1.62$). In `analysis/paired_stats.py`, paired statistical tests condition strictly on the 13 failing seeds with non-zero failure density ($m > 0$), reporting conditional mean $S_{25} = 4.00$ ($52/13$) for DCG (and $1.07$ vs. $2.64$ for R2). Both metrics describe the identical underlying run data.
+
 ### 4.2 Holdout & Out-of-Contract Benchmark (32 Seeds, MUT-X1 to MUT-X6)
 
 To verify that durability-contract priors generalize to unseen fault settings, the holdout suite evaluates 17 parameterized, delayed, and stochastic fault models across 32 deterministic seeds:
@@ -200,12 +204,12 @@ To run paired statistical comparisons on the Pebble #5825 case study per-seed re
 python3 analysis/paired_stats.py results/casestudy_pebble5825_per_seed.csv "Pebble #5825 Case Study (32 seeds)" MUT-0
 ```
 
-- **Causal Verification:** Under `MUT-0`, 58 failures occur across 25 of 32 failing seeds (all manifesting exclusively at 50% partial-retention candidates). Under `BARRIER-5825`, which executes parent directory sync (`maybeSyncParentDir`) *before* `fs.inner.Create` when writing marker files to commit the pending `MANIFEST-xxxxxx` entry, failures drop to **0 across all 32 seeds**, causally confirming the fix for Pebble #5825.
+- **Barrier intervention:** Under `MUT-0`, 58 failures occur across 25 of 32 seeds, all at 50% partial retention. Under `BARRIER-5825`, which syncs the parent directory before creating the marker that references the pending `MANIFEST-xxxxxx`, no failures are observed across the 32 evaluated seeds. This controlled contrast supports the directory-ordering mechanism within the evaluated VFS model.
 - **Post-Hoc Partial-Retention Prior (`dcg-pr`):** Standard `dcg` prioritizes 0%-retention candidates first, requiring a median $k_1$ of **211.00** [203.00, 340.00] (mean 301.60) to discover the partial-retention failure. `dcg-pr` incorporates a partial-retention prior tracking `UnsyncedDirEntryCount >= 2`, discovering the first failure at median $k_1 = \mathbf{2.00}$ [2.00, 5.00] (mean 12.40, S25 = 1.44, S100 = 1.44, AUC Failures = 0.6733, AUC Bugs = 0.7562), compared to uniform random B0 median $k_1 = 148.00$ (mean 180.74) and state-representative B5 median $k_1 = 62.00$ (mean 57.68).
 
-### 4.4 Intra-Class Subsystem Transfer Case Study: Pebble Checkpoint Directory Race (`15b500fb`) (32 Seeds, MUT-0 vs BARRIER-CKPT)
+### 4.4 Intra-Class Subsystem Transfer Case Study: Pebble Checkpoint Directory Race (32 Seeds, MUT-0 vs BARRIER-CKPT)
 
-To evaluate real-world crash recovery failure caused by unsynced parent directory entries in checkpoint creation (CockroachDB Pebble commit `15b500fb`), the checkpoint holdout benchmark evaluates unfaulted `MUT-0` against the causal fix control `BARRIER-CKPT` (Checkpoint Directory Barrier Control) across 32 seeds under partial retention (0%, 50%, 100%) with `-checkpoint-at 60`:
+To evaluate the checkpoint directory race present in Pebble v2.1.7 and later fixed upstream by commit `15b500fb`, the holdout benchmark compares `MUT-0` with the `BARRIER-CKPT` intervention across 32 seeds under 0%, 50%, and 100% retention with `-checkpoint-at 60`:
 
 ```bash
 ./cracontest benchmark \
@@ -224,7 +228,7 @@ python3 analysis/paired_stats.py results/casestudy_checkpoint_per_seed.csv "Pebb
 ```
 
 #### Results Summary:
-- **Causal Verification:** In Pebble `db.Checkpoint("checkpoint")`, checkpoint manifest and marker pointer files (`marker.manifest.*`) are written before `dir.Sync()`. Under 50% partial retention, unsynced directory entries are dropped while marker pointers persist, causing checkpoint recovery failure (`open_error`) on 30 of 32 seeds (58 total failures across seeds). Under `BARRIER-CKPT`, which forces parent directory sync when creating checkpoint manifest/marker files, checkpoint recovery failures drop to **0 across all 32 seeds**.
+- **Barrier intervention:** In Pebble `db.Checkpoint("checkpoint")`, checkpoint manifest and marker pointer files (`marker.manifest.*`) are written before `dir.Sync()`. Under 50% partial retention, checkpoint recovery fails on 30 of 32 seeds (58 total failures). Under `BARRIER-CKPT`, which adds parent-directory synchronization around the relevant entries, no failures are observed across the 32 evaluated seeds.
 - **Pre-Freeze Prior Discovery (`dcg-pr`):** The partial-retention prior (`dcg-pr`) was frozen before evaluation (tag `v1.0-dcg-pr-freeze`). `dcg-pr` discovers the checkpoint failure at median $k_1 = \mathbf{3.00}$ [1.00, 277.50] (mean 140.03, S25 = 0.56, S100 = 0.56, AUC Failures = 0.4749, AUC Bugs = 0.6321), compared to 0%-retention-first DCG median $k_1 = 386.50$ (mean 319.20), R2 median $k_1 = 328.40$ (mean 336.53), and uniform random B0 median $k_1 = 172.00$ (mean 190.73).
 
 ### 4.5 MUT-5 Universe-Scaling Benchmark (ops ∈ {120, 300, 600, 1200})
@@ -245,20 +249,20 @@ Outputs: `results/scaling_mut5_per_seed.csv` and `results/scaling_mut5_summary.c
 
 #### Results Summary:
 - Candidate universes scale from ~338 (120 ops) to ~2,958 (1,200 ops).
-- DCG maintains constant $O(1)$ discovery cost: median $k_1 = 1.00$, mean $k_1 = 1.00$ across all 4 scales.
-- Random and heuristic baselines scale linearly with universe size: B0 mean $k_1$ scales from 25.75 to 214.50; B2 (LIFO) mean $k_1$ scales from 260.50 to 2,881.00; R2 mean $k_1$ scales from 11.62 to 83.12.
-- Average planning/ranking runtime remains sub-65ms (63.0ms) even at ~3,000 candidates.
+- DCG has median and mean $k_1 = 1.00$ at each of the four evaluated scales; this finite experiment does not establish asymptotic complexity.
+- Baseline discovery positions increase over the evaluated range: B0 mean $k_1$ from 25.75 to 222.38, B2 (LIFO) from 260.50 to 2,881.25, and R2 from 11.62 to 83.50.
+- Average planning/ranking runtime remains sub-60ms (56.1ms) even at ~3,000 candidates.
 
 ### 4.6 Multi-Shape Null-Control Verification (108 Runs, 0 False Alarms)
 
-To establish zero false alarm rates across diverse workload geometries, the multi-shape null-control check tests 12 shapes across 9 seeds on `MUT-0` at 0%/100% policies:
+The multi-shape null-control check evaluates 12 shapes across 9 seeds on `MUT-0` at 0%/100% policies:
 
 ```bash
 go test -v -count=1 -timeout 1200s -run TestNullControlMultiShape ./internal/exp -update
 ```
 
 Outputs: `results/null_control_multishape.csv`.
-Result: Exactly 0 violations, 0 open errors, 0 panics, and 0 hangs across all 108 runs (>50,000 crash states explored; Rule-of-Three 95% upper bound $\le 2.78\%$ per run, $\le 0.006\%$ across $>50{,}000$ candidates).
+Result: No violations, open errors, panics, or hangs are observed across the 108 evaluated runs (>50,000 crash states). The fixed workload shapes and dependent candidates do not support an independent-trial confidence bound on a population false-alarm probability.
 
 ### 4.7 Pebble Subsystem Discovery Benchmark (Workloads A, B, C under MUT-0)
 
@@ -274,16 +278,16 @@ go test -v -run TestSubsystemDiscovery ./internal/exp -update
 
 Outputs: `results/subsystem_discovery.csv` (9 data rows).
 
-To execute the CLI benchmark commands directly:
+To execute the CLI benchmark commands directly (output flags `-csv`, `-report`, and `-per-seed-csv` export files; omitting them prints a full summary report to stdout):
 ```bash
 # Workload A: External SSTable Ingestion
-go run ./cmd/cracontest benchmark -faults MUT-0 -seeds 42,100,777 -ops 80 -ingest-every 25 -policies 0,50,100
+go run ./cmd/cracontest benchmark -faults MUT-0 -seeds 42,100,777 -ops 80 -ingest-every 25 -policies 0,50,100 -csv results/workload_a_summary.csv -report docs/workload_a_report.md
 
 # Workload B: Live Format-Version Ratcheting
-go run ./cmd/cracontest benchmark -faults MUT-0 -seeds 42,100,777 -ops 80 -ratchet-at 50 -policies 0,50,100
+go run ./cmd/cracontest benchmark -faults MUT-0 -seeds 42,100,777 -ops 80 -ratchet-at 50 -policies 0,50,100 -csv results/workload_b_summary.csv -report docs/workload_b_report.md
 
 # Workload C: Combined Lifecycle Stress
-go run ./cmd/cracontest benchmark -faults MUT-0 -seeds 42,100,777 -ops 80 -ingest-every 30 -ratchet-at 40 -checkpoint-at 60 -max-manifest-size 1 -policies 0,50,100
+go run ./cmd/cracontest benchmark -faults MUT-0 -seeds 42,100,777 -ops 80 -ingest-every 30 -ratchet-at 40 -checkpoint-at 60 -max-manifest-size 1 -policies 0,50,100 -csv results/workload_c_summary.csv -report docs/workload_c_report.md
 ```
 
 #### Results Summary:

@@ -23,7 +23,7 @@ invoked on the recording filesystem during Phase 1 RECORD—crash snapshots are 
 exclusively in Phase 3 EXPLORE by replaying trace prefixes into a fresh `vfs.NewCrashableMem()`.
 
 **Inputs:**
-- A workload specification: operation mix, sizes, base seed, retention
+- A workload specification: operational parameters (seed, operations, key count, value bytes, sync/flush frequency; operation mix is standardized in `workload.Plan()` / `workload.DefaultConfig()` as 50% set, 20% get, 10% delete, 10% batch, 5% range_delete, 5% read, or selectable via `-preset`), retention
   policies, strategy list, crash budgets, and optional fault identifier.
 
 **Outputs:**
@@ -52,20 +52,20 @@ exclusively in Phase 3 EXPLORE by replaying trace prefixes into a fresh `vfs.New
   event, lock, or client operation boundary (`OpBegin`/`OpEnd`), preventing
   concurrent background `Close` or `EngineEvent` records from splitting write-sync
   pairs.
-- `NoSync` client mutations (`set`, `delete`, `batch`, `range_delete`) wait on `walCond`
-  (`WaitForWALWrite` in `internal/vfsrec/recorder.go:111-148`, with `NotifyDroppedWALWrite` for
+- `Sync` client mutations (`set`, `delete`, `batch`, `range_delete`) wait on `walCond`
+  (`WaitForWALWrite` in `internal/vfsrec/recorder.go:127-166`, with `NotifyDroppedWALWrite` for
   `MUT-X6`) so `LogWriter.flushLoop` emits the operation's `.log` `Write` before `OpEnd`.
 - During ingest workloads, `inIngestSection` gates non-staging, non-marker background `Remove`
-  calls (`internal/vfsrec/recorder.go:468-475`) on `ingestCond` until a deferred `EndIngestSection()`
-  call broadcasts upon `db.Ingest` return, while `FlushBegin` (`internal/vfsrec/listener.go:102-138`)
-  executes a 500-iteration `runtime.Gosched()` loop and, when outside `inIngestSection`, waits on
-  `manifestCond` while `pendingManifestDeletions > 0` (`ManifestCreated` at `listener.go:151-158`
-  when `dbManifestCount > 2` until `ManifestDeleted` at `listener.go:159-169`) so obsolete manifest
+  calls (`internal/vfsrec/recorder.go:498-550`) on `ingestCond` until a deferred `EndIngestSection()`
+  call broadcasts upon `db.Ingest` return, while `FlushBegin` (`internal/vfsrec/listener.go:102-136`)
+  executes `runtime.Gosched()` and, when outside `inIngestSection`, waits on
+  `manifestCond` while `pendingManifestDeletions > 0` (`ManifestCreated` at `listener.go:152-159`
+  when `dbManifestCount > 2` until `ManifestDeleted` at `listener.go:160-170`) so obsolete manifest
   cleanup from a prior manifest rotation completes before the next flush begins. All synchronization
   barriers (`WaitForWALWrite` on `walCond`, `FlushBegin` on `manifestCond`, and `drainBackgroundWork`)
-  wait purely on condition-variable / counter predicates during normal execution and enforce a 5-second
-  fail-fast safety bound that panics loudly (`panic(...)`) if a background goroutine ever stalls,
-  ensuring traces never silently fall back to wall-clock timing. The 5-second fail-fast timers in
+  wait purely on condition-variable / counter predicates during normal execution and enforce a configurable
+  fail-fast safety bound (default 30 seconds, overridable via `CRACONTEST_WAIT_TIMEOUT`) that panics loudly (`panic(...)`) if a background goroutine ever stalls,
+  ensuring traces never silently fall back to wall-clock timing. The fail-fast timers in
   `WaitForWALWrite` and `FlushBegin` set a mutex-protected `timedOut` boolean flag prior to `Broadcast()`
   (preventing any clock-skew lost wakeup); because `FlushBegin` runs inside Pebble's flush callback,
   its panic propagates unrecoverably through Pebble's background flush goroutine by design. This synchronization
@@ -195,7 +195,7 @@ counts against seeded faults.
 - Recall (fraction of seeded faults detected) and false-positive count.
 - Discovery CSVs and SVG plots, written by `cracontest evaluate -discovery <csv> -plot <svg>`.
 - Multi-seed benchmark metrics (`results/benchmark_summary.csv` and `results/benchmark_per_seed.csv`).
-- Paired statistical analysis computed via `py -3.12 analysis/paired_stats.py results/benchmark_per_seed.csv "Seeded Benchmark Faults (32 seeds)" MUT-1 MUT-2 MUT-3 MUT-4 MUT-5 MUT-6 MUT-8 MUT-9`.
+- Paired statistical analysis computed via `python3 analysis/paired_stats.py results/benchmark_per_seed.csv "Seeded Benchmark Faults (32 seeds)" MUT-1 MUT-2 MUT-3 MUT-4 MUT-5 MUT-6 MUT-8 MUT-9`.
 
 ## Cost Model
 
@@ -227,7 +227,7 @@ CraConTest/
 │   ├── vfsrec/           # Recording vfs.FS wrapper
 │   ├── replay/           # Trace replay into CrashableMem
 │   ├── recovery/         # Panic-safe Open, timeout, checks
-│   ├── faults/           # Seeded durability fault decorators (MUT-0 to MUT-9)
+│   ├── faults/           # Durability fault decorators & controls (MUT-0..9, holdouts MUT-X1..X6, BARRIER-5825, BARRIER-CKPT)
 │   ├── graph/            # Persistence DAG, state view, and durability-contract features
 │   ├── candidate/        # Candidate type and universe
 │   ├── strategy/         # Ranking strategies (B0–B6, R1, R2, RHG, DCG, DCG-FlagOnly)
@@ -306,7 +306,7 @@ history    trace          strategies ──► rankings           outcome table
 | `cracontest plan` | PLAN | Build graph, enumerate candidates, rank |
 | `cracontest explore` | EXPLORE | Execute candidates, fill outcome table |
 | `cracontest evaluate` | EVALUATE | Join rankings with outcomes, compute metrics; optionally write the discovery CSV and plot |
-| `cracontest benchmark` | ALL | Run multi-seed evaluation across fault models (MUT-0..MUT-9) and write summary CSV and report |
+| `cracontest benchmark` | ALL | Run multi-seed evaluation across fault models (MUT-0..MUT-9, holdouts MUT-X1..MUT-X6, BARRIER-5825, BARRIER-CKPT) and write summary CSV and report |
 
 ## Stored Artifacts
 

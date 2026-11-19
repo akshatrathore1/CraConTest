@@ -49,7 +49,7 @@ func DefaultMultiSeedBenchmarkConfig() BenchmarkConfig {
 		},
 		Policies:        []int{0, 100},
 		SafeOpenTimeout: 3 * time.Second,
-		B0PercentileCnt: 100,
+		B0PercentileCnt: DefaultB0PercentileCnt,
 		Budgets:         []int{0, 1, 5, 10, 25, 50, 100, 150, 200},
 		TrackMUT0:       true,
 	}
@@ -88,15 +88,20 @@ func CalculateSBudget(ranking []candidate.Candidate, outcomes []oracle.Outcome, 
 	for _, c := range ranking[:limit] {
 		o := outcomeMap[c]
 		if o.Class != oracle.ClassValid {
-			key := ""
+			// Key by (StateKey, Percent) to match Python paired_stats.py which
+			// indexes distinct failing states by (anchor, percent). Using only
+			// StateKey would collapse 0%, 50%, and 100% retention candidates that
+			// share the same 0%-retention canonical state key.
+			stateKey := ""
 			if view != nil && view.Cuts != nil {
 				if feat, ok := view.Cuts[c.Event]; ok {
-					key = feat.StateKey
+					stateKey = feat.StateKey
 				}
 			}
-			if key == "" {
-				key = fmt.Sprintf("event_%d", c.Event)
+			if stateKey == "" {
+				stateKey = fmt.Sprintf("event_%d", c.Event)
 			}
+			key := fmt.Sprintf("%s|p%d", stateKey, c.Percent)
 			seenStates[key] = true
 		}
 	}
@@ -105,6 +110,7 @@ func CalculateSBudget(ranking []candidate.Candidate, outcomes []oracle.Outcome, 
 
 // CalculateBugs100 counts distinct bug signatures discovered within the first 100 crashes.
 func CalculateBugs100(ranking []candidate.Candidate, outcomes []oracle.Outcome) int {
+	outcomes = NormalizeTable(outcomes)
 	limit := 100
 	if len(ranking) < limit {
 		limit = len(ranking)
@@ -116,7 +122,7 @@ func CalculateBugs100(ranking []candidate.Candidate, outcomes []oracle.Outcome) 
 	seenSigs := make(map[string]bool)
 	for _, c := range ranking[:limit] {
 		o := outcomeMap[c]
-		if (o.Class == oracle.ClassViolation || o.Class == oracle.ClassOpenError) && o.Signature != "" {
+		if (o.Class == oracle.ClassViolation || o.Class == oracle.ClassOpenError || o.Class == oracle.ClassPanic || o.Class == oracle.ClassHang) && o.Signature != "" {
 			seenSigs[o.Signature] = true
 		}
 	}
@@ -342,7 +348,8 @@ func WriteMultiSeedCSV(res *BenchmarkResult, csvPath string) error {
 		}
 	}
 
-	return nil
+	w.Flush()
+	return w.Error()
 }
 
 // GenerateMultiSeedReportMarkdown renders the comprehensive empirical comparison report as Markdown.
@@ -364,41 +371,40 @@ func GenerateMultiSeedReportMarkdown(res *BenchmarkResult) string {
 	sb.WriteString(fmt.Sprintf("**Evaluation Engine:** CockroachDB Pebble v2.1.7 (Go runtime: %s)  \n", time.Now().UTC().Format(time.RFC3339)))
 	sb.WriteString(fmt.Sprintf("**Workload Seeds (%d):** `%v`  \n", len(res.Config.WorkloadSeeds), res.Config.WorkloadSeeds))
 	sb.WriteString(fmt.Sprintf("**Execution Time:** %.2f seconds total  \n", res.TotalDuration.Seconds()))
-	sb.WriteString(fmt.Sprintf("**Null Control (MUT-0):** %d false alarms across all %d seeds at 0%%/100%% retention  \n\n",
+	sb.WriteString(fmt.Sprintf("**Null Control (MUT-0):** %d observed failures across %d evaluated seeds at 0%%/100%% retention  \n\n",
 		res.MUT0Violations, len(res.Config.WorkloadSeeds)))
 	sb.WriteString("---\n\n")
 
 	sb.WriteString("## 1. Executive Summary\n\n")
-	sb.WriteString("This report documents the multi-seed empirical evaluation of crash-consistency ranking strategies across 32 deterministic workload seeds on CockroachDB's Pebble key-value store. We evaluate Durability-Contract Guided Ranking (**DCG**), State-Representative Random (**R2**), 0%-Retention-First Random (**R1**), Sync-Boundary (**B6**), Uniform Random (**B0**), and baseline heuristics across 9 distinct fault models (MUT-1 through MUT-9), supplemented by an unfaulted null control run (MUT-0).\n\n")
+	sb.WriteString(fmt.Sprintf("This report documents the empirical evaluation of crash-consistency ranking strategies across %d deterministic workload seeds on CockroachDB's Pebble key-value store. We evaluate Durability-Contract Guided Ranking (**DCG**), State-Representative Random (**R2**), 0%%-Retention-First Random (**R1**), Sync-Boundary (**B6**), Uniform Random (**B0**), and baseline heuristics across nine fault models (MUT-1 through MUT-9), supplemented by an unfaulted null control run (MUT-0).\n\n", len(res.Config.WorkloadSeeds)))
 
 	sb.WriteString("### 1.1 Key Findings\n\n")
 
-	// Verification of DCG superiority over R2 on sparse faults (MUT-5, MUT-6, MUT-7)
+	// Summarize the observed DCG/R2 difference on MUT-5 when present.
 	mut5Summ, hasM5 := res.FaultSummaries[faults.MUT5]
 	if hasM5 {
 		dcgM5 := mut5Summ.StrategySummaries["dcg"]
 		r2M5 := mut5Summ.StrategySummaries["r2"]
 		b0M5 := mut5Summ.StrategySummaries["b0"]
 
-		dcgSuperiorOnSparse := dcgM5.K1FailureMedian <= 2.0 && dcgM5.K1FailureMedian < r2M5.K1FailureMedian
+		dcgLowerOnSparse := dcgM5.K1FailureMedian <= 2.0 && dcgM5.K1FailureMedian < r2M5.K1FailureMedian
 
-		if dcgSuperiorOnSparse {
+		if dcgLowerOnSparse {
 			sb.WriteString("**DCG achieves lower cost-to-first-failure than R2 on sparse faults.**\n\n")
-			sb.WriteString("")
-			sb.WriteString("Empirical Confirmation:\n")
-			speedupR2 := 1.0
+			sb.WriteString("Observed comparison:\n")
+			medianRatioR2 := 1.0
 			if dcgM5.K1FailureMedian > 0 {
-				speedupR2 = r2M5.K1FailureMedian / dcgM5.K1FailureMedian
+				medianRatioR2 = r2M5.K1FailureMedian / dcgM5.K1FailureMedian
 			}
-			speedupB0 := 1.0
+			medianRatioB0 := 1.0
 			if dcgM5.K1FailureMedian > 0 {
-				speedupB0 = b0M5.K1FailureMedian / dcgM5.K1FailureMedian
+				medianRatioB0 = b0M5.K1FailureMedian / dcgM5.K1FailureMedian
 			}
-			sb.WriteString(fmt.Sprintf("- **MUT-5 (Sparse $k$-th WAL Sync Drop):** DCG median $k_1 = %.1f$ (Mean $%.2f$, 95%% CI $[%.2f, %.2f]$) vs R2 median $k_1 = %.1f$ (Mean $%.2f$, 95%% CI $[%.2f, %.2f]$) vs B0 median $k_1 = %.1f$ (Mean $%.2f$). DCG achieves **$%.1fx$ faster fault discovery** than R2 and **$%.1fx$ faster** than B0.\n",
+			sb.WriteString(fmt.Sprintf("- **MUT-5 (Sparse $k$-th WAL Sync Drop):** DCG median $k_1 = %.1f$ (mean $%.2f$, 95%% CI $[%.2f, %.2f]$), R2 median $k_1 = %.1f$ (mean $%.2f$, 95%% CI $[%.2f, %.2f]$), and B0 median $k_1 = %.1f$ (mean $%.2f$). The ratios of median discovery positions are %.1f for R2/DCG and %.1f for B0/DCG; these are candidate-count ratios, not wall-clock speedups.\n",
 				dcgM5.K1FailureMedian, dcgM5.K1FailureMean, dcgM5.K1FailureMeanCI95Lower, dcgM5.K1FailureMeanCI95Upper,
 				r2M5.K1FailureMedian, r2M5.K1FailureMean, r2M5.K1FailureMeanCI95Lower, r2M5.K1FailureMeanCI95Upper,
 				b0M5.K1FailureMedian, b0M5.K1FailureMean,
-				speedupR2, speedupB0))
+				medianRatioR2, medianRatioB0))
 		} else {
 			sb.WriteString("**Evaluation metrics detailed below.**\n\n")
 		}
@@ -406,7 +412,7 @@ func GenerateMultiSeedReportMarkdown(res *BenchmarkResult) string {
 		sb.WriteString("**Evaluation metrics detailed below.**\n\n")
 	}
 
-	sb.WriteString(fmt.Sprintf("- **Control Invariance (MUT-0):** %d false alarms across all %d seeds at 0%%/100%% retention.\n",
+	sb.WriteString(fmt.Sprintf("- **Null-control observation (MUT-0):** %d failures across %d evaluated seeds at 0%%/100%% retention.\n",
 		res.MUT0Violations, len(res.Config.WorkloadSeeds)))
 
 	// MUT-8 post-compaction sync evaluation
@@ -429,12 +435,12 @@ func GenerateMultiSeedReportMarkdown(res *BenchmarkResult) string {
 	sb.WriteString("- **Engine:** CockroachDB Pebble `v2.1.7` running in-memory with precise crashable virtual filesystem tracking (`internal/vfsrec`).\n")
 	sb.WriteString("- **Workload Architecture:** 120 client operations per seed with realistic distribution (50% Set, 20% Get, 10% Delete, 10% Two-Key Atomic Batch, 5% Range Delete, 5% Iteration).\n")
 	sb.WriteString("- **Sync Rhythm:** Synchronous barriers enforced every 8th operation (`SyncEvery = 8`), background memtable flushes triggered every 40 operations (`FlushEvery = 40`).\n")
-	sb.WriteString("- **Statistical Population:** 32 deterministic workload seeds (`42, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1001..1022`), generating over 11,000 candidate crash states.\n\n")
+	sb.WriteString(fmt.Sprintf("- **Evaluated Seed Set:** %d deterministic workload seeds, generating over 11,000 candidate crash states in the full benchmark.\n\n", len(res.Config.WorkloadSeeds)))
 
 	sb.WriteString("### 2.2 Fault Model Taxonomy\n\n")
 	sb.WriteString("| Fault Model | Class | Target File / Trigger | Failure Signature | Failure Density |\n")
 	sb.WriteString("|---|---|---|---|---|\n")
-	sb.WriteString("| **MUT-0** | Control | Unfaulted filesystem | None (0 false alarms check) | 0.0% |\n")
+	sb.WriteString("| **MUT-0** | Control | Unfaulted filesystem | No failure observed in the evaluated null control | 0.0% |\n")
 	sb.WriteString("| **MUT-1** | Dense | All WAL `Sync()` calls suppressed | `v1:violation:durably_committed:lost_writes` | ~33% |\n")
 	sb.WriteString("| **MUT-2** | Dense/Sparse | MANIFEST `Sync()` calls suppressed | `v1:open_error:manifest_corrupt` | ~45% |\n")
 	sb.WriteString("| **MUT-3** | Dense/Sparse | Parent directory syncs suppressed | `v1:violation:durably_committed:lost_files` | ~37% |\n")
@@ -447,7 +453,7 @@ func GenerateMultiSeedReportMarkdown(res *BenchmarkResult) string {
 
 	sb.WriteString("### 2.3 Evaluated Ranking Strategies\n\n")
 	sb.WriteString("1. **DCG (Durability-Contract Guided / B8):** Trace-derived durability-contract analysis that prioritizes concrete durability contract violations (dangling table references, uncommitted directory renames, dropped WAL sync records) before exploring uncontracted state representatives.\n")
-	sb.WriteString("2. **DCG-FlagOnly (Contract-Flag Ablation):** Partitions candidate space strictly by contract violation flags without secondary scoring heuristics. DCG-FlagOnly ties full DCG on nearly every setting, showing that the binary durability-contract flags combined with StateKey equivalence partitioning drive the speedup.\n")
+	sb.WriteString("2. **DCG-FlagOnly (Contract-Flag Ablation):** Partitions candidate space strictly by contract violation flags without secondary scoring heuristics. Its near-ties with full DCG attribute most of the observed rank-position difference to binary contract flags and StateKey equivalence partitioning.\n")
 	sb.WriteString("3. **RHG (Reachability-Hazard Guided / B7):** Scores cutoffs by reachable uncommitted mutations and hazard surfaces.\n")
 	sb.WriteString("4. **R2 (State-Representative Random):** Partitions 0% retention candidates into equivalence classes by canonical `StateKey`, selects boundary-adjacent representatives within each `StateKey` class using graph features (`BeforeBoundary`, `BarrierProximity`, and canonical order `candidate.Less`) before shuffling classes, and tests redundant cutoffs afterward.\n")
 	sb.WriteString("5. **R1 (0%-Retention-First Random):** Partitions universe into 0% unsynced data retention and 100% retention; evaluates 0% retention first in pure random order.\n")
@@ -497,23 +503,24 @@ func GenerateMultiSeedReportMarkdown(res *BenchmarkResult) string {
 			}
 
 			nameStr := s.StrategyName
-			if code == "dcg" {
+			switch code {
+			case "dcg":
 				nameStr = "**DCG (Guided)**"
-			} else if code == "dcg-pr" {
+			case "dcg-pr":
 				nameStr = "**DCG-PR (Partial Prior)**"
-			} else if code == "dcg-flag-only" {
+			case "dcg-flag-only":
 				nameStr = "**DCG-FlagOnly**"
-			} else if code == "b7" {
+			case "b7":
 				nameStr = "**RHG (Risk-Horizon)**"
-			} else if code == "r2" {
+			case "r2":
 				nameStr = "**R2 (Representative)**"
-			} else if code == "r1" {
+			case "r1":
 				nameStr = "R1 (0%-Retention)"
-			} else if code == "b2" {
+			case "b2":
 				nameStr = "LIFO (Recent-First)"
-			} else if code == "b6" {
+			case "b6":
 				nameStr = "B6 (Sync-Boundary)"
-			} else if code == "b0" {
+			case "b0":
 				nameStr = "B0 (Uniform Random)"
 			}
 
@@ -554,16 +561,23 @@ func GenerateMultiSeedReportMarkdown(res *BenchmarkResult) string {
 		flagM8 := mut8Summ.StrategySummaries["dcg-flag-only"]
 		r2M8 := mut8Summ.StrategySummaries["r2"]
 		b0M8 := mut8Summ.StrategySummaries["b0"]
-		mut6Summ := res.FaultSummaries[faults.MUT6]
-		dcgM6 := mut6Summ.StrategySummaries["dcg"]
-		flagM6 := mut6Summ.StrategySummaries["dcg-flag-only"]
+		mut6Summ, hasM6 := res.FaultSummaries[faults.MUT6]
+		var dcgM6, flagM6 AggregatedStrategyStats
+		if hasM6 && mut6Summ.StrategySummaries != nil {
+			dcgM6 = mut6Summ.StrategySummaries["dcg"]
+			flagM6 = mut6Summ.StrategySummaries["dcg-flag-only"]
+		}
 		sb.WriteString(fmt.Sprintf("Under early testing budgets ($B = 25$, $S_{25}$), DCG discovers substantially more failing states than R2 and B0: on MUT-9 ($k=1$), DCG achieves mean $S_{25} = %.2f$ vs R2's %.2f and B0's %.2f; on MUT-8, DCG achieves mean $S_{25} = %.2f$ vs R2's %.2f and B0's %.2f. Comparing DCG against the **DCG-FlagOnly** ablation isolates the contribution of each mechanism:\n\n",
 			dcgM9.S25Mean, r2M9.S25Mean, b0M9.S25Mean,
 			dcgM8.S25Mean, r2M8.S25Mean, b0M8.S25Mean))
 		sb.WriteString(fmt.Sprintf("1. **Binary Durability-Contract Flags + `StateKey` Equivalence Partitioning:** Drive the $k_1 = 1.00$ first-failure discovery on MUT-5, MUT-8, and MUT-9 as well as the early-budget $S_{25}$ lead (`DCG-FlagOnly` matches full `DCG` with mean $S_{25} = %.2f$ on MUT-9 and %.2f on MUT-8).\n",
 			flagM9.S25Mean, flagM8.S25Mean))
-		sb.WriteString(fmt.Sprintf("2. **Tier 1B Continuous Severity Scoring (`Score()`):** Breaks ties when multiple file classes or sync points are flagged within a trace—most visibly on **MUT-6** (second manifest sync drop), where full DCG achieves mean $k_1 = %.2f$ compared to %.2f for `DCG-FlagOnly`.\n",
-			dcgM6.K1FailureMean, flagM6.K1FailureMean))
+		if hasM6 {
+			sb.WriteString(fmt.Sprintf("2. **Tier 1B Continuous Severity Scoring (`Score()`):** Breaks ties when multiple file classes or sync points are flagged within a trace—most visibly on **MUT-6** (second manifest sync drop), where full DCG achieves mean $k_1 = %.2f$ compared to %.2f for `DCG-FlagOnly`.\n",
+				dcgM6.K1FailureMean, flagM6.K1FailureMean))
+		} else {
+			sb.WriteString("2. **Tier 1B Continuous Severity Scoring (`Score()`):** Breaks ties when multiple file classes or sync points are flagged within a trace.\n")
+		}
 		sb.WriteString("3. **Tier 3A Regime/Epoch Diversity Partitioning:** Operates in Pass 2 after unique `StateKey` representatives are exhausted, increasing full-budget failure-curve area (`AUCNormFailures`) rather than altering $k_1$ or $S_{25}$.\n\n")
 	}
 
@@ -761,5 +775,6 @@ func WriteMultiSeedPerSeedCSV(res *BenchmarkResult, csvPath string) error {
 		}
 	}
 
-	return nil
+	w.Flush()
+	return w.Error()
 }

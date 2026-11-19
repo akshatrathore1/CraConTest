@@ -15,8 +15,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"path"
 	"sort"
+	"strings"
 	"sync"
+	"unsafe"
 
 	"github.com/akshatrathore1/CraConTest/internal/trace"
 )
@@ -105,7 +108,6 @@ func Build(events []trace.Event, base uint64, policies []int) ([]Candidate, erro
 			universe = append(universe, Candidate{Event: cut, Percent: policy, Seed: seed})
 		}
 	}
-	RegisterTrace(events)
 	Sort(universe)
 	return universe, nil
 }
@@ -203,29 +205,6 @@ func Decode(reader io.Reader) ([]Candidate, error) {
 	return universe, nil
 }
 
-// activeTraceLock protects activeTrace.
-var (
-	activeTraceLock sync.RWMutex
-	activeTrace     []trace.Event
-)
-
-// RegisterTrace records the active trace for persistence state classification.
-func RegisterTrace(events []trace.Event) {
-	activeTraceLock.Lock()
-	defer activeTraceLock.Unlock()
-	activeTrace = trace.Clone(events)
-}
-
-// ActiveTrace returns a copy of the currently registered trace, or nil if none.
-func ActiveTrace() []trace.Event {
-	activeTraceLock.RLock()
-	defer activeTraceLock.RUnlock()
-	if activeTrace == nil {
-		return nil
-	}
-	return trace.Clone(activeTrace)
-}
-
 type canonicalFile struct {
 	Path       string `json:"path"`
 	DurableLen int64  `json:"durable_len"`
@@ -233,10 +212,9 @@ type canonicalFile struct {
 }
 
 type canonicalState struct {
-	Percent       int             `json:"percent"`
-	LastAckSyncOp uint64          `json:"last_ack_sync_op"`
-	Files         []canonicalFile `json:"files"`
-	Pending       []string        `json:"pending,omitempty"`
+	Percent int             `json:"percent"`
+	Files   []canonicalFile `json:"files"`
+	Pending []string        `json:"pending,omitempty"`
 }
 
 type fileEntry struct {
@@ -244,12 +222,18 @@ type fileEntry struct {
 	durableLen int64
 	currentLen int64
 	deleted    bool
+	isDir      bool
+	synced     bool
+}
+
+type pendingDirOp struct {
+	dir  string
+	desc string
 }
 
 type cutoffState struct {
-	lastAckSyncOp uint64
-	files         map[string]*fileEntry
-	pending       []string
+	files   map[string]*fileEntry
+	pending []pendingDirOp
 }
 
 func cloneFiles(src map[string]*fileEntry) map[string]*fileEntry {
@@ -261,14 +245,25 @@ func cloneFiles(src map[string]*fileEntry) map[string]*fileEntry {
 	return dst
 }
 
+func clonePending(src []pendingDirOp) []pendingDirOp {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make([]pendingDirOp, len(src))
+	copy(dst, src)
+	return dst
+}
+
 func (s *cutoffState) Key(percent int) string {
 	state := canonicalState{
-		Percent:       percent,
-		LastAckSyncOp: s.lastAckSyncOp,
-		Files:         []canonicalFile{},
+		Percent: percent,
+		Files:   []canonicalFile{},
 	}
 	if len(s.pending) > 0 {
-		state.Pending = append([]string(nil), s.pending...)
+		state.Pending = make([]string, 0, len(s.pending))
+		for _, p := range s.pending {
+			state.Pending = append(state.Pending, p.desc)
+		}
 		sort.Strings(state.Pending)
 	}
 
@@ -278,13 +273,40 @@ func (s *cutoffState) Key(percent int) string {
 	}
 	sort.Strings(names)
 
+	isPendingCreate := func(pending []pendingDirOp, p string) bool {
+		for _, op := range pending {
+			if op.desc == "mkdir:"+p ||
+				op.desc == "create:"+p ||
+				op.desc == "link:"+p ||
+				op.desc == "rename_to:"+p ||
+				strings.HasSuffix(op.desc, "->"+p) ||
+				op.desc == "reuse_to:"+p {
+				return true
+			}
+		}
+		return false
+	}
+
 	for _, name := range names {
 		f := s.files[name]
 		if f.deleted {
 			continue
 		}
 		if percent == 0 {
-			if f.durableLen > 0 {
+			// At 0% retention, unsynced directory entries and unsynced files do not survive crash.
+			// A file or directory survives if its directory entry has been durably synced
+			// (not in s.pending), or if the file itself has durable data / was synced.
+			survives := false
+			if f.isDir {
+				survives = !isPendingCreate(s.pending, f.path)
+			} else {
+				if f.durableLen > 0 || f.synced {
+					survives = true
+				} else if !isPendingCreate(s.pending, f.path) {
+					survives = true
+				}
+			}
+			if survives {
 				state.Files = append(state.Files, canonicalFile{
 					Path:       f.path,
 					DurableLen: f.durableLen,
@@ -300,38 +322,196 @@ func (s *cutoffState) Key(percent int) string {
 	}
 	encoded, err := json.Marshal(state)
 	if err != nil {
-		panic(fmt.Sprintf("candidate: state key encoding: %v", err))
+		return fmt.Sprintf("fallback:%d:%d", state.Percent, len(state.Files))
 	}
 	digest := sha256.Sum256(encoded)
 	return hex.EncodeToString(digest[:])
 }
 
-// buildCutoffStates performs a single forward pass over events, computing the
-// snapshot of persistence state for every cutoff 0..len(events).
-func buildCutoffStates(events []trace.Event) []*cutoffState {
-	states := make([]*cutoffState, len(events)+1)
-	files := make(map[string]*fileEntry)
-	handles := make(map[uint64]*fileEntry)
-	var pending []string
-	var lastAckSyncOp uint64
-	var activeOpSync bool
+type cutoffCacheEntry struct {
+	ptr    uintptr
+	length int
+	hash   uint64
+	states []*cutoffState
+}
 
-	states[0] = &cutoffState{
-		lastAckSyncOp: 0,
-		files:         cloneFiles(files),
-		pending:       nil,
+var (
+	cutoffCacheMu sync.Mutex
+	cutoffCache   = make([]cutoffCacheEntry, 0, 16)
+)
+
+func traceFingerprint(events []trace.Event) uint64 {
+	h := uint64(14695981039346656037)
+	const prime = 1099511628211
+	for i := range events {
+		h ^= uint64(events[i].ID)
+		h *= prime
+		for j := 0; j < len(events[i].Kind); j++ {
+			h ^= uint64(events[i].Kind[j])
+			h *= prime
+		}
+		for j := 0; j < len(events[i].File); j++ {
+			h ^= uint64(events[i].File[j])
+			h *= prime
+		}
+		for j := 0; j < len(events[i].File2); j++ {
+			h ^= uint64(events[i].File2[j])
+			h *= prime
+		}
+		for j := 0; j < len(events[i].Cat); j++ {
+			h ^= uint64(events[i].Cat[j])
+			h *= prime
+		}
+		for j := 0; j < len(events[i].Err); j++ {
+			h ^= uint64(events[i].Err[j])
+			h *= prime
+		}
+		for j := 0; j < len(events[i].Note); j++ {
+			h ^= uint64(events[i].Note[j])
+			h *= prime
+		}
+		for j := 0; j < len(events[i].OpKind); j++ {
+			h ^= uint64(events[i].OpKind[j])
+			h *= prime
+		}
+		h ^= uint64(events[i].Mode)
+		h *= prime
+		h ^= uint64(events[i].Off)
+		h *= prime
+		h ^= uint64(events[i].Len)
+		h *= prime
+		h ^= events[i].Handle
+		h *= prime
+		h ^= events[i].Op
+		h *= prime
+		h ^= events[i].Job
+		h *= prime
+		h ^= uint64(events[i].Size)
+		h *= prime
+		if events[i].Dir {
+			h ^= 1
+			h *= prime
+		}
+		if events[i].FullSync {
+			h ^= 2
+			h *= prime
+		}
+	}
+	return h
+}
+
+// buildCutoffStates returns the persistence states for all cutoffs, using an in-memory
+// cache to avoid repeated O(N) reconstruction on the same trace.
+func buildCutoffStates(events []trace.Event) []*cutoffState {
+	if len(events) == 0 {
+		return buildCutoffStatesUncached(events)
 	}
 
+	ptr := uintptr(unsafe.Pointer(&events[0]))
+	length := len(events)
+	fp := traceFingerprint(events)
+
+	cutoffCacheMu.Lock()
+	for i, entry := range cutoffCache {
+		if entry.length == length && entry.hash == fp {
+			res := entry.states
+			if i > 0 {
+				copy(cutoffCache[1:i+1], cutoffCache[0:i])
+				cutoffCache[0] = entry
+			}
+			cutoffCacheMu.Unlock()
+			return res
+		}
+	}
+	cutoffCacheMu.Unlock()
+
+	states := buildCutoffStatesUncached(events)
+
+	cutoffCacheMu.Lock()
+	newEntry := cutoffCacheEntry{
+		ptr:    ptr,
+		length: length,
+		hash:   fp,
+		states: states,
+	}
+	if len(cutoffCache) < 16 {
+		cutoffCache = append([]cutoffCacheEntry{newEntry}, cutoffCache...)
+	} else {
+		copy(cutoffCache[1:], cutoffCache[:15])
+		cutoffCache[0] = newEntry
+	}
+	cutoffCacheMu.Unlock()
+
+	return states
+}
+
+// buildCutoffStatesUncached performs a single forward pass over events, computing the
+// snapshot of persistence state for every cutoff 0..len(events).
+func buildCutoffStatesUncached(events []trace.Event) []*cutoffState {
+	maxID := uint64(len(events))
 	for _, event := range events {
+		if event.ID > maxID {
+			maxID = event.ID
+		}
+	}
+	states := make([]*cutoffState, maxID+1)
+	files := make(map[string]*fileEntry)
+	handles := make(map[uint64]*fileEntry)
+	var pending []pendingDirOp
+
+	states[0] = &cutoffState{
+		files:   cloneFiles(files),
+		pending: nil,
+	}
+
+	for i, event := range events {
 		switch event.Kind {
 		case trace.KindMkdirAll:
-			files[event.File] = &fileEntry{path: event.File}
+			if event.Err != "" {
+				break
+			}
+			files[event.File] = &fileEntry{path: event.File, isDir: true}
+			d := path.Clean(path.Dir(event.File))
+			pending = append(pending, pendingDirOp{dir: d, desc: "mkdir:" + event.File})
 		case trace.KindCreate:
+			if event.Err != "" {
+				break
+			}
 			f := &fileEntry{path: event.File}
 			files[event.File] = f
 			handles[event.Handle] = f
-			pending = append(pending, "create:"+event.File)
+			d := path.Clean(path.Dir(event.File))
+			pending = append(pending, pendingDirOp{dir: d, desc: "create:" + event.File})
+		case trace.KindReuseForWrite:
+			if event.Err != "" {
+				break
+			}
+			f := files[event.File]
+			if f != nil {
+				delete(files, event.File)
+				f.path = event.File2
+				f.currentLen = 0
+				f.durableLen = 0
+				f.synced = false
+				f.isDir = false
+				files[event.File2] = f
+			} else {
+				f = &fileEntry{path: event.File2}
+				files[event.File2] = f
+			}
+			handles[event.Handle] = f
+			dOld := path.Clean(path.Dir(event.File))
+			dNew := path.Clean(path.Dir(event.File2))
+			if dOld == dNew {
+				pending = append(pending, pendingDirOp{dir: dOld, desc: "reuse:" + event.File + "->" + event.File2})
+			} else {
+				pending = append(pending, pendingDirOp{dir: dOld, desc: "reuse_from:" + event.File})
+				pending = append(pending, pendingDirOp{dir: dNew, desc: "reuse_to:" + event.File2})
+			}
 		case trace.KindOpen, trace.KindOpenReadWrite, trace.KindOpenDir:
+			if event.Err != "" {
+				break
+			}
 			f := files[event.File]
 			if f == nil {
 				f = &fileEntry{path: event.File}
@@ -339,6 +519,9 @@ func buildCutoffStates(events []trace.Event) []*cutoffState {
 			}
 			handles[event.Handle] = f
 		case trace.KindWrite, trace.KindWriteAt:
+			if event.Err != "" {
+				break
+			}
 			f := handles[event.Handle]
 			if f != nil && event.Len > 0 {
 				end := event.Off + int64(event.Len)
@@ -346,47 +529,135 @@ func buildCutoffStates(events []trace.Event) []*cutoffState {
 					f.currentLen = end
 				}
 			}
+		case trace.KindPreallocate:
+			if event.Err != "" {
+				break
+			}
+			f := handles[event.Handle]
+			if f != nil && event.Size > 0 {
+				end := event.Off + event.Size
+				if end > f.currentLen {
+					f.currentLen = end
+				}
+			}
 		case trace.KindSync, trace.KindSyncData, trace.KindSyncTo:
+			if event.Err != "" {
+				break
+			}
 			if event.IsBarrier() {
 				f := handles[event.Handle]
 				if f != nil {
+					f.synced = true
 					f.durableLen = f.currentLen
 				}
 				if event.Dir {
-					pending = nil
+					syncDir := event.File
+					if syncDir == "" {
+						if h := handles[event.Handle]; h != nil {
+							syncDir = h.path
+						}
+					}
+					if syncDir != "" {
+						syncDir = path.Clean(syncDir)
+						kept := make([]pendingDirOp, 0, len(pending))
+						for _, p := range pending {
+							if p.dir != syncDir {
+								kept = append(kept, p)
+							}
+						}
+						pending = kept
+					}
 				}
-				activeOpSync = true
 			}
 		case trace.KindClose:
 			delete(handles, event.Handle)
 		case trace.KindRename:
+			if event.Err != "" {
+				break
+			}
 			f := files[event.File]
 			if f != nil {
 				delete(files, event.File)
 				f.path = event.File2
 				files[event.File2] = f
 			}
-			pending = append(pending, "rename:"+event.File+"->"+event.File2)
+			dOld := path.Clean(path.Dir(event.File))
+			dNew := path.Clean(path.Dir(event.File2))
+			if dOld == dNew {
+				pending = append(pending, pendingDirOp{dir: dOld, desc: "rename:" + event.File + "->" + event.File2})
+			} else {
+				pending = append(pending, pendingDirOp{dir: dOld, desc: "rename_from:" + event.File})
+				pending = append(pending, pendingDirOp{dir: dNew, desc: "rename_to:" + event.File2})
+			}
 		case trace.KindRemove, trace.KindRemoveAll:
+			if event.Err != "" {
+				break
+			}
 			f := files[event.File]
 			if f != nil {
 				f.deleted = true
 				delete(files, event.File)
 			}
-			pending = append(pending, "remove:"+event.File)
-		case trace.KindOpBegin:
-			activeOpSync = false
-		case trace.KindOpEnd:
-			if activeOpSync && trace.MutatingOperation(event.OpKind) && event.Err == "" {
-				lastAckSyncOp++
+			// For RemoveAll, also delete all child paths (subtree pruning).
+			if event.Kind == trace.KindRemoveAll {
+				isRoot := event.File == "" || event.File == "."
+				prefix := strings.TrimSuffix(event.File, "/") + "/"
+				for childPath := range files {
+					if isRoot || strings.HasPrefix(childPath, prefix) {
+						cf := files[childPath]
+						if cf != nil {
+							cf.deleted = true
+						}
+						delete(files, childPath)
+					}
+				}
+				kept := make([]pendingDirOp, 0, len(pending))
+				for _, p := range pending {
+					if !isRoot && p.dir != event.File && !strings.HasPrefix(p.dir, prefix) {
+						kept = append(kept, p)
+					}
+				}
+				pending = kept
 			}
-			activeOpSync = false
+			d := path.Clean(path.Dir(event.File))
+			pending = append(pending, pendingDirOp{dir: d, desc: "remove:" + event.File})
+		case trace.KindLink:
+			if event.Err != "" {
+				break
+			}
+			// Mirror the link in the files map: the destination path shares the
+			// same size as the source, matching replay.go's filePaths alias logic.
+			src := files[event.File]
+			if src != nil {
+				dst := &fileEntry{
+					path:       event.File2,
+					currentLen: src.currentLen,
+					durableLen: src.durableLen,
+					isDir:      src.isDir,
+					synced:     src.synced,
+				}
+				files[event.File2] = dst
+			}
+			d := path.Clean(path.Dir(event.File2))
+			pending = append(pending, pendingDirOp{dir: d, desc: "link:" + event.File2})
 		}
 
-		states[event.ID] = &cutoffState{
-			lastAckSyncOp: lastAckSyncOp,
-			files:         cloneFiles(files),
-			pending:       append([]string(nil), pending...),
+		cs := &cutoffState{
+			files:   cloneFiles(files),
+			pending: clonePending(pending),
+		}
+		if event.ID > 0 {
+			if event.ID <= maxID {
+				states[event.ID] = cs
+			}
+		} else if uint64(i+1) <= maxID {
+			states[i+1] = cs
+		}
+	}
+
+	for idx := 1; idx <= int(maxID); idx++ {
+		if states[idx] == nil {
+			states[idx] = states[idx-1]
 		}
 	}
 
@@ -456,8 +727,6 @@ func CollapseEquivalenceStates(candidates []Candidate, events ...[]trace.Event) 
 	var evs []trace.Event
 	if len(events) > 0 && len(events[0]) > 0 {
 		evs = events[0]
-	} else {
-		evs = ActiveTrace()
 	}
 
 	if len(evs) == 0 {
@@ -515,8 +784,6 @@ func EquivalenceClasses(candidates []Candidate, events ...[]trace.Event) map[str
 	var evs []trace.Event
 	if len(events) > 0 && len(events[0]) > 0 {
 		evs = events[0]
-	} else {
-		evs = ActiveTrace()
 	}
 
 	if len(evs) == 0 {

@@ -214,7 +214,7 @@ func referenceOracle(entries []referenceEntry, cut uint64, initial, recovered ma
 			}
 		} else {
 			switch entry.Kind {
-			case "get", "iterate", "flush", "compact":
+			case "get", "iterate", "flush", "compact", "checkpoint", "ratchet":
 			default:
 				return "oracle_error", "invalid_history"
 			}
@@ -509,6 +509,8 @@ func TestTraceV1ReplayFilesystemEffects(test *testing.T) {
 		case trace.KindClose:
 			err = files[event.Handle].Close()
 			delete(files, event.Handle)
+		case trace.KindPreallocate:
+			err = files[event.Handle].Preallocate(event.Off, event.Size)
 		case trace.KindLock:
 			locks[event.Handle], err = filesystem.Lock(event.File)
 		case trace.KindUnlock:

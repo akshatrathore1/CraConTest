@@ -144,7 +144,7 @@ func TestFaultIDsAndValidation(t *testing.T) {
 	}
 
 	// Verify IsSparse
-	for _, id := range []string{faults.MUT2, faults.MUT3, faults.MUT4, faults.MUT5, faults.MUT6, faults.MUT7, faults.MUT8, faults.MUT9} {
+	for _, id := range []string{faults.MUT3, faults.MUT4, faults.MUT5, faults.MUT6, faults.MUT7, faults.MUT8, faults.MUT9} {
 		if !faults.IsSparse(id) {
 			t.Errorf("%s should be sparse", id)
 		}
@@ -152,8 +152,8 @@ func TestFaultIDsAndValidation(t *testing.T) {
 	if !faults.IsSparse("MUT-9") || !faults.IsSparse("MUT-DIR-K") {
 		t.Error("MUT-9 and MUT-DIR-K should be sparse")
 	}
-	if faults.IsSparse(faults.MUT0) || faults.IsSparse(faults.MUT1) || faults.IsSparse(faults.BarrierCkpt) {
-		t.Error("MUT-0, MUT-1, and BARRIER-CKPT should not be sparse")
+	if faults.IsSparse(faults.MUT0) || faults.IsSparse(faults.MUT1) || faults.IsSparse(faults.MUT2) || faults.IsSparse(faults.BarrierCkpt) {
+		t.Error("MUT-0, MUT-1, MUT-2, and BARRIER-CKPT should not be sparse")
 	}
 
 	for _, id := range []string{faults.MUTX1, faults.MUTX2, faults.MUTX3, faults.MUTX4, faults.MUTX5, faults.MUTX6, "MUT-X1_k6"} {
@@ -1743,4 +1743,175 @@ func TestBarrier5825NormalizeAndParentDirSync(t *testing.T) {
 	}
 	mf.Close()
 	// If we reach here without panic/error, the parent-dir sync succeeded.
+}
+
+func TestFaultMUT7ReuseForWriteMetadataDrop(t *testing.T) {
+	mem := vfs.NewMem()
+	if err := mem.MkdirAll("db", 0755); err != nil {
+		t.Fatal(err)
+	}
+	f, err := mem.Create("db/old.wal", vfs.WriteCategoryUnspecified)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	fs, err := faults.New(faults.MUT7, mem)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stateFS := fs.(*faults.FS)
+
+	// ReuseForWrite targeting CURRENT (a metadata pointer) under MUT7 should set pendingDirSyncDrop
+	rf, err := fs.ReuseForWrite("db/old.wal", "db/CURRENT", vfs.WriteCategoryUnspecified)
+	if err != nil {
+		t.Fatalf("ReuseForWrite: %v", err)
+	}
+	rf.Close()
+
+	if !stateFS.PendingDirSyncDrop() {
+		t.Fatalf("expected PendingDirSyncDrop=true after ReuseForWrite to CURRENT")
+	}
+
+	// Syncing parent directory now should drop
+	df, err := fs.OpenDir("db")
+	if err != nil {
+		t.Fatalf("OpenDir: %v", err)
+	}
+	defer df.Close()
+	if err := df.Sync(); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	if !stateFS.DirSyncDropped() {
+		t.Fatalf("expected MUT7 to drop parent dir sync after ReuseForWrite to CURRENT")
+	}
+}
+
+func TestFaultMUTX4SeedVariance(t *testing.T) {
+	mem1 := vfs.NewMem()
+	mem2 := vfs.NewMem()
+	mem3 := vfs.NewMem()
+
+	fs1, err := faults.NewWithConfig(faults.Config{ID: faults.MUTX4, Seed: 100}, mem1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs2, err := faults.NewWithConfig(faults.Config{ID: faults.MUTX4, Seed: 200}, mem2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs3, err := faults.NewWithConfig(faults.Config{ID: faults.MUTX4, Seed: 100}, mem3)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	state1 := fs1.(*faults.FS)
+	state2 := fs2.(*faults.FS)
+	state3 := fs3.(*faults.FS)
+
+	f1, _ := fs1.Create("test1.dat", vfs.WriteCategoryUnspecified)
+	f2, _ := fs2.Create("test2.dat", vfs.WriteCategoryUnspecified)
+	f3, _ := fs3.Create("test3.dat", vfs.WriteCategoryUnspecified)
+
+	nSyncs := 200
+	for i := 0; i < nSyncs; i++ {
+		_ = f1.Sync()
+		_ = f2.Sync()
+		_ = f3.Sync()
+	}
+	_ = f1.Close()
+	_ = f2.Close()
+	_ = f3.Close()
+
+	if state1.XCall() != nSyncs || state2.XCall() != nSyncs {
+		t.Fatalf("expected XCall==%d, got %d and %d", nSyncs, state1.XCall(), state2.XCall())
+	}
+
+	// Verify that syncs were actually dropped (non-zero drop count under MUT-X4)
+	if state1.XDropCount() == 0 || state2.XDropCount() == 0 {
+		t.Fatalf("expected non-zero drops under MUT-X4, got seed 100 drops=%d, seed 200 drops=%d",
+			state1.XDropCount(), state2.XDropCount())
+	}
+
+	// Verify seed determinism: identical seed produces identical drop counts
+	if state1.XDropCount() != state3.XDropCount() {
+		t.Fatalf("expected identical drops for seed 100, got %d vs %d",
+			state1.XDropCount(), state3.XDropCount())
+	}
+
+	// Verify seed variance: different seeds produce different drop counts or behaviors
+	if state1.XDropCount() == state2.XDropCount() {
+		// If counts happen to match, verify that at least the specific dropped call indices differed
+		state1.Reset()
+		state2.Reset()
+		var drops1, drops2 []int
+		f1b, _ := fs1.Create("test1b.dat", vfs.WriteCategoryUnspecified)
+		f2b, _ := fs2.Create("test2b.dat", vfs.WriteCategoryUnspecified)
+		for i := 0; i < nSyncs; i++ {
+			prev1 := state1.XDropCount()
+			_ = f1b.Sync()
+			if state1.XDropCount() > prev1 {
+				drops1 = append(drops1, i)
+			}
+			prev2 := state2.XDropCount()
+			_ = f2b.Sync()
+			if state2.XDropCount() > prev2 {
+				drops2 = append(drops2, i)
+			}
+		}
+		_ = f1b.Close()
+		_ = f2b.Close()
+		if reflect.DeepEqual(drops1, drops2) {
+			t.Fatalf("expected different drop indices for different seeds (100 vs 200), got identical drops: %v", drops1)
+		}
+	}
+}
+
+type mockNotifierWrapper struct {
+	vfs.FS
+	inner vfs.FS
+}
+
+func (m *mockNotifierWrapper) Unwrap() vfs.FS {
+	return m.inner
+}
+
+type mockNotifierFS struct {
+	vfs.FS
+	droppedCount int
+}
+
+func (m *mockNotifierFS) WALWriteCount() uint64         { return 0 }
+func (m *mockNotifierFS) WaitForWALWrite(target uint64) {}
+func (m *mockNotifierFS) NotifyDroppedWALWrite() {
+	m.droppedCount++
+}
+
+func TestFaultMUTX6UnwrapNotifier(t *testing.T) {
+	mem := vfs.NewMem()
+	notifier := &mockNotifierFS{FS: mem}
+	wrapper := &mockNotifierWrapper{FS: notifier, inner: notifier}
+
+	fs, err := faults.NewWithConfig(faults.Config{ID: faults.MUTX6, XK: 1}, wrapper)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	f, err := fs.Create("000001.log", "pebble-wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	n, err := f.Write([]byte("wal record"))
+	if err != nil {
+		t.Fatalf("write failed: %v", err)
+	}
+	if n != len("wal record") {
+		t.Fatalf("write returned short count: %d", n)
+	}
+
+	if notifier.droppedCount != 1 {
+		t.Fatalf("expected NotifyDroppedWALWrite called via Unwrap traversal, got %d", notifier.droppedCount)
+	}
 }

@@ -38,10 +38,13 @@ func (s r1) Rank(view *graph.View, universe []candidate.Candidate) []candidate.C
 	}
 
 	u0 := make([]candidate.Candidate, 0, len(ordered))
+	uMid := make([]candidate.Candidate, 0, len(ordered))
 	u100 := make([]candidate.Candidate, 0, len(ordered))
 	for _, c := range ordered {
 		if c.Percent == 0 {
 			u0 = append(u0, c)
+		} else if c.Percent < 100 {
+			uMid = append(uMid, c)
 		} else {
 			u100 = append(u100, c)
 		}
@@ -50,10 +53,17 @@ func (s r1) Rank(view *graph.View, universe []candidate.Candidate) []candidate.C
 	rng0 := rand.New(rand.NewPCG(0, s.seed))
 	rng0.Shuffle(len(u0), func(left, right int) { u0[left], u0[right] = u0[right], u0[left] })
 
+	if len(uMid) > 0 {
+		candidate.Sort(uMid)
+		rngMid := rand.New(rand.NewPCG(2, s.seed))
+		rngMid.Shuffle(len(uMid), func(left, right int) { uMid[left], uMid[right] = uMid[right], uMid[left] })
+	}
+
 	rng1 := rand.New(rand.NewPCG(1, s.seed))
 	rng1.Shuffle(len(u100), func(left, right int) { u100[left], u100[right] = u100[right], u100[left] })
 
-	return append(u0, u100...)
+	result := append(u0, uMid...)
+	return append(result, u100...)
 }
 
 // --- R2: State-Representative R1 Baseline ---------------------------------
@@ -89,15 +99,18 @@ func (s r2) Rank(view *graph.View, universe []candidate.Candidate) []candidate.C
 		return nil
 	}
 
-	// 1. Partition universe into 0% retention candidates and 100% retention candidates.
+	// 1. Partition universe into 0% retention, partial-retention, and 100% retention candidates.
 	var u0 []candidate.Candidate
 	var u0Labels []graph.Features
+	var uMid []candidate.Candidate
 	var u100 []candidate.Candidate
 
 	for i, c := range ordered {
 		if c.Percent == 0 {
 			u0 = append(u0, c)
 			u0Labels = append(u0Labels, labels[i])
+		} else if c.Percent < 100 {
+			uMid = append(uMid, c)
 		} else {
 			u100 = append(u100, c)
 		}
@@ -151,6 +164,7 @@ func (s r2) Rank(view *graph.View, universe []candidate.Candidate) []candidate.C
 	// 4. Ensure canonical order before shuffling to eliminate map/group iteration non-determinism.
 	candidate.Sort(zeroReps)
 	candidate.Sort(zeroNonReps)
+	candidate.Sort(uMid)
 	candidate.Sort(u100)
 
 	// 5. Shuffle partitions using independent PCG generators seeded deterministically.
@@ -160,13 +174,19 @@ func (s r2) Rank(view *graph.View, universe []candidate.Candidate) []candidate.C
 	rng1 := rand.New(rand.NewPCG(1, s.seed))
 	rng1.Shuffle(len(zeroNonReps), func(i, j int) { zeroNonReps[i], zeroNonReps[j] = zeroNonReps[j], zeroNonReps[i] })
 
+	if len(uMid) > 0 {
+		rngMid := rand.New(rand.NewPCG(3, s.seed))
+		rngMid.Shuffle(len(uMid), func(i, j int) { uMid[i], uMid[j] = uMid[j], uMid[i] })
+	}
+
 	rng2 := rand.New(rand.NewPCG(2, s.seed))
 	rng2.Shuffle(len(u100), func(i, j int) { u100[i], u100[j] = u100[j], u100[i] })
 
-	// 6. Concatenate: distinct state representatives first, then remaining 0%, then 100%.
+	// 6. Concatenate: distinct state representatives first, then remaining 0%, then partial-retention, then 100%.
 	result := make([]candidate.Candidate, 0, len(ordered))
 	result = append(result, zeroReps...)
 	result = append(result, zeroNonReps...)
+	result = append(result, uMid...)
 	result = append(result, u100...)
 
 	return result

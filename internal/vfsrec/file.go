@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"io"
 	"os"
+	"sync"
 
 	"github.com/akshatrathore1/CraConTest/internal/trace"
 	"github.com/cockroachdb/pebble/v2/vfs"
 )
 
 type recFile struct {
+	mu     sync.Mutex
 	fs     *FS
 	inner  vfs.File
 	handle uint64
@@ -23,8 +25,8 @@ type recFile struct {
 var _ vfs.File = (*recFile)(nil)
 
 func (f *recFile) Close() error {
-	f.fs.mu.Lock()
-	defer f.fs.mu.Unlock()
+	f.mu.Lock()
+	defer f.mu.Unlock()
 
 	if f.closed {
 		return nil
@@ -44,13 +46,15 @@ func (f *recFile) Close() error {
 	if err != nil {
 		event.Err = err.Error()
 	}
+	f.fs.mu.Lock()
 	f.fs.appendEventLocked(event)
+	f.fs.mu.Unlock()
 	return err
 }
 
 func (f *recFile) Read(p []byte) (int, error) {
-	f.fs.mu.Lock()
-	defer f.fs.mu.Unlock()
+	f.mu.Lock()
+	defer f.mu.Unlock()
 
 	if f.closed {
 		return 0, os.ErrClosed
@@ -72,13 +76,15 @@ func (f *recFile) Read(p []byte) (int, error) {
 	if err != nil {
 		event.Err = err.Error()
 	}
+	f.fs.mu.Lock()
 	f.fs.appendEventLocked(event)
+	f.fs.mu.Unlock()
 	return n, err
 }
 
 func (f *recFile) Write(p []byte) (int, error) {
-	f.fs.mu.Lock()
-	defer f.fs.mu.Unlock()
+	f.mu.Lock()
+	defer f.mu.Unlock()
 
 	if f.closed {
 		return 0, os.ErrClosed
@@ -103,19 +109,21 @@ func (f *recFile) Write(p []byte) (int, error) {
 		err = io.ErrShortWrite
 		event.Err = err.Error()
 	}
+	f.fs.mu.Lock()
 	f.fs.appendEventLocked(event)
-	if isDBWALPath(f.label) && (f.cat == "pebble-wal" || f.cat == vfs.WriteCategoryUnspecified || f.cat == "") {
+	if err == nil && isDBWALPath(f.label) && (f.cat == "pebble-wal" || f.cat == vfs.WriteCategoryUnspecified || f.cat == "") {
 		f.fs.walWrites++
 		if f.fs.walCond != nil {
 			f.fs.walCond.Broadcast()
 		}
 	}
+	f.fs.mu.Unlock()
 	return n, err
 }
 
 func (f *recFile) WriteAt(p []byte, off int64) (int, error) {
-	f.fs.mu.Lock()
-	defer f.fs.mu.Unlock()
+	f.mu.Lock()
+	defer f.mu.Unlock()
 
 	if f.closed {
 		return 0, os.ErrClosed
@@ -138,13 +146,21 @@ func (f *recFile) WriteAt(p []byte, off int64) (int, error) {
 		err = io.ErrShortWrite
 		event.Err = err.Error()
 	}
+	f.fs.mu.Lock()
 	f.fs.appendEventLocked(event)
+	if err == nil && isDBWALPath(f.label) && (f.cat == "pebble-wal" || f.cat == vfs.WriteCategoryUnspecified || f.cat == "") {
+		f.fs.walWrites++
+		if f.fs.walCond != nil {
+			f.fs.walCond.Broadcast()
+		}
+	}
+	f.fs.mu.Unlock()
 	return n, err
 }
 
 func (f *recFile) Sync() error {
-	f.fs.mu.Lock()
-	defer f.fs.mu.Unlock()
+	f.mu.Lock()
+	defer f.mu.Unlock()
 
 	if f.closed {
 		return os.ErrClosed
@@ -160,17 +176,19 @@ func (f *recFile) Sync() error {
 	if err != nil {
 		event.Err = err.Error()
 	}
+	f.fs.mu.Lock()
 	if !f.isDir && event.Err == "" {
 		f.fs.appendSyncEventLocked(event)
 	} else {
 		f.fs.appendEventLocked(event)
 	}
+	f.fs.mu.Unlock()
 	return err
 }
 
 func (f *recFile) SyncData() error {
-	f.fs.mu.Lock()
-	defer f.fs.mu.Unlock()
+	f.mu.Lock()
+	defer f.mu.Unlock()
 
 	if f.closed {
 		return os.ErrClosed
@@ -186,17 +204,19 @@ func (f *recFile) SyncData() error {
 	if err != nil {
 		event.Err = err.Error()
 	}
+	f.fs.mu.Lock()
 	if !f.isDir && event.Err == "" {
 		f.fs.appendSyncEventLocked(event)
 	} else {
 		f.fs.appendEventLocked(event)
 	}
+	f.fs.mu.Unlock()
 	return err
 }
 
 func (f *recFile) SyncTo(length int64) (bool, error) {
-	f.fs.mu.Lock()
-	defer f.fs.mu.Unlock()
+	f.mu.Lock()
+	defer f.mu.Unlock()
 
 	if f.closed {
 		return false, os.ErrClosed
@@ -214,17 +234,20 @@ func (f *recFile) SyncTo(length int64) (bool, error) {
 	if err != nil {
 		event.Err = err.Error()
 	}
+	f.fs.mu.Lock()
 	if !f.isDir && event.Err == "" {
 		f.fs.appendSyncEventLocked(event)
 	} else {
 		f.fs.appendEventLocked(event)
 	}
+	f.fs.mu.Unlock()
 	return fullSync, err
 }
 
 func (f *recFile) ReadAt(p []byte, off int64) (int, error) {
-	f.fs.mu.Lock()
-	defer f.fs.mu.Unlock()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	if f.closed {
 		return 0, os.ErrClosed
 	}
@@ -232,8 +255,9 @@ func (f *recFile) ReadAt(p []byte, off int64) (int, error) {
 }
 
 func (f *recFile) Stat() (vfs.FileInfo, error) {
-	f.fs.mu.Lock()
-	defer f.fs.mu.Unlock()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	if f.closed {
 		return nil, os.ErrClosed
 	}
@@ -241,17 +265,33 @@ func (f *recFile) Stat() (vfs.FileInfo, error) {
 }
 
 func (f *recFile) Preallocate(offset, length int64) error {
-	f.fs.mu.Lock()
-	defer f.fs.mu.Unlock()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	if f.closed {
 		return os.ErrClosed
 	}
-	return f.inner.Preallocate(offset, length)
+	err := f.inner.Preallocate(offset, length)
+	event := trace.Event{
+		Kind:   trace.KindPreallocate,
+		File:   f.label,
+		Handle: f.handle,
+		Off:    offset,
+		Size:   length,
+	}
+	if err != nil {
+		event.Err = err.Error()
+	}
+	f.fs.mu.Lock()
+	f.fs.appendEventLocked(event)
+	f.fs.mu.Unlock()
+	return err
 }
 
 func (f *recFile) Prefetch(offset, length int64) error {
-	f.fs.mu.Lock()
-	defer f.fs.mu.Unlock()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	if f.closed {
 		return os.ErrClosed
 	}
@@ -259,8 +299,9 @@ func (f *recFile) Prefetch(offset, length int64) error {
 }
 
 func (f *recFile) Fd() uintptr {
-	f.fs.mu.Lock()
-	defer f.fs.mu.Unlock()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	if f.closed || f.inner == nil {
 		return 0
 	}

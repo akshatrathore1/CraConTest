@@ -43,3 +43,13 @@ func (fs *FS) SetPendingManifestDeletionsForTesting(n int) {
 	defer fs.mu.Unlock()
 	fs.pendingManifestDeletions = n
 }
+
+// CurGoroutineIDForTesting returns curGoroutineID().
+func CurGoroutineIDForTesting() uint64 {
+	return curGoroutineID()
+}
+
+// ParseGoroutineIDForTesting parses a goroutine ID from a stack string.
+func ParseGoroutineIDForTesting(s string) uint64 {
+	return parseGoroutineID(s)
+}

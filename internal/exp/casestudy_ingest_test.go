@@ -310,7 +310,8 @@ func validateCaseStudyIngestCSVs(t *testing.T, perSeedPath, summaryPath string) 
 	for _, row := range rows2[1:] {
 		fid := row[0]
 		strat := row[1]
-		if fid == "BARRIER-INGEST" {
+		switch fid {
+		case "BARRIER-INGEST":
 			if len(strat) == 0 {
 				t.Errorf("BARRIER-INGEST has empty strategy")
 			}
@@ -320,7 +321,7 @@ func validateCaseStudyIngestCSVs(t *testing.T, perSeedPath, summaryPath string) 
 			if row[5] != "0.00" {
 				t.Errorf("BARRIER-INGEST strategy %s expected k1_failure_mean == 0.00, got %s", strat, row[5])
 			}
-		} else if fid == "MUT-0" {
+		case "MUT-0":
 			if strat == "Durability-Contract Guided (DCG)" {
 				k1Med, _ := strconv.ParseFloat(row[2], 64)
 				if k1Med <= 0 {
@@ -426,6 +427,7 @@ func TestCaseStudyIngestBenchmark(t *testing.T) {
 				},
 				Policies:        []int{0, 100},
 				SafeOpenTimeout: 3 * time.Second,
+				// B0PercentileCnt is set to 50 (vs DefaultB0PercentileCnt=100) to keep 32-seed test runtime manageable.
 				B0PercentileCnt: 50,
 				Budgets:         []int{0, 1, 5, 10, 25},
 			}

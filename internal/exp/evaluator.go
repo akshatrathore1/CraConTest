@@ -108,6 +108,9 @@ func ValidateTable(universe []candidate.Candidate, outcomes []oracle.Outcome) er
 
 		case oracle.ClassPanic, oracle.ClassHang:
 			// Non-violation recovery failures.
+			if o.Signature != "" && !strings.HasPrefix(o.Signature, "v1:") {
+				return fmt.Errorf("exp: %s outcome for candidate %+v signature %q missing v1: prefix", o.Class, o.Candidate, o.Signature)
+			}
 
 		case oracle.ClassOracleError:
 			return fmt.Errorf("exp: oracle_error encountered for candidate %+v: %s", o.Candidate, o.Detail)
@@ -125,8 +128,9 @@ func ValidateTable(universe []candidate.Candidate, outcomes []oracle.Outcome) er
 // - Budgets must be unique, nonnegative, <= len(universe), and strictly increasing.
 // - ranking must be a valid permutation of universe without duplicates or foreign candidates.
 // - Failures counts violations, open_errors, panics, and hangs.
-// - DistinctBugs counts unique nonempty signatures of violation and open_error outcomes.
+// - DistinctBugs counts unique nonempty signatures of violation, open_error, panic, and hang outcomes.
 func Evaluate(universe, ranking []candidate.Candidate, outcomes []oracle.Outcome, budgets []int) ([]Point, error) {
+	outcomes = NormalizeTable(outcomes)
 	if err := ValidateTable(universe, outcomes); err != nil {
 		return nil, fmt.Errorf("evaluate: %w", err)
 	}
@@ -170,12 +174,11 @@ func Evaluate(universe, ranking []candidate.Candidate, outcomes []oracle.Outcome
 	}
 
 	points := make([]Point, 0, len(budgets))
+	failures := 0
+	seenBugs := make(map[string]bool)
+	prevB := 0
 	for _, b := range budgets {
-		failures := 0
-		seenBugs := make(map[string]bool)
-
-		prefix := ranking[:b]
-		for _, c := range prefix {
+		for _, c := range ranking[prevB:b] {
 			o := outcomeMap[c]
 			switch o.Class {
 			case oracle.ClassViolation:
@@ -188,12 +191,27 @@ func Evaluate(universe, ranking []candidate.Candidate, outcomes []oracle.Outcome
 				if o.Signature != "" && !seenBugs[o.Signature] {
 					seenBugs[o.Signature] = true
 				}
-			case oracle.ClassPanic, oracle.ClassHang:
+			case oracle.ClassPanic:
 				failures++
+				if o.Signature != "" && !seenBugs[o.Signature] {
+					seenBugs[o.Signature] = true
+				}
+			case oracle.ClassHang:
+				failures++
+				sig := o.Signature
+				if sig == "" && o.Detail != "" {
+					sig = FormatHangSignature(o.Detail)
+				} else if sig == "" {
+					sig = "v1:hang:timeout"
+				}
+				if !seenBugs[sig] {
+					seenBugs[sig] = true
+				}
 			case oracle.ClassValid:
 				// no failure
 			}
 		}
+		prevB = b
 
 		points = append(points, Point{
 			Budget:       b,
@@ -209,9 +227,7 @@ func Evaluate(universe, ranking []candidate.Candidate, outcomes []oracle.Outcome
 // NormalizeOpenErrorReason maps an error message or detail string to a stable normalized reason tag.
 func NormalizeOpenErrorReason(detail string) string {
 	s := strings.TrimSpace(detail)
-	if strings.HasPrefix(s, "v1:open_error:") {
-		s = strings.TrimPrefix(s, "v1:open_error:")
-	}
+	s = strings.TrimPrefix(s, "v1:open_error:")
 	lower := strings.ToLower(s)
 	switch {
 	case strings.Contains(lower, "not exist") || strings.Contains(lower, "no such file"):
@@ -263,10 +279,39 @@ func FormatOpenErrorSignature(reason string) string {
 	return fmt.Sprintf("v1:open_error:%s", norm)
 }
 
-// NormalizeOutcome ensures that an outcome with ClassOpenError has a deterministic,
-// normalized signature v1:open_error:<reason>.
+// FormatPanicSignature constructs a deterministic, normalized signature v1:panic:<reason>.
+func FormatPanicSignature(reason string) string {
+	if strings.HasPrefix(reason, "v1:panic:") {
+		return reason
+	}
+	s := strings.TrimSpace(reason)
+	s = strings.TrimPrefix(s, "v1:panic:")
+	norm := digitRuns.ReplaceAllString(s, "N")
+	if norm == "" {
+		norm = "unknown"
+	}
+	return fmt.Sprintf("v1:panic:%s", norm)
+}
+
+// FormatHangSignature constructs a deterministic, normalized signature v1:hang:<reason>.
+func FormatHangSignature(reason string) string {
+	if strings.HasPrefix(reason, "v1:hang:") {
+		return reason
+	}
+	s := strings.TrimSpace(reason)
+	s = strings.TrimPrefix(s, "v1:hang:")
+	norm := digitRuns.ReplaceAllString(s, "N")
+	if norm == "" {
+		norm = "timeout"
+	}
+	return fmt.Sprintf("v1:hang:%s", norm)
+}
+
+// NormalizeOutcome ensures that an outcome with ClassOpenError, ClassPanic, or ClassHang has a deterministic,
+// normalized signature.
 func NormalizeOutcome(o oracle.Outcome) oracle.Outcome {
-	if o.Class == oracle.ClassOpenError {
+	switch o.Class {
+	case oracle.ClassOpenError:
 		if o.Signature == "" {
 			reason := o.Detail
 			if reason == "" {
@@ -276,11 +321,31 @@ func NormalizeOutcome(o oracle.Outcome) oracle.Outcome {
 		} else if !strings.HasPrefix(o.Signature, "v1:") {
 			o.Signature = FormatOpenErrorSignature(o.Signature)
 		}
+	case oracle.ClassPanic:
+		if o.Signature == "" {
+			reason := o.Detail
+			if reason == "" {
+				reason = "unknown"
+			}
+			o.Signature = FormatPanicSignature(reason)
+		} else if !strings.HasPrefix(o.Signature, "v1:") {
+			o.Signature = FormatPanicSignature(o.Signature)
+		}
+	case oracle.ClassHang:
+		if o.Signature == "" {
+			reason := o.Detail
+			if reason == "" {
+				reason = "timeout"
+			}
+			o.Signature = FormatHangSignature(reason)
+		} else if !strings.HasPrefix(o.Signature, "v1:") {
+			o.Signature = FormatHangSignature(o.Signature)
+		}
 	}
 	return o
 }
 
-// NormalizeTable returns a copy of outcomes with all ClassOpenError outcomes normalized.
+// NormalizeTable returns a copy of outcomes with all ClassOpenError/ClassPanic outcomes normalized.
 func NormalizeTable(outcomes []oracle.Outcome) []oracle.Outcome {
 	res := make([]oracle.Outcome, len(outcomes))
 	for i, o := range outcomes {
@@ -293,6 +358,7 @@ func NormalizeTable(outcomes []oracle.Outcome) []oracle.Outcome {
 // including FirstFailure (1-based index of first non-valid candidate) and
 // FirstViolation (1-based index of first ClassViolation candidate).
 func TabulateSummary(universe, ranking []candidate.Candidate, outcomes []oracle.Outcome) (Summary, error) {
+	outcomes = NormalizeTable(outcomes)
 	if err := ValidateTable(universe, outcomes); err != nil {
 		return Summary{}, fmt.Errorf("tabulate summary: %w", err)
 	}
@@ -366,6 +432,13 @@ func TabulateSummary(universe, ranking []candidate.Candidate, outcomes []oracle.
 			}
 			s.Failures++
 			s.Panics++
+			sig := o.Signature
+			if sig == "" && o.Detail != "" {
+				sig = FormatPanicSignature(o.Detail)
+			}
+			if sig != "" && !seenBugs[sig] {
+				seenBugs[sig] = true
+			}
 
 		case oracle.ClassHang:
 			if s.FirstFailure == 0 {
@@ -373,6 +446,15 @@ func TabulateSummary(universe, ranking []candidate.Candidate, outcomes []oracle.
 			}
 			s.Failures++
 			s.Hangs++
+			sig := o.Signature
+			if sig == "" && o.Detail != "" {
+				sig = FormatHangSignature(o.Detail)
+			} else if sig == "" {
+				sig = "v1:hang:timeout"
+			}
+			if !seenBugs[sig] {
+				seenBugs[sig] = true
+			}
 		}
 	}
 
@@ -460,6 +542,9 @@ func DecodeOutcomes(reader io.Reader) ([]oracle.Outcome, error) {
 				return nil, fmt.Errorf("decode outcomes: open_error signature missing v1: prefix: %s", o.Signature)
 			}
 		case oracle.ClassPanic, oracle.ClassHang:
+			if o.Signature != "" && !strings.HasPrefix(o.Signature, "v1:") {
+				return nil, fmt.Errorf("decode outcomes: %s signature missing v1: prefix: %s", o.Class, o.Signature)
+			}
 		case oracle.ClassOracleError:
 			return nil, fmt.Errorf("decode outcomes: oracle_error encountered: %s", o.Detail)
 		default:

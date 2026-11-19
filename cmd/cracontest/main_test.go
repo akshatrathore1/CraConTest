@@ -143,6 +143,7 @@ func TestCLIBenchmarkCommand(t *testing.T) {
 	tempDir := t.TempDir()
 	repPath := filepath.Join(tempDir, "report_empirical.md")
 	csvPath := filepath.Join(tempDir, "summary.csv")
+	perSeedPath := filepath.Join(tempDir, "per_seed.csv")
 
 	err := runBenchmarkCmd([]string{
 		"-seeds", "42",
@@ -150,6 +151,7 @@ func TestCLIBenchmarkCommand(t *testing.T) {
 		"-ops", "30",
 		"-report", repPath,
 		"-csv", csvPath,
+		"-per-seed-csv", perSeedPath,
 		"-control=false",
 	})
 	if err != nil {
@@ -161,6 +163,9 @@ func TestCLIBenchmarkCommand(t *testing.T) {
 	}
 	if _, err := os.Stat(csvPath); err != nil {
 		t.Errorf("expected summary csv at %s, stat failed: %v", csvPath, err)
+	}
+	if _, err := os.Stat(perSeedPath); err != nil {
+		t.Errorf("expected per-seed csv at %s, stat failed: %v", perSeedPath, err)
 	}
 }
 
@@ -216,6 +221,7 @@ func TestCLIBenchmarkWithPoliciesAndManifestSize(t *testing.T) {
 		"-max-manifest-size", "1048576",
 		"-report", repPath,
 		"-csv", csvPath,
+		"-per-seed-csv", "none",
 		"-control=false",
 	})
 	if err != nil {
@@ -230,5 +236,29 @@ func TestCLIBenchmarkWithPoliciesAndManifestSize(t *testing.T) {
 	})
 	if err == nil {
 		t.Errorf("expected error for invalid benchmark -policies, got nil")
+	}
+}
+
+func TestCLIRecordWithSeedAndDropKFlags(t *testing.T) {
+	tempDir := t.TempDir()
+	runDir := filepath.Join(tempDir, "record_seed_run")
+	smokeConfig := filepath.Join("..", "..", "experiments", "configs", "smoke.json")
+
+	err := runRecord([]string{
+		"-spec", smokeConfig,
+		"-out", runDir,
+		"-fault", "MUT-5",
+		"-seed", "123",
+		"-wal-drop-k", "1",
+		"-dir-drop-k", "1",
+	})
+	if err != nil {
+		t.Fatalf("runRecord with seed and drop-k flags failed: %v", err)
+	}
+
+	for _, fname := range []string{"run.json", "trace.json", "history.json"} {
+		if _, err := os.Stat(filepath.Join(runDir, fname)); err != nil {
+			t.Errorf("expected %s after record, but stat failed: %v", fname, err)
+		}
 	}
 }

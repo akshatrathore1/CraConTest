@@ -31,7 +31,7 @@ CraConTest treats crash-consistency testing as an explicit resource-bounded sear
    - **R2 (State-Representative Random):** Partitions 0%-retention candidates into canonical `StateKey` equivalence classes, selecting boundary-adjacent representatives within each `StateKey` class using graph features (`BeforeBoundary`, `BarrierProximity`, and canonical order `candidate.Less`) before shuffling classes, and tests redundant cutoffs afterward.
    - **RHG / B7 (Reachability-Hazard Guided):** Ranks 0%-retention state representatives by uncommitted hazard reachability, barrier proximity, and semantic tier.
    - **DCG / B8 (Durability-Contract Guided) & DCG-FlagOnly (Ablation):** Trace-derived durability-contract analysis that prioritizes 0%-retention state representatives that exhibit structural POSIX durability-contract violations (`ContractScore > 0`) ahead of unflagged representatives, alongside a randomized flag-only ablation (`DCG-FlagOnly`) that isolates the effect of the contract indicators (POSIX durability-contract priors instantiated for Pebble). DCG-FlagOnly ties full DCG on nearly every setting, showing that the binary durability-contract flags combined with StateKey equivalence partitioning drive the speedup.
-   - **DCG-PR (Durability-Contract Guided with Partial-Retention Prior):** A post-hoc variant of DCG that inspects `ContractFeatures.UnsyncedDirEntryCount` and promotes 50%-retention candidates (with ≥ 2 unsynced directory entries coexisting in the same parent) into Tier 1, ahead of the standard 0%-retention sweep. Achieves median $k_1 = 1.00$ on all 12 testable in-contract holdout fault settings and median $k_1 = \mathbf{2.00}$ on Pebble `#5825` and median $k_1 = \mathbf{3.00}$ on checkpoint commit `15b500fb`.
+   - **DCG-PR (Durability-Contract Guided with Partial-Retention Prior):** A post-hoc variant of DCG that inspects `ContractFeatures.UnsyncedDirEntryCount` and promotes 50%-retention candidates (with ≥ 2 unsynced directory entries coexisting in the same parent) into Tier 1, ahead of the standard 0%-retention sweep. Achieves median $k_1 = 1.00$ on all 12 testable in-contract holdout fault settings, $k_1 = \mathbf{2.00}$ on Pebble issue `#5825`, and $k_1 = \mathbf{3.00}$ on the checkpoint race later fixed upstream by `15b500fb`.
 
 4. **Strict Ground-Truth Crash Oracle (`oracle`):**
    - Evaluates recovered database states against an append-only mutation history ledger (`history`).
@@ -82,7 +82,7 @@ See [docs/architecture.md](docs/architecture.md) for full architectural details.
 ├── internal/
 │   ├── candidate/           # Crash candidate universe and serialization
 │   ├── exp/                 # Exploration runner, offline evaluator, and benchmark runner
-│   ├── faults/              # Seeded durability faults (MUT-0 to MUT-9)
+│   ├── faults/              # Durability fault and barrier suite (MUT-0..9, holdouts MUT-X1..X6, BARRIER-5825, BARRIER-CKPT)
 │   ├── graph/               # Persistence DAG, state view, and durability-contract features
 │   ├── history/             # Mutation history tracking
 │   ├── oracle/              # Crash consistency validation oracle
@@ -100,7 +100,7 @@ See [docs/architecture.md](docs/architecture.md) for full architectural details.
 │   ├── holdout_per_seed.csv           # Per-seed holdout metrics
 │   ├── casestudy_pebble5825_summary.csv # Pebble #5825 A/B benchmark summary
 │   ├── casestudy_pebble5825_per_seed.csv
-│   ├── casestudy_checkpoint_summary.csv # Checkpoint 15b500fb A/B benchmark summary
+│   ├── casestudy_checkpoint_summary.csv # Checkpoint directory-race benchmark summary
 │   ├── casestudy_checkpoint_per_seed.csv
 │   ├── casestudy_ingest_summary.csv     # Direct L0 Ingest 32-seed A/B benchmark summary
 │   ├── casestudy_ingest_per_seed.csv
@@ -120,6 +120,7 @@ See [docs/architecture.md](docs/architecture.md) for full architectural details.
 ### Prerequisites
 
 - Go 1.27+ (`go.mod` specifies Go 1.27.1).
+- Python 3.10+ (for statistical analysis in `analysis/paired_stats.py`; compatible with NumPy ≥ 1.22.0 and SciPy ≥ 1.11.0, tested up to Python 3.15).
 - OS: Linux (Ubuntu/ext4) or Windows (NTFS). On Windows, build with `CGO_ENABLED=0`.
 
 ### Building the CLI
@@ -151,7 +152,7 @@ experiment uses `experiments/configs/main.json`; see [docs/reproduce.md](docs/re
 
 ### Running the Multi-Seed Benchmark
 
-Run the full 32-seed benchmark across all fault models (`MUT-0` through `MUT-9`):
+Run the full 32-seed benchmark across all fault models (`MUT-0` through `MUT-9`, holdouts `MUT-X1` through `MUT-X6`, and barrier controls):
 
 ```bash
 ./cracontest benchmark -report docs/benchmark-report.md -csv results/benchmark_summary.csv -per-seed-csv results/benchmark_per_seed.csv
@@ -171,7 +172,7 @@ The experimental evaluation comprises both single-seed 1,000-operation runs and 
 
 ### 1. Oracle Soundness (MUT-0)
 
-Across all 2,150 candidates of the 1,000-operation main run, all 302 candidates of the 100-operation smoke run, and all 32 workload seeds of the multi-seed benchmark (>11,000 evaluated crash states), zero false alarms were observed on unfaulted runs (`MUT-0`). Every crash candidate recovered to a state that strictly satisfied the durability prefix and atomicity invariants, with 0 false alarms across all 32 seeds at 0%/100% retention. Confirmed also across a 108-run Multi-Shape Null-Control suite spanning 12 workload geometries (>50,000 evaluated crash states, 0.00% false-alarm rate). We note explicitly that this 0.00% false-alarm rate is scoped strictly to non-ingest workloads evaluated under endpoint (0%/100%) retention; enabling `db.Ingest` under the global prefix oracle or enabling 50% partial retention surfaces cross-channel prefix divergence and `atomicfs` directory races.
+Across all 2,150 candidates of the 1,000-operation main run, all 302 candidates of the 100-operation smoke run, and all 32 workload seeds of the multi-seed benchmark (>11,000 evaluated crash states), no failures were observed on unfaulted runs (`MUT-0`) at 0%/100% retention. The 108-run multi-shape null control likewise produced no failures over 12 workload shapes and >50,000 crash states. These are descriptive results for the evaluated non-ingest workloads and endpoint policies, not a population-level false-alarm guarantee; `db.Ingest` and 50% partial retention expose additional mechanisms discussed below.
 
 ### 2. Why Naive Topological Reachability (B4) Underperforms Random on Dense Faults (MUT-1 to MUT-4)
 
@@ -181,7 +182,7 @@ On dense faults where every barrier of a class is suppressed (28%–50% failure 
 
 ### 3. State-Equivalence Sampling (R2) vs. Durability-Contract Priors (DCG) Across Dense and Sparse Faults (32-Seed Benchmark, MUT-0 to MUT-9)
 
-To evaluate ranking strategies across both dense and sparse failure distributions, we ran a 32-seed benchmark across 10 fault models (`MUT-0` through `MUT-9`), evaluating over 11,000 crash states. Candidate universes are identical across all ranking strategies within each `(seed, fault)` execution, but universe sizes vary across fault models because `faults.FS` drops specific sync barriers prior to VFS trace recording. Note that `R2` (`State-Representative Random`) is CraConTest's internal `StateKey` equivalence-class baseline—**not** a re-implementation of Pathfinder's full C++/LLVM syscall-function subgraph isomorphism and DPOR model checker—so comparisons against `R2` measure the intra-framework gain of adding POSIX durability-contract priors onto `StateKey` partitioning rather than a head-to-head comparison against the Pathfinder tool. Because `DCG`'s 0%-retention indicators inspect the VFS trace for missing `Sync`/`SyncData` barriers after client acknowledgment or metadata updates, achieving $k_1 = 1.00$ on synthetic sync-omission faults reflects exact alignment between trace-level durability-contract checking and sync-omission fault injection combined with `StateKey` equivalence deduplication.
+To evaluate ranking strategies across both dense and sparse failure distributions, we ran a 32-seed benchmark across 10 fault models (`MUT-0` through `MUT-9`), evaluating over 11,000 crash states. Candidate universes are identical across all ranking strategies within each `(seed, fault)` execution, but universe sizes vary across fault models because `faults.FS` drops specific sync barriers prior to VFS trace recording. `R2` (`State-Representative Random`) is CraConTest's internal `StateKey` equivalence-class baseline—not a re-implementation of Pathfinder's full C++/LLVM syscall-function subgraph isomorphism and DPOR model checker—so comparisons against `R2` measure an intra-framework difference. DCG's indicators inspect the same missing barriers targeted by the synthetic sync-omission faults; $k_1 = 1.00$ on those faults therefore reflects by-construction alignment plus `StateKey` deduplication, and should not be interpreted as fault-class-independent prediction.
 
 #### Table 1: Cost-to-First-Failure ($k_1$ Mean [95% CI])
 
@@ -215,7 +216,7 @@ To evaluate ranking strategies across both dense and sparse failure distribution
 #### Analysis
 
 1. **POSIX Durability-Contract Priors Across Inode Data and Parent-Directory Entries:**
-   Under POSIX filesystem semantics, ensuring durable file persistence after crash requires two conditions: (1) flushing dirty file data (`fsync` / `fdatasync`), and (2) flushing the parent directory entry (`fsync(parentDir)`) after file creation, renaming, hard-linking, or directory creation (`Create`, `ReuseForWrite`, `Rename`, `Link`, `MkdirAll`). If a file is written and its data synced, but its parent directory entry remains unsynced, a crash at 0% retention causes the directory entry to vanish, resulting in lost files upon recovery. CraConTest implements universal POSIX durability priors without engine-specific heuristics: tracking `parentDir` and `dirEntrySynced` for every filesystem node, enforcing that durability holds if and only if `dirtyBytes == 0 && dirEntrySynced == true`, and scoping directory sync events strictly to the target directory path. MUT-9 is dense (41.4% density) at $k=1$ (initial directory sync) and sparse (0.8%–12.4%) at $k \in \{7, 9, 10, 12\}$ (flush/compaction directory syncs); directory-entry tracking was added after inspecting MUT-9, so MUT-9 evaluates parameterized $k$-generalization within the directory-sync family. On MUT-9 ($k=1$), DCG identifies the uncommitted directory entry prior, expanding state coverage to $S_{100} = 27.00$ (vs B0's $9.83$, a 2.7x expansion) and $S_{25} = 25.00$ (vs B0's $3.03$, an 8.2x early-budget advantage).
+   Under the project's POSIX VFS model, durable file persistence requires flushing dirty file data and, after namespace mutation, the parent directory entry. CraConTest instantiates these priors for Pebble's recorded VFS categories by tracking `parentDir`, `dirEntrySynced`, dirty byte spans, and directory-scoped sync events. MUT-9 is dense (41.4% density) at $k=1$ and sparse (0.8%–12.4%) at $k \in \{7, 9, 10, 12\}$; directory-entry tracking was added after inspecting MUT-9, so these settings evaluate within-family parameter changes rather than a wholly unseen durability mechanism.
 
 2. **Component Attribution & DCG-FlagOnly Ablation:**
    Comparing full DCG against the **DCG-FlagOnly** ablation isolates the exact contribution of each mechanism:
@@ -231,46 +232,46 @@ To evaluate ranking strategies across both dense and sparse failure distribution
 The parameterized $k$-index (`MUT-X1..X3`), stochastic probability-$p$ (`MUT-X4..X5`), and out-of-contract silent write-loss (`MUT-X6`) fault families were committed to `internal/faults/faults.go` on `2026-11-01` (`c67a44a`, prior to tag `v1.0-dcg-pr-freeze`) to evaluate whether the four binary POSIX durability-contract flags generalize across arbitrary sync-drop indices $k$ and drop probabilities $p$ without re-tuning (`287 wins / 0 losses / 43 ties` vs. `R2`, Holm $p \le 0.002$).
 
 Subsequently, `internal/strategy/dcg.go` and `internal/graph/features.go` were frozen at Git tag **`v1.0-dcg-pr-freeze` (`67bbe7d`)**, following the development and calibration of the partial-retention prior `DCG-PR` on Pebble `#5825` (§5.1). **Three strictly post-freeze evaluations** were designed and executed with 0 bytes of modification to the ranking or feature code:
-1. **Post-Freeze Evaluation 1 (Intra-Class Subsystem Transfer — Checkpoint `15b500fb`, §5.2)**: Evaluated across 32 seeds (`MUT-0` vs. path-pattern barrier control `BARRIER-CKPT`).
+1. **Post-Freeze Evaluation 1 (Intra-Class Subsystem Transfer — checkpoint race later fixed by `15b500fb`, §5.2)**: Evaluated across 32 seeds (`MUT-0` vs. `BARRIER-CKPT`).
 2. **Post-Freeze Evaluation 2 (Cross-Channel Ordering — Direct L0 `db.Ingest` Cross-Channel Commit-Order Hole, §5.3)**: Evaluated across 32 seeds (`MUT-0` vs. path-pattern barrier control `BARRIER-INGEST`).
 3. **Post-Freeze Holdout 3 (Multi-Distribution Workload Suite, §8)**: 5 workload presets evaluated across 16 seeds and 4 fault models.
 
 Across all 12 testable in-contract holdout settings (`MUT-X1..X5`), `DCG`/`DCG-PR` achieves median $k_1 = 1.00$, winning 287/287 non-tied comparisons against `R2` (0 losses, Holm-adjusted sign-test $p \le 0.002$, mean speedup $2.0\times$–$19.9\times$ across 100-shuffle means ($2.2\times$–$19.1\times$ on single-seed rankings)). On the 3 out-of-contract settings (`MUT-X6`), performance degrades gracefully to the `R2` baseline (Holm-adjusted $p = 1.0$, not significant) — confirming the contract boundary is correctly defined.
 
-### 5. Storage Engine Case Studies (Pebble #5825, Checkpoint 15b500fb & Direct L0 Ingest)
+### 5. Storage Engine Case Studies (Pebble #5825, Checkpoint Directory Race & Direct L0 Ingest)
 
-CraConTest has been evaluated across two real-world directory-sync crash bugs (#5825 and Checkpoint 15b500fb) and one cross-channel commit-order prefix divergence (Direct L0 db.Ingest) in CockroachDB's Pebble v2.1.7:
+CraConTest has been evaluated across two directory-sync crash bugs in Pebble v2.1.7 (issue #5825 and the checkpoint race later fixed by `15b500fb`) and one cross-channel commit-order prefix divergence in Direct L0 `db.Ingest`:
 
 1. **Pebble #5825 (Manifest Rotation / Multi-Entry Directory Race) & `BARRIER-5825`:**
    - Under 50% partial retention during manifest rotation, an unsynced directory entry for the new `MANIFEST-XXXXXX` file coexists with an unsynced removal of the old manifest, resulting in 58 failures across 25 of 32 failing seeds under unpatched `MUT-0` (deterministic partial-retention sampler).
-   - Causal barrier control `BARRIER-5825` injects a parent directory sync immediately following manifest rotation, eliminating all failures (0/32 seeds).
+   - The `BARRIER-5825` intervention adds a parent-directory sync before marker creation; no failures are observed across the 32 evaluated seeds.
    - Pre-frozen `DCG-PR` promotes candidates with coexisting unsynced directory entries (`UnsyncedDirEntryCount >= 2`), discovering the bug at median $k_1 = \mathbf{2.00}$ (mean $12.40$, $S_{25} = 1.44$, $S_{100} = 1.44$) vs $211.00$ for 0%-first `DCG` (mean $301.60$) and $148.00$ for `B0` (mean $180.74$).
 
-2. **Pebble Checkpoint Commit `15b500fb` (Checkpoint Directory Sync) & `BARRIER-CKPT`:**
+2. **Pebble Checkpoint Directory Race & `BARRIER-CKPT`:**
    - In Pebble's checkpoint subsystem, during `db.Checkpoint(destDir)`, Pebble creates hard-linked SSTables, `MANIFEST`, and `marker.manifest.*` inside `destDir` before calling the directory sync inside `manifestMarker.Move` (`checkpoint.go:596`). When a crash occurs *inside that multi-entry window prior to `dirFD.Sync()`* under 50% partial retention, `marker.manifest.*` can survive while the newly created `MANIFEST-*` or hard-linked `.sst` entry in the same directory is dropped, causing reopening to fail with `open_error` (58 failures across 30 of 32 seeds under `MUT-0`).
    - Case Study 2 belongs to the same structural bug class as Case Study 1 (`#5825`) (multi-entry directory races in Pebble's `atomicfs` marker protocol), evaluating **intra-class subsystem transfer** of `dcg-pr` (from manifest rotation in `"db/"` to `db.Checkpoint` in `"checkpoint/"`), not generalization to an unseen bug class.
-   - Causal barrier control `BARRIER-CKPT` (`internal/faults/faults.go:602-625`) forces destination directory synchronization across both `"db/"` and `"checkpoint/"`, reducing checkpoint recovery failures to strictly 0 across all 32 seeds.
+   - The `BARRIER-CKPT` intervention (`internal/faults/faults.go:602-625`) adds destination-directory synchronization; no checkpoint recovery failures are observed across the 32 evaluated seeds.
    - Evaluated post-freeze on pre-frozen `DCG-PR` (intra-class subsystem transfer within Pebble's atomicfs marker protocol; because BARRIER-CKPT and dcg-pr share the same directory-entry mechanism as #5825, this tests subsystem transfer rather than a blind unseen bug class), `DCG-PR` discovers the first failure at median $k_1 = \mathbf{3.00}$ (mean $140.03$) vs $386.50$ for 0%-first `DCG` (mean $319.20$), $328.40$ for `R2` (mean $336.53$), and $172.00$ for `B0` (mean $190.73$).
 
 3. **Direct L0 `db.Ingest` Cross-Channel Prefix Hole & `BARRIER-INGEST`:**
    - When external SSTables do not overlap active memtables, Pebble bypasses the WAL (`asFlushable = false`), allocating sequence number $s_2 > s_1$ and committing via `MANIFEST` sync (`vs.manifestFile.Sync()`) while earlier un-synced WAL writes at $s_1$ remain unpersisted. Upon a 0%-retention crash, $s_2$ survives via `MANIFEST` while $s_1 < s_2$ is discarded from the unsynced WAL. Under endpoint (`0%/100%`) retention, **22 of 32 seeds** exhibit prefix violations (276 total failures; seeds `3, 5, 7, 8, 9, 16, 20, 23, 26, 29` have 0 failures because randomly generated ingest keys overlapped the active memtable and took the `asFlushable = true` branch, which synchronously flushes the WAL via `commit.directWrite` at `commit.go:289`).
    - RocksDB's `db.h` notes that `IngestExternalFile` does not imply `FlushWAL(true)`, and under a per-operation synced-only durability oracle (which permits individual unacknowledged NoSync writes to be lost independently), dropping $s_1$ while retaining $s_2$ is permissible. Direct L0 `db.Ingest` is an **undocumented cross-channel ordering behavior between unsynced `NoSync` WAL writes and synced `MANIFEST` ingests under a global prefix ("no-hole") oracle (not a loss of synced data and not reported upstream as a Pebble bug, as Pebble's contract guarantees durability only for synced operations)**.
-   - Causal remedy `BARRIER-INGEST` (`db.LogData(nil, pebble.Sync)`) flushes the active WAL before MANIFEST version edit, eliminating prefix violations to strictly 0 across all 32 seeds (**0 of 32 seeds** fail, $S_{25}=0.00, S_{100}=0.00$).
+   - The `BARRIER-INGEST` intervention (`db.LogData(nil, pebble.Sync)`) flushes the active WAL before MANIFEST version edit; no prefix violations are observed across the 32 evaluated seeds ($S_{25}=0.00, S_{100}=0.00$).
    - Pre-frozen `DCG-PR` achieves median $k_1 = \mathbf{9.00}$ (mean $15.32$) and `DCG` achieves $9.00$ (mean $15.32$), compared to $27.88$ (mean $27.64$) for `R2`, $28.60$ (mean $30.61$) for `R1`, $28.18$ (mean $29.88$) for `DCG Flag-Only`, $81.00$ (mean $80.18$) for `sync-boundary`, and $21.50$ (mean $24.73$) for `B0` across 276 total failures on 22 failing seeds.
 
 ### 6. Candidate Universe Scaling (MUT-5, 120..1200 ops) & Multi-Shape Null Control (108 Runs)
 
-As the candidate universe grows from ~338 to ~2,958 states (`MUT-5`, 120–1200 ops/seed), `DCG` maintains $k_1 = 1.00$ (median) with $\le 63.0$ ms planning time, while `R2`, `R1`, and `B0` scale linearly in universe size. Across the 108-run multi-shape null-control suite (>50,000 crash states), the harness exhibits 0 false alarms (Rule-of-Three 95% upper bound $\le 2.78\%$ per run, $\le 0.006\%$ across $>50{,}000$ candidates).
+Across four evaluated workload sizes (`MUT-5`, 120–1,200 operations per seed), candidate universes grow from approximately 338 to 2,958 states while `DCG` retains median and mean $k_1 = 1.00$; measured planning time remains at most 63.0 ms. The baseline discovery positions increase over this range. The 108-run multi-shape null control produces no observed failures over >50,000 crash states, but its fixed workloads and dependent candidates do not support an independent-trial population bound.
 
 ### 7. Pebble Subsystem Audit & Empirical Crash-Consistency Evaluation (MUT-0)
 
-To establish whether uninvestigated Pebble v2.1.7 subsystems performing multi-file and directory-marker mutations exhibit crash-consistency vulnerabilities under unfaulted conditions (`MUT-0`), we conducted an exhaustive source-level audit and empirical discovery campaign across three subsystems:
+To examine selected Pebble v2.1.7 subsystems that perform multi-file and directory-marker mutations under unfaulted conditions (`MUT-0`), we conducted a targeted source audit and empirical discovery campaign across ingestion, format ratcheting, and checkpoints:
 
 1. **Source-Level Audit of Pebble v2.1.7 (`github.com/cockroachdb/pebble/v2`):**
    - **External SSTable Ingestion (`ingest.go`):** In `ingest.go:1490`, `d.objProvider.Sync()` unconditionally syncs `dataDir` prior to sequence number allocation and branching. Direct L0 ingest commits via MANIFEST sync (`vs.manifestFile.Sync()` at `version_set.go:649`) without WAL writes. Flushable ingest commits via synchronous WAL fsync (`commit.directWrite(b)` at `commit.go:289` / `ingest.go:1367`) without MANIFEST writes.
    - **Live Format-Major-Version Ratcheting (`format_major_version.go`):** `RatchetFormatMajorVersion` (`format_major_version.go:436–480`) calls `finalizeFormatVersUpgrade` (`line 486`), which transitions `marker.format-version` via `atomicfs.Marker.Move` (`line 495`). Zero MANIFEST edits are logged; directory sync occurs synchronously inside `Move`.
    - **AtomicFS Marker Dynamics (`vfs/atomicfs/marker.go`):** `Move` executes `Create(new)` -> `f.Close()` -> `Remove(old)` -> `dirFD.Sync()`. Under this project's partial-retention model (`deterministicPartialClone`), which defines a sorted entry-and-4KB-block Bernoulli partial-retention model (whose marginal retention rates are checked in `TestDeterministicPartialCloneStatisticalFidelity`) rather than calling Pebble's `MemFS.CrashClone`, `oldMarker` is retained 100% of the time, and `newMarker` 50% of the time; `LocateMarker` deterministically selects the latest valid iteration index.
-   - **Checkpoint Subsystem Durability (`checkpoint.go`):** Enforces three directory syncs at lines 287 (OPTIONS and format marker), 596 (SSTable hard links, MANIFEST, and manifest marker), and 448 (WAL files), guaranteeing atomic crash consistency.
+   - **Checkpoint Subsystem Durability (`checkpoint.go`):** Performs directory syncs at lines 287 (OPTIONS and format marker), 596 (SSTable hard links, MANIFEST, and manifest marker), and 448 (WAL files). The partial-retention experiments evaluate intermediate states before these barriers complete.
 
 2. **Workload Drivers & CLI Flags:**
    - Extended `internal/workload/workload.go` with `IngestEvery` (staged SSTable ingestion with disjoint key ranges) and `RatchetAt` (live format ratcheting). Exposed flags `-ingest-every` and `-ratchet-at` on CLI `record` and `benchmark`.

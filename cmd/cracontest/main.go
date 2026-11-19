@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
@@ -31,6 +32,30 @@ import (
 	"github.com/cockroachdb/pebble/v2/vfs"
 )
 
+// DefaultPebbleVersion defines the single-source-of-truth fallback Pebble version
+// when dynamic build info is unavailable at runtime.
+const DefaultPebbleVersion = "v2.1.7"
+
+// detectPebbleVersion queries runtime build info to determine the active Pebble module version,
+// falling back to DefaultPebbleVersion if build info is not embedded.
+func detectPebbleVersion() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return DefaultPebbleVersion
+	}
+	for _, dep := range info.Deps {
+		if dep.Path == "github.com/cockroachdb/pebble/v2" || dep.Path == "github.com/cockroachdb/pebble" {
+			if dep.Replace != nil && dep.Replace.Version != "" {
+				return dep.Replace.Version
+			}
+			if dep.Version != "" {
+				return dep.Version
+			}
+		}
+	}
+	return DefaultPebbleVersion
+}
+
 // RunMetadata records complete environment and execution parameters for a run directory.
 type RunMetadata struct {
 	SchemaVersion int             `json:"schema_version"`
@@ -40,6 +65,7 @@ type RunMetadata struct {
 	BaseSeed      uint64          `json:"base_seed"`
 	Policies      []int           `json:"policies"`
 	Workload      workload.Config `json:"workload"`
+	FaultConfig   *faults.Config  `json:"fault_config,omitempty"`
 	PebbleVersion string          `json:"pebble_version"`
 	GoVersion     string          `json:"go_version"`
 	GOOS          string          `json:"goos"`
@@ -110,6 +136,9 @@ func runRecord(args []string) error {
 	ratchetAtFlag := fs.Int("ratchet-at", 0, "ratchet format major version at operation N (0 = disabled)")
 	barrierIngestFlag := fs.Bool("barrier-ingest", false, "execute WAL sync barrier prior to db.Ingest")
 	presetFlag := fs.String("preset", "", "workload diversity preset (ycsb-a, ycsb-b, ycsb-f, overwrite-heavy, delete-heavy)")
+	seedFlag := fs.Uint64("seed", 0, "workload and fault seed (overrides spec seed)")
+	walDropKFlag := fs.Int("wal-drop-k", 0, "drop strictly the k-th WAL sync for MUT-5")
+	dirDropKFlag := fs.Int("dir-drop-k", 0, "drop strictly the k-th directory sync for MUT-9")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -140,9 +169,11 @@ func runRecord(args []string) error {
 	if targetDir == "" {
 		return errors.New("record: must specify -out or -run directory")
 	}
+	targetDir = filepath.Clean(targetDir)
 
 	cfg := workload.DefaultConfig()
 	if *specPath != "" {
+		*specPath = filepath.Clean(*specPath)
 		data, err := os.ReadFile(*specPath)
 		if err != nil {
 			return fmt.Errorf("read spec: %w", err)
@@ -166,13 +197,31 @@ func runRecord(args []string) error {
 		cfg.Preset = *presetFlag
 	}
 
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "seed" {
+			cfg.Seed = *seedFlag
+		}
+	})
+
+	if err := workload.Validate(cfg); err != nil {
+		return fmt.Errorf("validate config: %w", err)
+	}
+
 	if err := os.MkdirAll(targetDir, 0755); err != nil {
 		return fmt.Errorf("create run dir: %w", err)
 	}
 
 	mem := vfs.NewCrashableMem()
 	rec := vfsrec.New(mem)
-	faultFS, err := faults.New(*faultID, rec)
+	fCfg := faults.DefaultConfig(*faultID)
+	fCfg.Seed = cfg.Seed
+	if *walDropKFlag > 0 {
+		fCfg.WALDropK = *walDropKFlag
+	}
+	if *dirDropKFlag > 0 {
+		fCfg.DirDropK = *dirDropKFlag
+	}
+	faultFS, err := faults.NewWithConfig(fCfg, rec)
 	if err != nil {
 		return fmt.Errorf("init fault %q: %w", *faultID, err)
 	}
@@ -234,7 +283,8 @@ func runRecord(args []string) error {
 		BaseSeed:      cfg.Seed,
 		Policies:      policies,
 		Workload:      cfg,
-		PebbleVersion: "v2.1.7",
+		FaultConfig:   &fCfg,
+		PebbleVersion: detectPebbleVersion(),
 		GoVersion:     runtime.Version(),
 		GOOS:          runtime.GOOS,
 		GOARCH:        runtime.GOARCH,
@@ -246,10 +296,10 @@ func runRecord(args []string) error {
 	if err != nil {
 		return fmt.Errorf("create run.json: %w", err)
 	}
-	defer metaFile.Close()
 	enc := json.NewEncoder(metaFile)
 	enc.SetIndent("", "  ")
 	if err := enc.Encode(meta); err != nil {
+		_ = metaFile.Close()
 		return fmt.Errorf("encode run.json: %w", err)
 	}
 	if err := metaFile.Close(); err != nil {
@@ -261,8 +311,8 @@ func runRecord(args []string) error {
 	if err != nil {
 		return fmt.Errorf("create trace.json: %w", err)
 	}
-	defer traceFile.Close()
 	if err := trace.Encode(traceFile, traceEvents); err != nil {
+		_ = traceFile.Close()
 		return fmt.Errorf("encode trace.json: %w", err)
 	}
 	if err := traceFile.Close(); err != nil {
@@ -274,8 +324,8 @@ func runRecord(args []string) error {
 	if err != nil {
 		return fmt.Errorf("create history.json: %w", err)
 	}
-	defer histFile.Close()
 	if err := history.Encode(histFile, correlated); err != nil {
+		_ = histFile.Close()
 		return fmt.Errorf("encode history.json: %w", err)
 	}
 	if err := histFile.Close(); err != nil {
@@ -301,6 +351,7 @@ func runPlan(args []string) error {
 	if *runDir == "" {
 		return errors.New("plan: must specify -run directory")
 	}
+	*runDir = filepath.Clean(*runDir)
 
 	meta, traceEvents, _, err := loadRunData(*runDir, false)
 	if err != nil {
@@ -321,9 +372,12 @@ func runPlan(args []string) error {
 	if err != nil {
 		return fmt.Errorf("create universe.json: %w", err)
 	}
-	defer univFile.Close()
 	if err := candidate.Encode(univFile, universe); err != nil {
+		_ = univFile.Close()
 		return fmt.Errorf("encode universe.json: %w", err)
+	}
+	if err := univFile.Close(); err != nil {
+		return fmt.Errorf("close universe.json: %w", err)
 	}
 
 	view, err := graph.Build(traceEvents)
@@ -331,7 +385,7 @@ func runPlan(args []string) error {
 		return fmt.Errorf("build graph: %w", err)
 	}
 
-	combinedStrat, err := strategy.NewCombined(strategy.DefaultWeights)
+	combinedStrat, err := strategy.NewCombined(strategy.DefaultWeights())
 	if err != nil {
 		return fmt.Errorf("init combined strategy: %w", err)
 	}
@@ -348,7 +402,7 @@ func runPlan(args []string) error {
 		{combinedStrat, 0, "b4"},
 		{strategy.NewRepresentative(), 0, "b5"},
 		{strategy.NewSyncBoundary(), 0, "b6"},
-		{strategy.NewRiskHorizon(strategy.DefaultRHGWeights), 0, "b7"},
+		{strategy.NewRiskHorizon(strategy.DefaultRHGWeights()), 0, "b7"},
 		{strategy.NewR1(*rankingSeed), *rankingSeed, "r1"},
 		{strategy.NewR2(*rankingSeed), *rankingSeed, "r2"},
 		{exp.NewDCGStrategy(), 0, "dcg"},
@@ -378,7 +432,9 @@ func runPlan(args []string) error {
 			_ = rFile.Close()
 			return fmt.Errorf("encode %s: %w", fname, err)
 		}
-		_ = rFile.Close()
+		if err := rFile.Close(); err != nil {
+			return fmt.Errorf("close %s: %w", fname, err)
+		}
 	}
 
 	fmt.Printf("Planned %d universe candidates with %d strategies -> %s\n",
@@ -400,6 +456,7 @@ func runExploreCmd(args []string) error {
 	if *runDir == "" {
 		return errors.New("explore: must specify -run directory")
 	}
+	*runDir = filepath.Clean(*runDir)
 
 	_, traceEvents, histEntries, err := loadRunData(*runDir, true)
 	if err != nil {
@@ -438,6 +495,9 @@ func runExploreCmd(args []string) error {
 	if err := exp.EncodeOutcomes(outFile, universe, res.Outcomes); err != nil {
 		return fmt.Errorf("encode outcomes.json: %w", err)
 	}
+	if err := outFile.Close(); err != nil {
+		return fmt.Errorf("close outcomes.json: %w", err)
+	}
 
 	fmt.Printf("Explored %d candidates in %v: valid=%d, viol=%d, open_err=%d, panic=%d, hang=%d, oracle_err=%d\n",
 		res.Summary.TotalCandidates, res.Summary.TotalTime,
@@ -461,6 +521,13 @@ func runEvaluate(args []string) error {
 	}
 	if *runDir == "" {
 		return errors.New("evaluate: must specify -run directory")
+	}
+	*runDir = filepath.Clean(*runDir)
+	if *discoveryOut != "" {
+		*discoveryOut = filepath.Clean(*discoveryOut)
+	}
+	if *plotOut != "" {
+		*plotOut = filepath.Clean(*plotOut)
 	}
 	if (*discoveryOut == "") != (*plotOut == "") {
 		return errors.New("evaluate: -discovery and -plot must be given together")
@@ -487,6 +554,7 @@ func runEvaluate(args []string) error {
 	if err != nil {
 		return fmt.Errorf("decode outcomes.json: %w", err)
 	}
+	outcomes = exp.NormalizeTable(outcomes)
 
 	// Determine budgets.
 	var budgets []int
@@ -534,12 +602,19 @@ func runEvaluate(args []string) error {
 	fmt.Println(strings.Repeat("-", 62))
 
 	for _, rPath := range matches {
-		rFile, err := os.Open(rPath)
-		if err != nil {
-			return fmt.Errorf("open %s: %w", rPath, err)
-		}
-		rDoc, err := exp.DecodeRanking(rFile)
-		_ = rFile.Close()
+		rDoc, err := func() (doc exp.RankingDocument, err error) {
+			rFile, err := os.Open(rPath)
+			if err != nil {
+				return doc, fmt.Errorf("open %s: %w", rPath, err)
+			}
+			defer func() {
+				if cerr := rFile.Close(); cerr != nil && err == nil {
+					err = fmt.Errorf("close %s: %w", rPath, cerr)
+				}
+			}()
+			doc, err = exp.DecodeRanking(rFile)
+			return doc, err
+		}()
 		if err != nil {
 			return fmt.Errorf("decode %s: %w", rPath, err)
 		}
@@ -563,6 +638,11 @@ func runEvaluate(args []string) error {
 			fmt.Printf("%-18s %-8d %-8d %-10d %-14d\n",
 				rDoc.Strategy, p.Budget, p.Tested, p.Failures, p.DistinctBugs)
 		}
+	}
+
+	w.Flush()
+	if err := w.Error(); err != nil {
+		return fmt.Errorf("flush curves.csv: %w", err)
 	}
 
 	fmt.Printf("\nSaved discovery curves to %s\n", filepath.Join(*runDir, "curves.csv"))
@@ -627,6 +707,12 @@ func loadRunData(dir string, loadHistory bool) (*RunMetadata, []trace.Event, []h
 // writePositions records, for every stored ranking and for random order over
 // fixed seeds, the position of the first failure and the position at which
 // every failure kind has appeared.
+//
+// Format Note: For deterministic strategies (e.g. B1..B6, RHG, DCG), a single ranking
+// is evaluated, so p10 and p90 columns are written identically to the point estimate
+// (first_failure and all_kinds) because the variance across repeated evaluations is zero.
+// In contrast, randomized strategies (e.g. random_x100) report actual empirical p10/p90
+// quantiles computed over multiple random seeds.
 func writePositions(runDir string, universe []candidate.Candidate, outcomes []oracle.Outcome, rankingPaths []string) error {
 	path := filepath.Join(runDir, "positions.csv")
 	file, err := os.Create(path)
@@ -641,12 +727,19 @@ func writePositions(runDir string, universe []candidate.Candidate, outcomes []or
 	}
 	itoa := strconv.Itoa
 	for _, rPath := range rankingPaths {
-		rFile, err := os.Open(rPath)
-		if err != nil {
-			return err
-		}
-		doc, err := exp.DecodeRanking(rFile)
-		_ = rFile.Close()
+		doc, err := func() (doc exp.RankingDocument, err error) {
+			rFile, err := os.Open(rPath)
+			if err != nil {
+				return doc, err
+			}
+			defer func() {
+				if cerr := rFile.Close(); cerr != nil && err == nil {
+					err = fmt.Errorf("close %s: %w", rPath, cerr)
+				}
+			}()
+			doc, err = exp.DecodeRanking(rFile)
+			return doc, err
+		}()
 		if err != nil {
 			return fmt.Errorf("decode %s: %w", rPath, err)
 		}
@@ -688,7 +781,7 @@ func runBenchmarkCmd(args []string) error {
 	maxManifestSizeFlag := fs.Int64("max-manifest-size", 0, "optional MaxManifestFileSize in bytes")
 	reportFlag := fs.String("report", "", "path to output empirical markdown report")
 	csvFlag := fs.String("csv", "", "optional path to output summary CSV")
-	perSeedCSVFlag := fs.String("per-seed-csv", "", "path for per-seed CSV output (default: results/benchmark_per_seed.csv for full matrix)")
+	perSeedCSVFlag := fs.String("per-seed-csv", "", "path for per-seed CSV output")
 	controlFlag := fs.Bool("control", true, "run MUT-0 null control check")
 	checkpointAt := fs.Int("checkpoint-at", 0, "emit a Checkpoint op every N operations (0 = disabled)")
 	ingestEvery := fs.Int("ingest-every", 0, "emit an external SSTable ingest op every N operations (0 = disabled)")
@@ -764,25 +857,16 @@ func runBenchmarkCmd(args []string) error {
 	}
 
 	targetReport := *reportFlag
-	if targetReport == "" && *seedsFlag == "" && *faultsFlag == "" {
-		targetReport = "docs/benchmark-report.md"
-	}
 	if targetReport == "none" {
 		targetReport = ""
 	}
 
 	targetCSV := *csvFlag
-	if targetCSV == "" && *seedsFlag == "" && *faultsFlag == "" {
-		targetCSV = "results/benchmark_summary.csv"
-	}
 	if targetCSV == "none" {
 		targetCSV = ""
 	}
 
 	targetPerSeedCSV := *perSeedCSVFlag
-	if targetPerSeedCSV == "" && *seedsFlag == "" && *faultsFlag == "" {
-		targetPerSeedCSV = "results/benchmark_per_seed.csv"
-	}
 	if targetPerSeedCSV == "none" {
 		targetPerSeedCSV = ""
 	}
@@ -825,6 +909,10 @@ func runBenchmarkCmd(args []string) error {
 			return fmt.Errorf("write per-seed csv: %w", err)
 		}
 		fmt.Printf("Generated per-seed CSV -> %s\n", targetPerSeedCSV)
+	}
+
+	if targetReport == "" && targetCSV == "" && targetPerSeedCSV == "" {
+		fmt.Println("\n" + exp.GenerateMultiSeedReportMarkdown(res))
 	}
 
 	fmt.Printf("Benchmark completed successfully in %v.\n", res.TotalDuration)

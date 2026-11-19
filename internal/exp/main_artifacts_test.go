@@ -20,9 +20,9 @@ func TestMainRunArtifactsMatchStoredTables(t *testing.T) {
 	}{
 		{"mut0", 0, 0},
 		{"mut1", 865, 15},
-		{"mut2", 1047, 0}, // open errors only: no violation signatures
+		{"mut2", 1047, 1}, // open errors normalized to distinct bug
 		{"mut3", 999, 3},
-		{"mut4", 594, 0}, // open errors only
+		{"mut4", 594, 1}, // open errors normalized to distinct bug
 	} {
 		runDir := filepath.Join(results, "main_"+run.name)
 		if _, err := os.Stat(filepath.Join(runDir, "outcomes.json")); err != nil {

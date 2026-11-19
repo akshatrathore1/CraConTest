@@ -748,3 +748,32 @@ func TestUnsyncedDirEntryCount(t *testing.T) {
 		t.Errorf("UnsyncedDirEntryCount at cut 3 = %d, want 0", cf3.UnsyncedDirEntryCount)
 	}
 }
+
+func TestContractFeaturesCacheCollisionDifferentTraces(t *testing.T) {
+	// Two traces with identical event structures and path lengths, but different
+	// write categories (WAL vs SST) and filenames ("000002.log" vs "000002.sst").
+	traceWAL := []trace.Event{
+		{ID: 1, Kind: trace.KindCreate, File: "000002.log", Cat: "pebble-wal", Handle: 10},
+		{ID: 2, Kind: trace.KindOpBegin, Op: 101, OpKind: "set"},
+		{ID: 3, Kind: trace.KindWrite, File: "000002.log", Cat: "pebble-wal", Handle: 10, Off: 0, Len: 256},
+		{ID: 4, Kind: trace.KindOpEnd, Op: 101, OpKind: "set"},
+	}
+	traceSST := []trace.Event{
+		{ID: 1, Kind: trace.KindCreate, File: "000002.sst", Cat: "pebble-table", Handle: 10},
+		{ID: 2, Kind: trace.KindOpBegin, Op: 101, OpKind: "set"},
+		{ID: 3, Kind: trace.KindWrite, File: "000002.sst", Cat: "pebble-table", Handle: 10, Off: 0, Len: 256},
+		{ID: 4, Kind: trace.KindOpEnd, Op: 101, OpKind: "set"},
+	}
+
+	cfWAL := graph.ComputeContractFeatures(traceWAL)[4]
+	cfSST := graph.ComputeContractFeatures(traceSST)[4]
+
+	// traceWAL must have AckSyncMissing because WAL write was not persisted.
+	if !cfWAL.AckSyncMissing {
+		t.Fatalf("expected AckSyncMissing=true for unpersisted WAL trace")
+	}
+	// traceSST is a table file write, NOT a WAL write, so it should not flag AckSyncMissing.
+	if cfSST.AckSyncMissing {
+		t.Fatalf("expected AckSyncMissing=false for SST table trace, but got cached WAL features")
+	}
+}

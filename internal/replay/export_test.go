@@ -3,6 +3,7 @@ package replay
 import (
 	"math/rand/v2"
 
+	"github.com/akshatrathore1/CraConTest/internal/trace"
 	"github.com/cockroachdb/pebble/v2/vfs"
 )
 
@@ -23,7 +24,7 @@ func (s *State) MemFSForTesting() *vfs.MemFS {
 
 // FileSyncedBytesForTesting returns the fileSyncedBytes map for testing.
 func (s *State) FileSyncedBytesForTesting() map[string][]byte {
-	return s.fileSyncedBytes
+	return s.syncedBytesByPath()
 }
 
 // WrapHandleForTesting wraps an open file handle in s.handles for testing.
@@ -31,4 +32,9 @@ func (s *State) WrapHandleForTesting(handle uint64, wrap func(vfs.File) vfs.File
 	if f, ok := s.handles[handle]; ok {
 		s.handles[handle] = wrap(f)
 	}
+}
+
+// AdvanceStepForTesting exposes applyEvent for testing.
+func (s *State) AdvanceStepForTesting(event trace.Event) error {
+	return s.applyEvent(event)
 }

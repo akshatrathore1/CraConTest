@@ -1,6 +1,7 @@
 package graph
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/akshatrathore1/CraConTest/internal/trace"
@@ -72,6 +73,45 @@ func TestIntervalMerge(test *testing.T) {
 	}
 	if len(list) != 2 || list[0] != (interval{0, 6}) || list[1] != (interval{10, 30}) {
 		test.Fatalf("merged intervals: %v", list)
+	}
+}
+
+func TestPendingSliceCapacityReclaimedOnDirSync(test *testing.T) {
+	// Build a trace that creates 50 files in directory "db", causing b.pending to allocate
+	// a slice with capacity >= 50.
+	events := []trace.Event{
+		{ID: 1, Kind: trace.KindMkdirAll, File: "db", Mode: 0755},
+		{ID: 2, Kind: trace.KindOpenDir, File: "db", Handle: 1, Dir: true},
+	}
+	nextID := uint64(3)
+	for i := 0; i < 50; i++ {
+		fileName := fmt.Sprintf("db/%06d.sst", i)
+		events = append(events, trace.Event{
+			ID: nextID, Kind: trace.KindCreate, File: fileName, Handle: uint64(2 + i), Cat: "pebble-sst",
+		})
+		nextID++
+	}
+	b := step(test, events)
+	if len(b.pending) != 51 { // 1 mkdir + 50 creates
+		test.Fatalf("expected 51 pending entries, got %d", len(b.pending))
+	}
+	if cap(b.pending) < 51 {
+		test.Fatalf("expected capacity >= 51, got %d", cap(b.pending))
+	}
+
+	// Now sync directory "db" (Handle 1). All 50 creates in "db" should be cleared.
+	// Only the root mkdir ("db") survives.
+	syncEvent := trace.Event{ID: nextID, Kind: trace.KindSync, File: "db", Handle: 1, Dir: true}
+	if _, err := b.apply(syncEvent); err != nil {
+		test.Fatalf("apply dir sync: %v", err)
+	}
+
+	if len(b.pending) != 1 {
+		test.Fatalf("expected 1 surviving pending entry (root mkdir), got %d", len(b.pending))
+	}
+	// The capacity must be shrunk to exactly the surviving count (1), NOT retaining the old 50+ array!
+	if cap(b.pending) != 1 {
+		test.Fatalf("slice capacity not reclaimed: expected cap(b.pending)==1, got %d", cap(b.pending))
 	}
 }
 

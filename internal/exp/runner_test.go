@@ -2,6 +2,7 @@ package exp_test
 
 import (
 	"bytes"
+	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
@@ -226,6 +227,88 @@ func TestRunExploreTimeoutHandling(t *testing.T) {
 	t.Logf("Completed without timeout: outcome classes: %v, %v", res.Outcomes[0].Class, res.Outcomes[1].Class)
 }
 
+func TestReadJournalRejectsInvalidRecords(t *testing.T) {
+	valid := oracle.Outcome{Candidate: candidate.Candidate{Event: 1}, Class: oracle.ClassValid}
+	mismatched := valid
+	mismatched.Candidate.Event = 2
+	unknownClass := valid
+	unknownClass.Class = "unknown"
+	cases := []struct {
+		name   string
+		record exp.JournalRecord
+	}{
+		{"mismatched candidate", exp.JournalRecord{Stage: exp.StageFinished, Candidate: valid.Candidate, Outcome: &mismatched}},
+		{"missing outcome", exp.JournalRecord{Stage: exp.StageFinished, Candidate: valid.Candidate}},
+		{"unknown stage", exp.JournalRecord{Stage: "unknown", Candidate: valid.Candidate}},
+		{"invalid outcome", exp.JournalRecord{Stage: exp.StageFinished, Candidate: valid.Candidate, Outcome: &unknownClass}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var buffer bytes.Buffer
+			if err := json.NewEncoder(&buffer).Encode(tc.record); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := exp.ReadJournal(&buffer); err == nil {
+				t.Fatal("malformed journal was accepted")
+			}
+		})
+	}
+}
+
+func TestRunExploreRejectsStaleJournal(t *testing.T) {
+	events := []trace.Event{
+		{ID: 1, Kind: trace.KindOpBegin, Op: 1, OpKind: "get"},
+		{ID: 2, Kind: trace.KindOpEnd, Op: 1, OpKind: "get"},
+	}
+	hist := []history.Entry{{Op: 1, Kind: "get", BeginEvent: 1, EndEvent: 2}}
+	cfg := exp.RunnerConfig{
+		Universe: []candidate.Candidate{{Event: 0}},
+		Events:   events,
+		History:  hist,
+		Timeout:  time.Second,
+	}
+	cases := []string{"trace", "history", "timeout"}
+	for _, name := range cases {
+		t.Run(name, func(t *testing.T) {
+			initial := cfg
+			initial.JournalPath = filepath.Join(t.TempDir(), "journal.ndjson")
+			if _, err := exp.RunExplore(initial); err != nil {
+				t.Fatal(err)
+			}
+			changed := initial
+			switch name {
+			case "trace":
+				changed.Events = trace.Clone(events)
+				changed.Events[1].Err = "changed read result"
+				changed.History = history.Clone(hist)
+				changed.History[0].Err = changed.Events[1].Err
+			case "history":
+				changed.Events = nil
+				changed.History = nil
+			case "timeout":
+				changed.Timeout = 2 * time.Second
+			}
+			if _, err := exp.RunExplore(changed); err == nil {
+				t.Fatal("stale journal was reused with different execution inputs")
+			}
+		})
+	}
+}
+
+func TestRunExploreRejectsInvalidUniverse(t *testing.T) {
+	cases := [][]candidate.Candidate{
+		{{Event: 1}},
+		{{Percent: -1}},
+		{{Percent: 101}},
+		{{Event: 0}, {Event: 0}},
+	}
+	for _, universe := range cases {
+		if _, err := exp.RunExplore(exp.RunnerConfig{Universe: universe}); err == nil {
+			t.Fatalf("invalid universe accepted: %+v", universe)
+		}
+	}
+}
+
 func TestRunExploreCorruptJournalReturnsError(t *testing.T) {
 	events, hist := runSmallWorkload(t, 10)
 	universe, err := candidate.Build(events, 42, []int{0, 100})
@@ -409,8 +492,12 @@ func TestInspectCheckpointRecovery_Outcomes(t *testing.T) {
 		if !strings.HasPrefix(outcome.Detail, "checkpoint: ") {
 			t.Fatalf("expected 'checkpoint: ' prefix, got %q", outcome.Detail)
 		}
-		if outcome.Rule != "" || outcome.Signature != "" {
-			t.Fatalf("expected empty rule and signature, got rule=%q sig=%q", outcome.Rule, outcome.Signature)
+		if outcome.Rule != "" {
+			t.Fatalf("expected empty rule, got rule=%q", outcome.Rule)
+		}
+		expectedSig := exp.FormatOpenErrorSignature(outcome.Detail)
+		if outcome.Signature != expectedSig {
+			t.Fatalf("expected signature %q, got %q", expectedSig, outcome.Signature)
 		}
 	})
 
