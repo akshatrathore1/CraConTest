@@ -120,9 +120,11 @@ python3 analysis/paired_stats.py results/casestudy_checkpoint_per_seed.csv "Pebb
 
 ## Provenance and Cross-Validation Contract
 
-`results/` contains 23 CSV files in total:
+`results/` contains 23 CSV files in total. The in-sample benchmark pair and the holdout pair have been regenerated from `v1.1.1-evaluation-freeze` (`6eecbf865107`); the remaining Stage 2 CSVs retain their original provenance until their corresponding reevaluations complete.
 
-- **14 Stage 2 Multi-Seed Benchmark, Case-Study, Hold-Out, Workload-Diversity, Subsystem-Discovery, and Null-Control CSVs (all carrying `git_commit = ff6ac305e3e2`):**
+- **Regenerated evaluation CSVs carrying `git_commit = 6eecbf865107`:** `benchmark_per_seed.csv`, `benchmark_summary.csv`, `holdout_per_seed.csv`, and `holdout_summary.csv`. Their revised values must be interpreted with the report's `v1.1.1-evaluation-freeze` chronology.
+
+- **10 historical Stage 2 Multi-Seed Benchmark, Case-Study, Workload-Diversity, Subsystem-Discovery, and Null-Control CSVs carrying `git_commit = ff6ac305e3e2`:**
   - **6 CSVs validated read-only by Go tests in `internal/exp` (regenerated only when `-update` / `-update-artifacts` is passed):**
     - `null_control_multishape.csv` — validated read-only by `TestNullControlMultiShape` (`internal/exp/null_control_test.go:41-103`).
     - `subsystem_discovery.csv` — validated read-only by `TestSubsystemDiscovery` (`internal/exp/subsystem_discovery_test.go:71-122, 353-360`).
@@ -134,7 +136,7 @@ python3 analysis/paired_stats.py results/casestudy_checkpoint_per_seed.csv "Pebb
     - `casestudy_pebble5825_per_seed.csv` and `casestudy_pebble5825_summary.csv` (crash-point mechanics also verified by `TestCaseStudyPebble5825CrashPointProbe` in `internal/exp/casestudy_5825_probe_test.go:116`)
     - `casestudy_checkpoint_per_seed.csv` and `casestudy_checkpoint_summary.csv`
 
-These measurements describe revision `ff6ac305e3e2`, whose ranking and feature files match the historical freeze. Later implementation revisions are not covered by those provenance fields. Reproduction uses the recorded revision; revised rankings require separately regenerated measurements and their own source provenance. Do not re-stamp existing rows without recomputing them.
+The historical measurements describe revision `ff6ac305e3e2`, whose ranking and feature files match `v1.0-dcg-pr-freeze`. The four regenerated files describe `6eecbf865107`, whose ranking and feature sources are frozen by `v1.1.1-evaluation-freeze`. Reproduction uses each file's recorded revision; do not compare or combine historical and revised summary rows without preserving that distinction.
 
 - **9 Fixed-Schema Regression CSVs Without a `git_commit` Column:**
   - **7 Stage 1 Single-Run Discovery Curve Tables:** `discovery_mut0.csv` and `discovery_mut1.csv` guarded byte-for-byte by `TestGateG4` (`internal/exp/gate_g4_test.go:20-95`); `discovery_main_mut0.csv` through `discovery_main_mut4.csv` guarded byte-for-byte by `TestMainRunArtifactsMatchStoredTables` (`internal/exp/main_artifacts_test.go:15-56`).
