@@ -87,7 +87,7 @@ Within each workload seed (`RunSingleSeedFault` in `internal/exp/benchmark.go`),
 
 8. **Direct L0 `db.Ingest` 32-Seed Benchmark (`results/casestudy_ingest_summary.csv`, `results/casestudy_ingest_per_seed.csv`):**
    - Scope: Post-Freeze Evaluation 2 (Cross-Channel Ordering — Direct L0 `db.Ingest` undocumented cross-channel ordering behavior where sequence numbers advance and MANIFEST is synced without syncing preceding un-flushed WAL writes under a global prefix oracle), evaluated across 32 seeds (`seed = 1..32`, 25 ops) under endpoint `[0, 100]` retention (>13,000 candidate crash states).
-   - Findings: Under unfaulted `MUT-0` at endpoint (`0%/100%`) retention, **22 of 32 seeds** exhibit prefix violations (276 total failures; seeds `3, 5, 7, 8, 9, 16, 20, 23, 26, 29` have 0 failures because randomly generated ingest keys overlapped the active memtable and took the `asFlushable = true` branch, which synchronously flushes the WAL via `commit.directWrite` at `commit.go:289`). Under the `BARRIER-INGEST` intervention (`db.LogData(nil, pebble.Sync)`), no prefix violations are observed across the 32 evaluated seeds. Pre-frozen `DCG-PR` and `DCG` achieve median $k_1 = \mathbf{9.00}$ [9.00, 19.00] (mean $15.32$), compared to $27.88$ (mean $27.64$) for `R2`, $28.60$ (mean $30.61$) for `R1`, $28.18$ (mean $29.88$) for `DCG Flag-Only`, $81.00$ (mean $80.18$) for `sync-boundary`, and $21.50$ (mean $24.73$) for uniform random `B0`.
+   - Findings: Under unfaulted `MUT-0` at endpoint (`0%/100%`) retention, **22 of 32 seeds** exhibit prefix violations (276 total failures; seeds `3, 5, 7, 8, 9, 16, 20, 23, 26, 29` have 0 failures because randomly generated ingest keys overlapped the active memtable and took the `asFlushable = true` branch, which synchronously flushes the WAL via `commit.directWrite` at `commit.go:289`). Under `BARRIER-INGEST`, no prefix violations are observed across the 32 evaluated seeds. DCG/DCG-PR median/mean $k_1$ is 9.00/15.32, R2 is 26.77/27.00, and accounting-corrected B0 is 33.74/34.32; the paired DCG-PR/R2 sign test is not significant at 0.05 (13/6/3, $p=0.0835$).
 
 9. **Multi-Distribution Workload Diversity Suite (`results/workload_diversity_summary.csv`, `results/workload_diversity_per_seed.csv`):**
    - Scope: Generalization evaluation across 5 standardized access distributions (`ycsb-a`, `ycsb-b`, `ycsb-f`, `overwrite-heavy`, `delete-heavy`) evaluated across 16 seeds (`seed = 1..16`, 25 ops) and 4 fault models (`MUT-0`, `MUT-1`, `MUT-5`, `MUT-9`).
@@ -122,15 +122,14 @@ python3 analysis/paired_stats.py results/casestudy_checkpoint_per_seed.csv "Pebb
 
 `results/` contains 23 CSV files in total. Artifact provenance is transitional while the accounting-corrected campaign runs; each CSV's `git_commit` field is authoritative.
 
-- **8 accounting-corrected CSVs carrying `git_commit = f9202dfca579`:** `benchmark_per_seed.csv`, `benchmark_summary.csv`, `holdout_per_seed.csv`, `holdout_summary.csv`, `casestudy_pebble5825_per_seed.csv`, `casestudy_pebble5825_summary.csv`, `casestudy_checkpoint_per_seed.csv`, and `casestudy_checkpoint_summary.csv`. B0 `*_mean` fields are true shuffle means under `v1.1.2-evaluation-freeze`.
+- **10 accounting-corrected CSVs carrying `git_commit = f9202dfca579`:** `benchmark_per_seed.csv`, `benchmark_summary.csv`, `holdout_per_seed.csv`, `holdout_summary.csv`, `casestudy_pebble5825_per_seed.csv`, `casestudy_pebble5825_summary.csv`, `casestudy_checkpoint_per_seed.csv`, `casestudy_checkpoint_summary.csv`, `casestudy_ingest_per_seed.csv`, and `casestudy_ingest_summary.csv`. B0 `*_mean` fields are true shuffle means under `v1.1.2-evaluation-freeze`.
 
 - **No current result CSV points to `6eecbf865107`;** its prior reevaluation remains reachable in Git history and by `v1.1.1-evaluation-freeze`.
 
-- **6 historical Stage 2 Workload-Diversity, Subsystem-Discovery, Ingest, and Null-Control CSVs carrying `git_commit = ff6ac305e3e2`:**
-  - **6 CSVs validated read-only by Go tests in `internal/exp` (regenerated only when `-update` / `-update-artifacts` is passed):**
+- **4 historical Stage 2 Workload-Diversity, Subsystem-Discovery, and Null-Control CSVs carrying `git_commit = ff6ac305e3e2`:**
+   - **4 CSVs validated read-only by Go tests in `internal/exp` (regenerated only when `-update` / `-update-artifacts` is passed):**
     - `null_control_multishape.csv` — validated read-only by `TestNullControlMultiShape` (`internal/exp/null_control_test.go:41-103`).
     - `subsystem_discovery.csv` — validated read-only by `TestSubsystemDiscovery` (`internal/exp/subsystem_discovery_test.go:71-122, 353-360`).
-    - `casestudy_ingest_per_seed.csv` and `casestudy_ingest_summary.csv` — validated read-only by `TestCaseStudyIngestBenchmark` (`internal/exp/casestudy_ingest_test.go:245-345`).
     - `workload_diversity_per_seed.csv` and `workload_diversity_summary.csv` — validated read-only by `TestWorkloadDiversityBenchmark` (`internal/exp/workload_diversity_test.go:119-213`).
 
 The historical measurements describe revision `ff6ac305e3e2`, whose ranking and feature files match `v1.0-dcg-pr-freeze`. The revised files describe either `6eecbf865107` (`v1.1.1-evaluation-freeze`) or the active accounting-corrected `f9202dfca579` (`v1.1.2-evaluation-freeze`). Reproduction uses each file's recorded revision; do not compare or combine rows without preserving that distinction.
