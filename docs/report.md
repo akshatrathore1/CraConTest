@@ -493,15 +493,15 @@ To evaluate whether durability-contract priors maintain their efficiency as work
 
 | Workload Operations | Mean Universe Size | DCG ($k_1$ Mean / Med) | R2 ($k_1$ Mean / Med) | R1 ($k_1$ Mean / Med) | B0 ($k_1$ Mean / Med) | B2 LIFO ($k_1$ Mean / Med) | Mean Plan+Rank Time | Mean Explore Time |
 |---|---|---|---|---|---|---|---|---|
-| **120 ops** | 337.5 | **1.00** / **1.00** | 11.62 / 12.00 | 13.38 / 13.00 | 25.75 / 25.00 | 260.50 / 264.00 | 1.6 ms | 402.1 ms |
-| **300 ops** | 767.5 | **1.00** / **1.00** | 23.12 / 22.50 | 28.38 / 29.00 | 56.25 / 56.50 | 690.50 / 691.00 | 7.8 ms | 1,241.5 ms |
-| **600 ops** | 1,505.5 | **1.00** / **1.00** | 42.62 / 44.00 | 54.12 / 55.50 | 108.12 / 109.00 | 1,428.50 / 1,427.00 | 22.2 ms | 2,645.0 ms |
-| **1,200 ops** | 2,958.2 | **1.00** / **1.00** | 83.50 / 85.00 | 113.25 / 110.50 | 222.38 / 220.50 | 2,881.25 / 2,881.00 | 56.1 ms | 6,791.9 ms |
+| **120 ops** | 337.5 | **1.00** / **1.00** | 12.00 / 12.00 | 12.12 / 12.50 | 26.75 / 27.00 | 260.50 / 264.00 | 1.9 ms | 339.5 ms |
+| **300 ops** | 767.2 | **1.00** / **1.00** | 23.38 / 23.50 | 30.25 / 30.00 | 56.25 / 54.50 | 690.25 / 691.00 | 4.4 ms | 784.8 ms |
+| **600 ops** | 1,505.0 | **1.00** / **1.00** | 41.50 / 41.00 | 53.12 / 52.50 | 116.75 / 116.00 | 1,428.00 / 1,425.00 | 12.4 ms | 2,387.0 ms |
+| **1,200 ops** | 2,958.0 | **1.00** / **1.00** | 80.62 / 81.50 | 109.75 / 109.00 | 220.88 / 213.00 | 2,881.00 / 2,881.00 | 38.5 ms | 8,435.2 ms |
 
 ### Key Findings:
 1. **Invariant Measured Discovery Position:** DCG achieves $k_1 = 1.00$ at all four evaluated operation counts, over candidate universes ranging from approximately 338 to 2,958 states. This finite range does not establish asymptotic complexity.
-2. **Increasing Baseline Budgets:** Over the same range, uniform-random B0 mean $k_1$ increases from 25.75 to 222.38, LIFO (B2) from 260.50 to 2,881.25, and R2 from 11.62 to 83.50. Four scale points are insufficient to identify a general growth law.
-3. **Measured Planning Cost:** Mean graph-construction and ranking time increases from 1.6 ms at 120 operations to 56.1 ms at 1,200 operations, while mean exploration time increases from 402.1 ms to 6,791.9 ms.
+2. **Increasing Baseline Budgets:** Over the same range, B0's mean of per-seed rounded shuffle medians increases from 26.75 to 220.88, LIFO (B2) from 260.50 to 2,881.00, and R2 from 12.00 to 80.62. Four scale points are insufficient to identify a general growth law.
+3. **Measured Planning Cost:** Mean graph-construction and ranking time increases from 1.9 ms at 120 operations to 38.5 ms at 1,200 operations, while mean exploration time increases from 339.5 ms to 8,435.2 ms.
 
 ---
 

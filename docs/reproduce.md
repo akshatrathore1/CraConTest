@@ -250,7 +250,7 @@ Outputs: `results/scaling_mut5_per_seed.csv` and `results/scaling_mut5_summary.c
 #### Results Summary:
 - Candidate universes scale from ~338 (120 ops) to ~2,958 (1,200 ops).
 - DCG has median and mean $k_1 = 1.00$ at each of the four evaluated scales; this finite experiment does not establish asymptotic complexity.
-- Baseline discovery positions increase over the evaluated range: B0 mean $k_1$ from 25.75 to 222.38, B2 (LIFO) from 260.50 to 2,881.25, and R2 from 11.62 to 83.50.
+- Baseline discovery positions increase over the evaluated range: B0's mean of per-seed rounded shuffle medians from 26.75 to 220.88, B2 (LIFO) from 260.50 to 2,881.00, and R2 from 12.00 to 80.62.
 - Average planning/ranking runtime remains sub-60ms (56.1ms) even at ~3,000 candidates.
 
 ### 4.6 Multi-Shape Null-Control Verification (108 Runs, 0 False Alarms)
