@@ -1,10 +1,10 @@
 # CraConTest: Multi-Seed Evaluation Across Fault Models
 
-**Date:** 2026-11-19  
-**Git Commit:** `6eecbf865107`  
+**Date:** 2026-11-20  
+**Git Commit:** `f9202dfca579`  
 **Evaluation Engine:** CockroachDB Pebble v2.1.7 (Go runtime: go1.27.3)  
 **Workload Seeds (32):** `[42 100 200 300 400 500 600 700 800 900 1001 1002 1003 1004 1005 1006 1007 1008 1009 1010 1011 1012 1013 1014 1015 1016 1017 1018 1019 1020 1021 1022]`  
-**Execution Time:** 208.26 seconds total  
+**Execution Time:** 308.72 seconds total  
 **Null Control (MUT-0):** 0 observed failures across 32 evaluated seeds at 0%/100% retention  
 
 ---
@@ -18,9 +18,9 @@ This report documents the empirical evaluation of crash-consistency ranking stra
 **DCG achieves lower cost-to-first-failure than R2 on sparse faults.**
 
 Observed comparison:
-- **MUT-5 (Sparse $k$-th WAL Sync Drop):** DCG median $k_1 = 1.0$ (mean $1.00$, 95% CI $[1.00, 1.00]$), R2 median $k_1 = 13.0$ (mean $13.04$, 95% CI $[12.71, 13.37]$), and B0 median $k_1 = 23.5$ (mean $32.53$). The ratios of median discovery positions are 13.0 for R2/DCG and 23.5 for B0/DCG; these are candidate-count ratios, not wall-clock speedups.
+- **MUT-5 (Sparse $k$-th WAL Sync Drop):** DCG median $k_1 = 1.0$ (mean $1.00$, 95% CI $[1.00, 1.00]$), R2 median $k_1 = 13.0$ (mean $13.04$, 95% CI $[12.71, 13.37]$), and B0 median $k_1 = 33.8$ (mean $33.75$). The ratios of median discovery positions are 13.0 for R2/DCG and 33.8 for B0/DCG; these are candidate-count ratios, not wall-clock speedups.
 - **Null-control observation (MUT-0):** 0 failures across 32 evaluated seeds at 0%/100% retention.
-- **MUT-8 (Compaction-Triggered SST Sync Drop):** DCG reaches the first failure at median $k_1 = 1.0$ (Mean 1.00) vs R2 median $k_1 = 3.4$ (Mean 3.42) and B0 median $k_1 = 4.0$ (Mean 6.81), discovers $S_{25} = 12.88$ mean distinct failing states at $B=25$ (vs R2 6.73 and B0 2.28), and matches R2 at full budget ($S_{100}$ Mean 12.88 vs R2 12.80 and B0 5.06).
+- **MUT-8 (Compaction-Triggered SST Sync Drop):** DCG reaches the first failure at median $k_1 = 1.0$ (Mean 1.00) vs R2 median $k_1 = 3.4$ (Mean 3.42) and B0 median $k_1 = 6.5$ (Mean 6.49), discovers $S_{25} = 12.88$ mean distinct failing states at $B=25$ (vs R2 6.73 and B0 2.12), and matches R2 at full budget ($S_{100}$ Mean 12.88 vs R2 12.80 and B0 5.19).
 
 ---
 
@@ -78,7 +78,7 @@ Observed comparison:
 | R1 (0%-Retention) | 1.4 [1.3, 1.4] | 1.38 [1.35, 1.41] | 1.3 | 1.5 | 10.0 | 10.03 | 19.8 | 19.88 | 93.7 | 0.7472 |
 | LIFO (Recent-First) | 5.0 [5.0, 5.0] | 5.00 [5.00, 5.00] | 5.0 | 5.0 | 7.0 | 6.53 | 8.5 | 8.94 | 98.0 | 0.5694 |
 | B6 (Sync-Boundary) | 17.0 [17.0, 17.0] | 17.00 [17.00, 17.00] | 17.0 | 17.0 | 5.0 | 5.00 | 13.0 | 13.00 | 31.0 | 0.4300 |
-| B0 (Uniform Random) | 1.5 [1.0, 3.0] | 2.41 [1.64, 3.17] | 1.0 | 4.9 | 6.0 | 5.66 | 15.0 | 14.59 | 189.2 | 0.5003 |
+| B0 (Uniform Random) | 2.7 [2.6, 2.8] | 2.73 [2.63, 2.82] | 2.5 | 3.1 | 6.3 | 6.34 | 14.5 | 14.58 | 187.4 | 0.5003 |
 
 ### 3.2 MUT-2 Evaluation (32 Seeds: Avg 333 Candidates, Density: 47.3%)
 
@@ -95,7 +95,7 @@ Observed comparison:
 | R1 (0%-Retention) | 1.1 [1.0, 1.1] | 1.05 [1.04, 1.06] | 1.0 | 1.1 | 8.6 | 8.68 | 22.8 | 22.88 | 1.1 | 0.7453 |
 | LIFO (Recent-First) | 1.0 [1.0, 1.0] | 1.00 [1.00, 1.00] | 1.0 | 1.0 | 7.0 | 7.00 | 11.0 | 11.34 | 1.0 | 0.5175 |
 | B6 (Sync-Boundary) | 5.0 [5.0, 5.0] | 5.00 [5.00, 5.00] | 5.0 | 5.0 | 11.0 | 11.00 | 30.0 | 30.00 | 5.0 | 0.4818 |
-| B0 (Uniform Random) | 1.5 [1.0, 2.0] | 2.03 [1.52, 2.55] | 1.0 | 3.0 | 5.5 | 5.50 | 14.0 | 13.80 | 2.0 | 0.5001 |
+| B0 (Uniform Random) | 2.1 [2.0, 2.1] | 2.10 [2.05, 2.15] | 2.0 | 2.3 | 5.9 | 5.88 | 13.9 | 13.91 | 2.1 | 0.5001 |
 
 ### 3.3 MUT-3 Evaluation (32 Seeds: Avg 307 Candidates, Density: 42.5%)
 
@@ -112,7 +112,7 @@ Observed comparison:
 | R1 (0%-Retention) | 1.2 [1.2, 1.2] | 1.17 [1.16, 1.19] | 1.1 | 1.2 | 7.2 | 7.19 | 18.9 | 18.94 | 5.3 | 0.7475 |
 | LIFO (Recent-First) | 1.0 [1.0, 1.0] | 1.00 [1.00, 1.00] | 1.0 | 1.0 | 7.0 | 7.16 | 12.0 | 12.06 | 202.0 | 0.5579 |
 | B6 (Sync-Boundary) | 9.0 [9.0, 9.0] | 9.00 [9.00, 9.00] | 9.0 | 9.0 | 9.0 | 9.00 | 21.0 | 21.00 | 15.0 | 0.4472 |
-| B0 (Uniform Random) | 1.0 [1.0, 2.0] | 2.06 [1.23, 2.89] | 1.0 | 4.8 | 4.0 | 4.31 | 11.0 | 11.20 | 7.8 | 0.5005 |
+| B0 (Uniform Random) | 2.3 [2.2, 2.4] | 2.32 [2.26, 2.39] | 2.1 | 2.5 | 5.0 | 5.00 | 11.3 | 11.29 | 10.1 | 0.5005 |
 
 ### 3.4 MUT-4 Evaluation (32 Seeds: Avg 335 Candidates, Density: 29.8%)
 
@@ -129,7 +129,7 @@ Observed comparison:
 | R1 (0%-Retention) | 1.7 [1.6, 1.7] | 1.68 [1.64, 1.71] | 1.6 | 1.8 | 5.4 | 5.39 | 14.7 | 14.60 | 1.7 | 0.7454 |
 | LIFO (Recent-First) | 1.0 [1.0, 1.0] | 1.00 [1.00, 1.00] | 1.0 | 1.0 | 8.0 | 8.00 | 12.0 | 12.25 | 1.0 | 0.6980 |
 | B6 (Sync-Boundary) | 31.0 [31.0, 32.0] | 31.62 [31.24, 32.01] | 31.0 | 33.0 | 0.0 | 0.00 | 17.0 | 16.69 | 31.0 | 0.3513 |
-| B0 (Uniform Random) | 2.0 [1.0, 3.5] | 3.22 [2.15, 4.29] | 1.0 | 7.9 | 4.0 | 4.06 | 9.0 | 8.59 | 2.8 | 0.5004 |
+| B0 (Uniform Random) | 3.4 [3.3, 3.6] | 3.42 [3.30, 3.54] | 3.0 | 3.9 | 3.7 | 3.66 | 8.6 | 8.67 | 3.4 | 0.5004 |
 
 ### 3.5 MUT-5 Evaluation (32 Seeds: Avg 339 Candidates, Density: 2.7%)
 
@@ -146,7 +146,7 @@ Observed comparison:
 | R1 (0%-Retention) | 17.0 [16.4, 17.6] | 16.88 [16.39, 17.36] | 15.2 | 18.1 | 0.9 | 0.89 | 1.6 | 1.58 | 17.0 | 0.7470 |
 | LIFO (Recent-First) | 264.0 [259.0, 267.0] | 262.25 [258.20, 266.30] | 243.6 | 275.0 | 0.0 | 0.00 | 0.0 | 0.00 | 264.0 | 0.2049 |
 | B6 (Sync-Boundary) | 17.0 [17.0, 17.0] | 17.00 [17.00, 17.00] | 17.0 | 17.0 | 1.0 | 1.00 | 1.0 | 1.00 | 17.0 | 0.6664 |
-| B0 (Uniform Random) | 23.5 [17.0, 32.5] | 32.53 [22.10, 42.96] | 4.5 | 85.5 | 1.0 | 0.83 | 1.0 | 1.00 | 25.0 | 0.4963 |
+| B0 (Uniform Random) | 33.8 [32.7, 34.7] | 33.75 [32.61, 34.88] | 30.5 | 37.0 | 0.5 | 0.53 | 1.2 | 1.22 | 33.8 | 0.4963 |
 
 ### 3.6 MUT-6 Evaluation (32 Seeds: Avg 339 Candidates, Density: 0.8%)
 
@@ -163,7 +163,7 @@ Observed comparison:
 | R1 (0%-Retention) | 20.1 [19.4, 21.9] | 20.72 [19.34, 22.10] | 18.4 | 24.2 | 0.0 | 0.38 | 0.0 | 1.21 | 53.7 | 0.3025 |
 | LIFO (Recent-First) | 103.0 [97.0, 103.0] | 101.00 [97.37, 104.63] | 95.0 | 108.2 | 0.0 | 0.00 | 0.0 | 0.41 | 107.0 | 0.2647 |
 | B6 (Sync-Boundary) | 43.0 [43.0, 43.0] | 43.15 [42.38, 43.93] | 41.4 | 45.0 | 0.0 | 0.00 | 0.0 | 1.22 | 47.0 | 0.2013 |
-| B0 (Uniform Random) | 26.0 [15.0, 48.0] | 36.38 [18.16, 54.61] | 7.0 | 68.4 | 0.0 | 0.22 | 0.0 | 0.81 | 97.5 | 0.2047 |
+| B0 (Uniform Random) | 40.2 [38.1, 44.4] | 41.24 [38.99, 43.48] | 37.6 | 46.2 | 0.0 | 0.21 | 0.0 | 0.72 | 108.1 | 0.2047 |
 
 ### 3.7 MUT-7 Evaluation (32 Seeds: Avg 335 Candidates, Density: 0.0%)
 
@@ -197,7 +197,7 @@ Observed comparison:
 | R1 (0%-Retention) | 3.3 [3.2, 3.5] | 3.32 [3.19, 3.45] | 2.9 | 3.8 | 3.3 | 3.30 | 8.4 | 8.45 | 3.3 | 0.7454 |
 | LIFO (Recent-First) | 1.0 [1.0, 1.0] | 1.00 [1.00, 1.00] | 1.0 | 1.0 | 8.0 | 8.00 | 12.0 | 11.75 | 1.0 | 0.8447 |
 | B6 (Sync-Boundary) | 55.0 [55.0, 55.0] | 55.25 [54.85, 55.65] | 55.0 | 57.0 | 0.0 | 0.00 | 10.0 | 9.88 | 55.0 | 0.3240 |
-| B0 (Uniform Random) | 4.0 [2.5, 6.0] | 6.81 [3.80, 9.83] | 1.0 | 15.0 | 2.0 | 2.28 | 5.0 | 5.06 | 5.0 | 0.4995 |
+| B0 (Uniform Random) | 6.5 [6.2, 6.6] | 6.49 [6.25, 6.73] | 5.7 | 7.6 | 2.1 | 2.12 | 5.2 | 5.19 | 6.5 | 0.4995 |
 
 ### 3.9 MUT-9 Evaluation (32 Seeds: Avg 337 Candidates, Density: 41.4%)
 
@@ -214,7 +214,7 @@ Observed comparison:
 | R1 (0%-Retention) | 1.2 [1.2, 1.2] | 1.20 [1.19, 1.22] | 1.1 | 1.3 | 5.6 | 5.61 | 17.4 | 17.49 | 44.8 | 0.7452 |
 | LIFO (Recent-First) | 1.0 [1.0, 1.0] | 1.00 [1.00, 1.00] | 1.0 | 1.0 | 7.0 | 7.00 | 11.0 | 10.94 | 11.0 | 0.5621 |
 | B6 (Sync-Boundary) | 17.0 [17.0, 17.0] | 17.00 [17.00, 17.00] | 17.0 | 17.0 | 5.0 | 5.00 | 26.0 | 26.00 | 111.0 | 0.4367 |
-| B0 (Uniform Random) | 2.0 [2.0, 3.0] | 2.50 [1.95, 3.05] | 1.0 | 5.0 | 3.0 | 3.44 | 10.0 | 9.84 | 73.8 | 0.5001 |
+| B0 (Uniform Random) | 2.4 [2.4, 2.5] | 2.42 [2.36, 2.48] | 2.2 | 2.6 | 3.3 | 3.31 | 9.8 | 9.79 | 89.9 | 0.5001 |
 
 ---
 
@@ -231,7 +231,7 @@ On sparse real-shaped crash bugs such as **MUT-5** (where only a single synchron
 
 In a 120-operation workload, there are ~35–40 distinct 0%-retention persistence states (`StateKey` equivalence classes). Under an exhaustive testing budget ($B = 100$, $S_{100}$), both DCG and R2 discover all reachable failing equivalence classes and tie because both strategies exhaust distinct state representatives before step 100.
 
-Under early testing budgets ($B = 25$, $S_{25}$), DCG discovers substantially more failing states than R2 and B0: on MUT-9 ($k=1$), DCG achieves mean $S_{25} = 25.00$ vs R2's 17.75 and B0's 3.44; on MUT-8, DCG achieves mean $S_{25} = 12.88$ vs R2's 6.73 and B0's 2.28. Comparing DCG against the **DCG-FlagOnly** ablation isolates the contribution of each mechanism:
+Under early testing budgets ($B = 25$, $S_{25}$), DCG discovers substantially more failing states than R2 and B0: on MUT-9 ($k=1$), DCG achieves mean $S_{25} = 25.00$ vs R2's 17.75 and B0's 3.31; on MUT-8, DCG achieves mean $S_{25} = 12.88$ vs R2's 6.73 and B0's 2.12. Comparing DCG against the **DCG-FlagOnly** ablation isolates the contribution of each mechanism:
 
 1. **Binary Durability-Contract Flags + `StateKey` Equivalence Partitioning:** Drive the $k_1 = 1.00$ first-failure discovery on MUT-5, MUT-8, and MUT-9 as well as the early-budget $S_{25}$ lead (`DCG-FlagOnly` matches full `DCG` with mean $S_{25} = 25.00$ on MUT-9 and 12.88 on MUT-8).
 2. **Tier 1B Continuous Severity Scoring (`Score()`):** Breaks ties when multiple file classes or sync points are flagged within a trace—most visibly on **MUT-6** (second manifest sync drop), where full DCG achieves mean $k_1 = 1.00$ compared to 1.19 for `DCG-FlagOnly`.
@@ -239,5 +239,5 @@ Under early testing budgets ($B = 25$, $S_{25}$), DCG discovers substantially mo
 
 ### 4.3 MUT-8 Evaluation (Compaction-Triggered SST Sync Drop)
 
-Under MUT-8 (compaction-triggered SST sync drop, 15.2% failure density), DCG reaches the first failing state at median $k_1 = 1.0$ (mean 1.00) compared to R2's median $k_1 = 3.4$ (mean 3.42) and B0's median $k_1 = 4.0$ (mean 6.81). At early budget $B = 25$, DCG discovers mean $S_{25} = 12.88$ distinct failing states versus 6.73 for R2 and 2.28 for B0. At full budget $B = 100$, DCG and R2 both exhaust the reachable failing equivalence classes ($S_{100}$ mean 12.88 for DCG vs 12.80 for R2, compared to 5.06 for B0).
+Under MUT-8 (compaction-triggered SST sync drop, 15.2% failure density), DCG reaches the first failing state at median $k_1 = 1.0$ (mean 1.00) compared to R2's median $k_1 = 3.4$ (mean 3.42) and B0's median $k_1 = 6.5$ (mean 6.49). At early budget $B = 25$, DCG discovers mean $S_{25} = 12.88$ distinct failing states versus 6.73 for R2 and 2.12 for B0. At full budget $B = 100$, DCG and R2 both exhaust the reachable failing equivalence classes ($S_{100}$ mean 12.88 for DCG vs 12.80 for R2, compared to 5.19 for B0).
 
