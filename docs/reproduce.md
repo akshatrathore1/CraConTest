@@ -228,8 +228,8 @@ python3 analysis/paired_stats.py results/casestudy_checkpoint_per_seed.csv "Pebb
 ```
 
 #### Results Summary:
-- **Barrier intervention:** In Pebble `db.Checkpoint("checkpoint")`, checkpoint manifest and marker pointer files (`marker.manifest.*`) are written before `dir.Sync()`. Under 50% partial retention, checkpoint recovery fails on 30 of 32 seeds (58 total failures). Under `BARRIER-CKPT`, which adds parent-directory synchronization around the relevant entries, no failures are observed across the 32 evaluated seeds.
-- **Pre-Freeze Prior Discovery (`dcg-pr`):** The partial-retention prior (`dcg-pr`) was frozen before evaluation (tag `v1.0-dcg-pr-freeze`). `dcg-pr` discovers the checkpoint failure at median $k_1 = \mathbf{3.00}$ [1.00, 277.50] (mean 140.03, S25 = 0.56, S100 = 0.56, AUC Failures = 0.4749, AUC Bugs = 0.6321), compared to 0%-retention-first DCG median $k_1 = 386.50$ (mean 319.20), R2 median $k_1 = 328.40$ (mean 336.53), and uniform random B0 median $k_1 = 172.00$ (mean 190.73).
+- **Barrier intervention:** In Pebble `db.Checkpoint("checkpoint")`, checkpoint manifest and marker pointer files (`marker.manifest.*`) are written before `dir.Sync()`. Under 50% partial retention, checkpoint recovery fails on 31 of 32 seeds (53 total failures). Under `BARRIER-CKPT`, which adds parent-directory synchronization around the relevant entries, no failures are observed across the 32 evaluated seeds.
+- **Accounting-Corrected Prior Discovery (`dcg-pr`):** On `v1.1.2-evaluation-freeze`, `dcg-pr` records median $k_1 = \mathbf{245.00}$ [3.00, 306.00] (mean 156.39, S25 = S100 = 0.53, AUC Failures = 0.5010, AUC Bugs = 0.6321), compared with DCG median/mean 288.00/258.65, R2 280.41/271.55, and corrected B0 262.26/238.53. The paired DCG-PR/R2 comparison is 22 wins, 9 losses, and 0 ties.
 
 ### 4.5 MUT-5 Universe-Scaling Benchmark (ops ∈ {120, 300, 600, 1200})
 
