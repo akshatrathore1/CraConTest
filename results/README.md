@@ -91,7 +91,7 @@ Within each workload seed (`RunSingleSeedFault` in `internal/exp/benchmark.go`),
 
 9. **Multi-Distribution Workload Diversity Suite (`results/workload_diversity_summary.csv`, `results/workload_diversity_per_seed.csv`):**
    - Scope: Generalization evaluation across 5 standardized access distributions (`ycsb-a`, `ycsb-b`, `ycsb-f`, `overwrite-heavy`, `delete-heavy`) evaluated across 16 seeds (`seed = 1..16`, 25 ops) and 4 fault models (`MUT-0`, `MUT-1`, `MUT-5`, `MUT-9`).
-   - Findings: No failures are observed on `MUT-0` across the 80 evaluated preset/seed trials. On `overwrite-heavy/MUT-5` and `ycsb-f/MUT-5`, the ratios of mean discovery positions are 9.3 for R2/DCG and 20.5 for B0/DCG. These are candidate-count ratios, not wall-clock speedups.
+   - Findings: No failures are observed on `MUT-0` across the 80 evaluated preset/seed trials. Across 14 failing settings, DCG has lower mean $k_1$ than corrected B0 on 14 and R2 on 13, with one `delete-heavy/MUT-1` regression. DCG $S_{25}$ is at least R2 on all 14 (9 strict, 5 ties). Corrected sparse examples are `ycsb-f/MUT-5` DCG/R2/B0 1.00/8.49/39.71 and `overwrite-heavy/MUT-5` 1.00/9.40/22.99.
 
 ---
 
@@ -122,15 +122,14 @@ python3 analysis/paired_stats.py results/casestudy_checkpoint_per_seed.csv "Pebb
 
 `results/` contains 23 CSV files in total. Artifact provenance is transitional while the accounting-corrected campaign runs; each CSV's `git_commit` field is authoritative.
 
-- **10 accounting-corrected CSVs carrying `git_commit = f9202dfca579`:** `benchmark_per_seed.csv`, `benchmark_summary.csv`, `holdout_per_seed.csv`, `holdout_summary.csv`, `casestudy_pebble5825_per_seed.csv`, `casestudy_pebble5825_summary.csv`, `casestudy_checkpoint_per_seed.csv`, `casestudy_checkpoint_summary.csv`, `casestudy_ingest_per_seed.csv`, and `casestudy_ingest_summary.csv`. B0 `*_mean` fields are true shuffle means under `v1.1.2-evaluation-freeze`.
+- **12 accounting-corrected CSVs carrying `git_commit = f9202dfca579`:** the benchmark, holdout, #5825, checkpoint, ingest, and workload-diversity summary/per-seed pairs. B0 `*_mean` fields are true shuffle means under `v1.1.2-evaluation-freeze`.
 
 - **No current result CSV points to `6eecbf865107`;** its prior reevaluation remains reachable in Git history and by `v1.1.1-evaluation-freeze`.
 
-- **4 historical Stage 2 Workload-Diversity, Subsystem-Discovery, and Null-Control CSVs carrying `git_commit = ff6ac305e3e2`:**
-   - **4 CSVs validated read-only by Go tests in `internal/exp` (regenerated only when `-update` / `-update-artifacts` is passed):**
+- **2 historical Stage 2 Subsystem-Discovery and Null-Control CSVs carrying `git_commit = ff6ac305e3e2`:**
+   - **2 CSVs validated read-only by Go tests in `internal/exp` (regenerated only when `-update` is passed):**
     - `null_control_multishape.csv` — validated read-only by `TestNullControlMultiShape` (`internal/exp/null_control_test.go:41-103`).
     - `subsystem_discovery.csv` — validated read-only by `TestSubsystemDiscovery` (`internal/exp/subsystem_discovery_test.go:71-122, 353-360`).
-    - `workload_diversity_per_seed.csv` and `workload_diversity_summary.csv` — validated read-only by `TestWorkloadDiversityBenchmark` (`internal/exp/workload_diversity_test.go:119-213`).
 
 The historical measurements describe revision `ff6ac305e3e2`, whose ranking and feature files match `v1.0-dcg-pr-freeze`. The revised files describe either `6eecbf865107` (`v1.1.1-evaluation-freeze`) or the active accounting-corrected `f9202dfca579` (`v1.1.2-evaluation-freeze`). Reproduction uses each file's recorded revision; do not compare or combine rows without preserving that distinction.
 
