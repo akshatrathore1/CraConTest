@@ -122,9 +122,9 @@ python3 analysis/paired_stats.py results/casestudy_checkpoint_per_seed.csv "Pebb
 
 `results/` contains 23 CSV files in total. Artifact provenance is transitional while the accounting-corrected campaign runs; each CSV's `git_commit` field is authoritative.
 
-- **4 accounting-corrected CSVs carrying `git_commit = f9202dfca579`:** `benchmark_per_seed.csv`, `benchmark_summary.csv`, `holdout_per_seed.csv`, and `holdout_summary.csv`. B0 `*_mean` fields are true shuffle means under `v1.1.2-evaluation-freeze`.
+- **6 accounting-corrected CSVs carrying `git_commit = f9202dfca579`:** `benchmark_per_seed.csv`, `benchmark_summary.csv`, `holdout_per_seed.csv`, `holdout_summary.csv`, `casestudy_pebble5825_per_seed.csv`, and `casestudy_pebble5825_summary.csv`. B0 `*_mean` fields are true shuffle means under `v1.1.2-evaluation-freeze`.
 
-- **2 prior-revision reevaluation CSVs carrying `git_commit = 6eecbf865107`:** `casestudy_pebble5825_per_seed.csv` and `casestudy_pebble5825_summary.csv`. They remain valid for `v1.1.1-evaluation-freeze` but are pending a complete accounting-corrected rerun.
+- **No current result CSV points to `6eecbf865107`;** its prior reevaluation remains reachable in Git history and by `v1.1.1-evaluation-freeze`.
 
 - **8 historical Stage 2 Case-Study, Workload-Diversity, Subsystem-Discovery, and Null-Control CSVs carrying `git_commit = ff6ac305e3e2`:**
   - **6 CSVs validated read-only by Go tests in `internal/exp` (regenerated only when `-update` / `-update-artifacts` is passed):**
