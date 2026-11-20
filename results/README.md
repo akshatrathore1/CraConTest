@@ -80,7 +80,7 @@ Within each workload seed (`RunSingleSeedFault` in `internal/exp/benchmark.go`),
      - **0 engine recovery panics or hangs**.
      - **Workload A (External SSTable Ingestion):** 0 lost committed keys. 40 prefix violations across seeds 42 (15) and 777 (25) reveal a cross-channel commit-order hole on direct L0 ingest: when `db.Ingest` takes the non-overlapping direct L0 shortcut (`asFlushable = false`), Pebble allocates sequence number $s_2 > s_1$ (`ingest.go:1703`) and syncs `MANIFEST` (`version_set.go:649`) without syncing the active `.log` WAL containing preceding `NoSync` writes at sequence number $s_1 < s_2$. Upon a 0%-retention crash, $s_2$ survives via `MANIFEST` while $s_1$ is lost from the unsynced `WAL`, creating a cross-channel sequence hole (whereas overlapping flushable ingest syncs the shared WAL at `commit.go:289` and preserves strict prefix order).
      - **Workload B (Live Format Ratcheting):** 0 violations, 0 panics, and 3 open errors under 50% retention at initial database creation cutoffs (0 on seed 42, 2 on seed 100, 1 on seed 777). `atomicfs.LocateMarker` deterministically selects the latest valid format marker iteration under both full and partial retention.
-     - **Workload C (Combined Stress):** 0 lost committed keys, 0 panics. 13 open errors occur exclusively under 50% partial retention during manifest rotation and checkpointing prior to directory sync (4 on seed 42, 7 on seed 100, 2 on seed 777).
+   - **Workload C (Combined Stress):** 0 lost committed keys, 0 panics. 15 open errors occur exclusively under 50% partial retention during manifest rotation and checkpointing prior to directory sync (5 on seed 42, 7 on seed 100, 3 on seed 777).
    - Reproduction & Validation Commands:
      - Read-only validation: `go test -v -run TestSubsystemDiscovery ./internal/exp`
      - CSV regeneration: `go test -v -run TestSubsystemDiscovery ./internal/exp -update`
@@ -122,12 +122,11 @@ python3 analysis/paired_stats.py results/casestudy_checkpoint_per_seed.csv "Pebb
 
 `results/` contains 23 CSV files in total. Artifact provenance is transitional while the accounting-corrected campaign runs; each CSV's `git_commit` field is authoritative.
 
-- **13 accounting-corrected CSVs carrying `git_commit = f9202dfca579`:** the benchmark, holdout, #5825, checkpoint, ingest, and workload-diversity summary/per-seed pairs plus `null_control_multishape.csv`. B0 `*_mean` fields are true shuffle means under `v1.1.2-evaluation-freeze`.
+- **14 accounting-corrected CSVs carrying `git_commit = f9202dfca579`:** all Stage 2 benchmark, holdout, case-study, workload-diversity, null-control, and subsystem-discovery CSVs. B0 `*_mean` fields are true shuffle means under `v1.1.2-evaluation-freeze`.
 
 - **No current result CSV points to `6eecbf865107`;** its prior reevaluation remains reachable in Git history and by `v1.1.1-evaluation-freeze`.
 
-- **1 historical Stage 2 Subsystem-Discovery CSV carrying `git_commit = ff6ac305e3e2`:**
-   - `subsystem_discovery.csv` is validated read-only by `TestSubsystemDiscovery` and regenerated only with `-update`.
+- **No current Stage 2 CSV retains historical provenance;** historical files remain reachable through their recorded Git revisions and tags.
 
 The historical measurements describe revision `ff6ac305e3e2`, whose ranking and feature files match `v1.0-dcg-pr-freeze`. The revised files describe either `6eecbf865107` (`v1.1.1-evaluation-freeze`) or the active accounting-corrected `f9202dfca579` (`v1.1.2-evaluation-freeze`). Reproduction uses each file's recorded revision; do not compare or combine rows without preserving that distinction.
 
