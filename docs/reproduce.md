@@ -93,7 +93,7 @@ done
 | `main_mut1` | WAL sync dropped | 2,427 | 1,978 | 865 violations (`durably_committed`) | 15 |
 | `main_mut2` | manifest sync dropped | 2,494 | 2,112 | 1,047 open errors (malformed manifest) | 1 |
 | `main_mut3` | directory sync dropped | 2,480 | 2,048 | 999 violations (`durably_committed`) | 3 |
-| `main_mut4` | flushed-table sync dropped | 2,500 | 2,124 | 594 open errors (table size mismatch) | 2 |
+| `main_mut4` | flushed-table sync dropped | 2,500 | 2,124 | 594 open errors (table size mismatch) | 1 |
 
 `record`, `plan` and `evaluate` each take well under a second; `explore` takes 5–15 s per
 run. `evaluate` writes `curves.csv` and `positions.csv` into the run directory:

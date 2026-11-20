@@ -171,7 +171,7 @@ work itself; every reported experiment is computed from a stored trace.
 | `main_mut1` WAL sync | 2,427 | 1,978 | 865 (44%) | `durably_committed` violation | 15 |
 | `main_mut2` manifest sync | 2,494 | 2,112 | 1,047 (50%) | open error: malformed manifest | 1 |
 | `main_mut3` directory sync | 2,480 | 2,048 | 999 (49%) | `durably_committed` violation | 3 |
-| `main_mut4` flushed-table sync | 2,500 | 2,124 | 594 (28%) | open error: table size differs from manifest | 2 |
+| `main_mut4` flushed-table sync | 2,500 | 2,124 | 594 (28%) | open error: table size differs from manifest | 1 |
 
 Under MUT-3 the crash loses directory entries that were never synced, so recovered data is
 missing although the files themselves were synced. Under MUT-2 and MUT-4 Pebble refuses to

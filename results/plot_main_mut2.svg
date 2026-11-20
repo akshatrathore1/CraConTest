@@ -9,6 +9,15 @@
     .b4-line { stroke: #2563eb; stroke-width: 2.5; fill: none; }
     .b5-line { stroke: #10b981; stroke-width: 2.5; fill: none; }
     .b6-line { stroke: #f59e0b; stroke-width: 2.5; fill: none; }
+    .dcg-line { stroke: #dc2626; stroke-width: 3; fill: none; }
+    .dcg-pr-line { stroke: #991b1b; stroke-width: 3; stroke-dasharray: 6,2; fill: none; }
+    .dcg-flag-line { stroke: #ea580c; stroke-width: 2.5; fill: none; }
+    .r1-line { stroke: #db2777; stroke-width: 2.5; fill: none; }
+    .r2-line { stroke: #7c3aed; stroke-width: 2.5; fill: none; }
+    .rhg-line { stroke: #0891b2; stroke-width: 2.5; fill: none; }
+    .fifo-line { stroke: #9ca3af; stroke-width: 2; fill: none; }
+    .lifo-line { stroke: #475569; stroke-width: 2; fill: none; }
+    .stride-line { stroke: #d97706; stroke-width: 2; fill: none; }
   </style>
   <rect width="100%" height="100%" fill="#ffffff" />
   <text x="400" y="35" class="title" text-anchor="middle">Discovery Curves: main_mut2 (MUT-2)</text>
