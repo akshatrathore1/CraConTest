@@ -122,14 +122,12 @@ python3 analysis/paired_stats.py results/casestudy_checkpoint_per_seed.csv "Pebb
 
 `results/` contains 23 CSV files in total. Artifact provenance is transitional while the accounting-corrected campaign runs; each CSV's `git_commit` field is authoritative.
 
-- **12 accounting-corrected CSVs carrying `git_commit = f9202dfca579`:** the benchmark, holdout, #5825, checkpoint, ingest, and workload-diversity summary/per-seed pairs. B0 `*_mean` fields are true shuffle means under `v1.1.2-evaluation-freeze`.
+- **13 accounting-corrected CSVs carrying `git_commit = f9202dfca579`:** the benchmark, holdout, #5825, checkpoint, ingest, and workload-diversity summary/per-seed pairs plus `null_control_multishape.csv`. B0 `*_mean` fields are true shuffle means under `v1.1.2-evaluation-freeze`.
 
 - **No current result CSV points to `6eecbf865107`;** its prior reevaluation remains reachable in Git history and by `v1.1.1-evaluation-freeze`.
 
-- **2 historical Stage 2 Subsystem-Discovery and Null-Control CSVs carrying `git_commit = ff6ac305e3e2`:**
-   - **2 CSVs validated read-only by Go tests in `internal/exp` (regenerated only when `-update` is passed):**
-    - `null_control_multishape.csv` — validated read-only by `TestNullControlMultiShape` (`internal/exp/null_control_test.go:41-103`).
-    - `subsystem_discovery.csv` — validated read-only by `TestSubsystemDiscovery` (`internal/exp/subsystem_discovery_test.go:71-122, 353-360`).
+- **1 historical Stage 2 Subsystem-Discovery CSV carrying `git_commit = ff6ac305e3e2`:**
+   - `subsystem_discovery.csv` is validated read-only by `TestSubsystemDiscovery` and regenerated only with `-update`.
 
 The historical measurements describe revision `ff6ac305e3e2`, whose ranking and feature files match `v1.0-dcg-pr-freeze`. The revised files describe either `6eecbf865107` (`v1.1.1-evaluation-freeze`) or the active accounting-corrected `f9202dfca579` (`v1.1.2-evaluation-freeze`). Reproduction uses each file's recorded revision; do not compare or combine rows without preserving that distinction.
 
