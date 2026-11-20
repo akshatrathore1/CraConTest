@@ -53,13 +53,13 @@ Within each workload seed (`RunSingleSeedFault` in `internal/exp/benchmark.go`),
      - `MUT-0` (unfaulted baseline): Parent directory sync is not forced upon file creation or rename. In partial-retention states (50%), file data survives while the unsynced parent directory entry is dropped, reproducing Pebble #5825 (58 total failures across 25 of 32 failing seeds).
    - `BARRIER-5825` (Manifest-Rotation Barrier Control): Enforces a parent-directory sync before creating a new `marker.manifest.*` file. In the evaluated model, this makes the pending `MANIFEST-xxxxxx` entry durable before its marker; no failures are observed across the 32 evaluated seeds.
    - `casestudy_pebble5825_summary.csv`: Aggregated summary statistics across 32 seeds comparing standard DCG, DCG-PR (`dcg-pr`), DCG Flag-Only, R2, R1, and baseline search heuristics.
-   - `casestudy_pebble5825_per_seed.csv`: Unaggregated per-seed discovery metrics across 32 seeds. Demonstrates that while standard DCG prioritizes 0% retention first (median $k_1 = 211.00$ [203.00, 340.00], mean $k_1 = 301.60$), `dcg-pr` incorporates a post-hoc partial-retention prior tracking `UnsyncedDirEntryCount >= 2`, discovering the failure at median $k_1 = \mathbf{2.00}$ [2.00, 5.00] (mean $k_1 = 12.40$, S25 = 1.44, S100 = 1.44, AUC Failures = 0.6733, AUC Bugs = 0.7562), compared to uniform random B0 median $k_1 = 148.00$ (mean 180.74) and state-representative B5 median $k_1 = 62.00$ (mean 57.68).
+   - `casestudy_pebble5825_per_seed.csv`: Unaggregated per-seed discovery metrics across 32 seeds. Standard DCG prioritizes 0% retention first (median/mean $k_1=203.00/243.84$); post-hoc `dcg-pr` discovers the failure at 2.00/12.40, compared with accounting-corrected B0 178.73/192.72 and representative B5 62.00/57.68.
 
 4. **Intra-Class Subsystem Transfer Case Study: Pebble Checkpoint Directory Race (`results/casestudy_checkpoint_summary.csv`, `results/casestudy_checkpoint_per_seed.csv`):**
    - Scope: Post-Freeze Evaluation 1 evaluates the checkpoint directory race present in Pebble v2.1.7 and later fixed upstream by `15b500fb`. The benchmark uses 32 deterministic seeds (`42, 100..900, 1001..1022`), retention policies 0%, 50%, and 100%, and `-checkpoint-at 60`.
-   - `MUT-0` (unfaulted baseline): Pebble `db.Checkpoint("checkpoint")` writes checkpoint manifest and marker pointer files (`marker.manifest.*`) before `dir.Sync()`. Under 50% partial retention, unsynced directory entries are dropped while marker pointers survive, causing checkpoint recovery failure (`open_error`) on 30 of 32 seeds (58 total failures across 30 of 32 seeds).
+   - `MUT-0` (unfaulted baseline): Pebble `db.Checkpoint("checkpoint")` writes checkpoint manifest and marker pointer files before `dir.Sync()`. Under 50% partial retention, reopening fails on 31 of 32 seeds (53 total failures).
    - `BARRIER-CKPT` (Checkpoint Directory Barrier Control): Adds immediate parent-directory syncs when writing checkpoint manifests and markers. No checkpoint recovery failures are observed across the 32 evaluated seeds.
-   - `casestudy_checkpoint_summary.csv`: Aggregated summary statistics across 32 seeds comparing standard DCG, DCG-PR (`dcg-pr`), DCG Flag-Only, R2, R1, and baseline search heuristics. Demonstrates that `dcg-pr` (prior frozen before evaluation) discovers checkpoint failures at median $k_1 = \mathbf{3.00}$ [1.00, 277.50] (mean $k_1 = 140.03$, AUC Failures = 0.4749, AUC Bugs = 0.6321), whereas 0%-retention-first DCG has median $k_1 = 386.50$ (mean $k_1 = 319.20$), R2 has median $k_1 = 328.40$ (mean $k_1 = 336.53$), and random B0 has median $k_1 = 172.00$ (mean 190.73).
+   - `casestudy_checkpoint_summary.csv`: Accounting-corrected DCG-PR median/mean $k_1=245.00/156.39$ (AUC Failures 0.5010, AUC Bugs 0.6321), versus DCG 288.00/258.65, R2 280.41/271.55, and B0 262.26/238.53. The paired DCG-PR/R2 result is 22/9/0.
    - `casestudy_checkpoint_per_seed.csv`: Unaggregated per-seed discovery metrics across all 32 seeds.
 
 5. **MUT-5 Universe-Scaling Benchmark (`results/scaling_mut5_summary.csv`, `results/scaling_mut5_per_seed.csv`):**
@@ -120,15 +120,11 @@ python3 analysis/paired_stats.py results/casestudy_checkpoint_per_seed.csv "Pebb
 
 ## Provenance and Cross-Validation Contract
 
-`results/` contains 23 CSV files in total. Artifact provenance is transitional while the accounting-corrected campaign runs; each CSV's `git_commit` field is authoritative.
+`results/` contains 23 CSV files in total. Each CSV's own schema/provenance is authoritative.
 
 - **14 accounting-corrected CSVs carrying `git_commit = f9202dfca579`:** all Stage 2 benchmark, holdout, case-study, workload-diversity, null-control, and subsystem-discovery CSVs. B0 `*_mean` fields are true shuffle means under `v1.1.2-evaluation-freeze`.
 
-- **No current result CSV points to `6eecbf865107`;** its prior reevaluation remains reachable in Git history and by `v1.1.1-evaluation-freeze`.
-
-- **No current Stage 2 CSV retains historical provenance;** historical files remain reachable through their recorded Git revisions and tags.
-
-The historical measurements describe revision `ff6ac305e3e2`, whose ranking and feature files match `v1.0-dcg-pr-freeze`. The revised files describe either `6eecbf865107` (`v1.1.1-evaluation-freeze`) or the active accounting-corrected `f9202dfca579` (`v1.1.2-evaluation-freeze`). Reproduction uses each file's recorded revision; do not compare or combine rows without preserving that distinction.
+- **All 14 Stage 2 CSVs carrying a `git_commit` column identify `f9202dfca579`**, the accounting-corrected `v1.1.2-evaluation-freeze`. Earlier artifacts remain reachable through Git history and their immutable tags; they are not mixed into current tables.
 
 - **9 Fixed-Schema Regression CSVs Without a `git_commit` Column:**
   - **7 Stage 1 Single-Run Discovery Curve Tables:** `discovery_mut0.csv` and `discovery_mut1.csv` guarded byte-for-byte by `TestGateG4` (`internal/exp/gate_g4_test.go:20-95`); `discovery_main_mut0.csv` through `discovery_main_mut4.csv` guarded byte-for-byte by `TestMainRunArtifactsMatchStoredTables` (`internal/exp/main_artifacts_test.go:15-56`).

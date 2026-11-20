@@ -309,7 +309,7 @@ To address these limitations, the expanded evaluation incorporates principled sp
 
 1. **Rigorous Baselines (R1 and R2):**
    - **R1 (0%-Retention-First):** Recognizes that storage consistency violations manifest primarily when dirty unpersisted bytes are dropped upon crash. `R1` partitions the candidate universe by retention policy and exhaustively tests 0% retention before testing 100% retention.
-   - **R2 (State-Representative Random):** Partitions 0% retention candidates into equivalence classes by canonical persistence state key (`StateKey`), selecting boundary-adjacent representatives within each `StateKey` class using graph features (`BeforeBoundary`, `BarrierProximity`, and canonical order `candidate.Less`) before shuffling classes and evaluating redundant cutoffs afterward. Note that `R2` is CraConTest's internal `StateKey` equivalence-class baseline—**not** a re-implementation of Pathfinder's full C++/LLVM syscall-function subgraph isomorphism and DPOR model checker—so comparisons against `R2` measure the intra-framework gain of adding POSIX durability-contract priors onto `StateKey` partitioning rather than a head-to-head comparison against the Pathfinder tool. On sparse faults such as `MUT-5`, `R2` cuts search cost by half ($k_1 = 13.01$ vs `B0`'s $25.97$).
+   - **R2 (State-Representative Random):** Partitions 0% retention candidates into equivalence classes by canonical persistence state key (`StateKey`), selecting boundary-adjacent representatives within each `StateKey` class using graph features (`BeforeBoundary`, `BarrierProximity`, and canonical order `candidate.Less`) before shuffling classes and evaluating redundant cutoffs afterward. Note that `R2` is CraConTest's internal `StateKey` equivalence-class baseline—**not** a re-implementation of Pathfinder's full C++/LLVM syscall-function subgraph isomorphism and DPOR model checker—so comparisons against `R2` measure the intra-framework gain of adding POSIX durability-contract priors onto `StateKey` partitioning rather than a head-to-head comparison against the Pathfinder tool. On `MUT-5`, corrected mean $k_1$ is 13.04 for R2 versus 33.75 for B0.
 2. **RHG (Reachability-Hazard Guided / B7):**
    - Eliminates representative key divergence by maintaining strict deterministic grouping and ranks candidates by reachable uncommitted hazard surfaces, achieving normalized AUC values between $0.70$ and $0.82$.
 3. **DCG (Durability-Contract Guided / B8) & DCG-FlagOnly (Ablation):**
@@ -331,29 +331,29 @@ Across 32 deterministic workload seeds (>11,000 evaluated crash candidates):
 | Fault Model | Fault Description | Failure Density | DCG | DCG-FlagOnly | RHG | R2 | R1 | LIFO | B6 | B0 |
 |---|---|---|---|---|---|---|---|---|---|---|
 | **MUT-0** | Null Control (No Fault) | 0.0% | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 |
-| **MUT-1** | All WAL Syncs Dropped | 36.4% | **1.00** [1.00, 1.00] | **1.00** [1.00, 1.00] | **1.00** [1.00, 1.00] | 1.44 [1.42, 1.46] | 1.37 [1.34, 1.39] | 5.00 [5.00, 5.00] | 17.00 [17.00, 17.00] | 2.00 [2.00, 2.00] |
-| **MUT-2** | MANIFEST Syncs Dropped | 47.3% | **1.00** [1.00, 1.00] | **1.00** [1.00, 1.00] | **1.00** [1.00, 1.00] | 1.17 [1.16, 1.19] | 1.04 [1.04, 1.05] | **1.00** [1.00, 1.00] | 5.00 [5.00, 5.00] | 1.55 [1.38, 1.71] |
-| **MUT-3** | Directory Syncs Dropped | 42.5% | **1.00** [1.00, 1.00] | 1.03 [1.03, 1.04] | **1.00** [1.00, 1.00] | 1.44 [1.40, 1.48] | 1.17 [1.15, 1.19] | **1.00** [1.00, 1.00] | 9.00 [9.00, 9.00] | 2.00 [2.00, 2.00] |
-| **MUT-4** | SST Flush Syncs Dropped | 29.8% | **1.00** [1.00, 1.00] | **1.00** [1.00, 1.00] | **1.00** [1.00, 1.00] | 1.95 [1.90, 2.01] | 1.67 [1.61, 1.74] | **1.00** [1.00, 1.00] | 31.62 [31.24, 32.01] | 2.39 [2.22, 2.56] |
-| **MUT-5** | Sparse $k$-th WAL Sync Dropped ($k=1$) | 2.7% | **1.00** [1.00, 1.00] | **1.00** [1.00, 1.00] | **1.00** [1.00, 1.00] | 13.01 [12.68, 13.34] | 17.04 [16.54, 17.53] | 262.25 [258.20, 266.30] | 17.00 [17.00, 17.00] | 25.97 [25.00, 26.94] |
-| **MUT-6** | Second Manifest Sync Dropped | 0.8% | **1.00** [1.00, 1.00] | 1.20 [1.17, 1.24] | 14.08 [13.50, 14.65] | 7.72 [7.46, 7.97] | 20.79 [19.89, 21.70] | 101.00 [97.37, 104.63] | 43.15 [42.38, 43.93] | 31.12 [29.02, 33.21] |
+| **MUT-1** | All WAL Syncs Dropped | 36.4% | **1.00** [1.00, 1.00] | **1.00** [1.00, 1.00] | **1.00** [1.00, 1.00] | 1.42 [1.40, 1.45] | 1.38 [1.35, 1.41] | 5.00 [5.00, 5.00] | 17.00 [17.00, 17.00] | 2.73 [2.63, 2.82] |
+| **MUT-2** | MANIFEST Syncs Dropped | 47.3% | **1.00** [1.00, 1.00] | **1.00** [1.00, 1.00] | **1.00** [1.00, 1.00] | 1.17 [1.15, 1.19] | 1.05 [1.04, 1.06] | **1.00** [1.00, 1.00] | 5.00 [5.00, 5.00] | 2.10 [2.05, 2.15] |
+| **MUT-3** | Directory Syncs Dropped | 42.5% | **1.00** [1.00, 1.00] | 1.04 [1.04, 1.05] | **1.00** [1.00, 1.00] | 1.42 [1.40, 1.45] | 1.17 [1.16, 1.19] | **1.00** [1.00, 1.00] | 9.00 [9.00, 9.00] | 2.32 [2.26, 2.39] |
+| **MUT-4** | SST Flush Syncs Dropped | 29.8% | **1.00** [1.00, 1.00] | **1.00** [1.00, 1.00] | **1.00** [1.00, 1.00] | 1.93 [1.88, 1.98] | 1.68 [1.64, 1.71] | **1.00** [1.00, 1.00] | 31.62 [31.24, 32.01] | 3.42 [3.30, 3.54] |
+| **MUT-5** | Sparse $k$-th WAL Sync Dropped ($k=1$) | 2.7% | **1.00** [1.00, 1.00] | **1.00** [1.00, 1.00] | **1.00** [1.00, 1.00] | 13.04 [12.71, 13.37] | 16.88 [16.39, 17.36] | 262.25 [258.20, 266.30] | 17.00 [17.00, 17.00] | 33.75 [32.61, 34.88] |
+| **MUT-6** | Second Manifest Sync Dropped | 0.8% | **1.00** [1.00, 1.00] | 1.19 [1.16, 1.21] | 14.08 [13.50, 14.65] | 7.59 [7.31, 7.87] | 20.72 [19.34, 22.10] | 101.00 [97.37, 104.63] | 43.15 [42.38, 43.93] | 41.24 [38.99, 43.48] |
 | **MUT-7** | Options Dir Sync (No-op Control) | 0.0% | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 |
-| **MUT-8** | Compaction SST Sync Drop | 15.2% | **1.00** [1.00, 1.00] | **1.00** [1.00, 1.00] | **1.00** [1.00, 1.00] | 3.58 [3.50, 3.66] | 3.26 [3.12, 3.40] | **1.00** [1.00, 1.00] | 55.25 [54.85, 55.65] | 4.41 [4.23, 4.58] |
-| **MUT-9** | Single $k$-th Directory Sync Drop | 41.4% | **1.00** [1.00, 1.00] | **1.00** [1.00, 1.00] | **1.00** [1.00, 1.00] | 1.40 [1.36, 1.44] | 1.21 [1.18, 1.23] | **1.00** [1.00, 1.00] | 17.00 [17.00, 17.00] | 1.95 [1.90, 2.01] |
+| **MUT-8** | Compaction SST Sync Drop | 15.2% | **1.00** [1.00, 1.00] | **1.00** [1.00, 1.00] | **1.00** [1.00, 1.00] | 3.42 [3.34, 3.51] | 3.32 [3.19, 3.45] | **1.00** [1.00, 1.00] | 55.25 [54.85, 55.65] | 6.49 [6.25, 6.73] |
+| **MUT-9** | Single $k$-th Directory Sync Drop | 41.4% | **1.00** [1.00, 1.00] | **1.00** [1.00, 1.00] | **1.00** [1.00, 1.00] | 1.38 [1.35, 1.40] | 1.20 [1.19, 1.22] | **1.00** [1.00, 1.00] | 17.00 [17.00, 17.00] | 2.42 [2.36, 2.48] |
 
 #### Table 2: Failing State Discovery ($S_{25}$ Early Budget / $S_{100}$ Exhaustive Budget Mean)
 
 | Fault Model | DCG ($S_{25}$ / $S_{100}$) | DCG-FlagOnly | RHG | R2 | R1 | LIFO | B6 | B0 |
 |---|---|---|---|---|---|---|---|---|
-| **MUT-1** | **23.94** / **23.97** | **23.94** / **23.97** | 17.69 / **23.97** | 17.12 / **23.97** | 10.02 / 19.80 | 6.53 / 8.94 | 5.00 / 13.00 | 6.12 / 14.61 |
-| **MUT-2** | **25.00** / **33.00** | **25.00** / **33.00** | 24.00 / **33.00** | 21.14 / **33.00** | 8.67 / 22.79 | 7.00 / 11.34 | 11.00 / 30.00 | 5.64 / 13.75 |
-| **MUT-3** | 24.00 / **27.00** | **24.12** / **27.00** | 21.03 / **27.00** | 17.26 / **27.00** | 7.27 / 19.00 | 7.16 / 12.06 | 9.00 / 21.00 | 5.00 / 11.22 |
-| **MUT-4** | **21.69** / **21.69** | **21.69** / **21.69** | 16.69 / **21.69** | 12.57 / **21.69** | 5.44 / 14.51 | 8.00 / 12.25 | 0.00 / 16.69 | 3.53 / 8.59 |
-| **MUT-5** | **2.00** / **2.00** | **2.00** / **2.00** | 1.81 / **2.00** | 1.30 / **2.00** | 0.87 / 1.60 | 0.00 / 0.00 | 1.00 / 1.00 | 0.48 / 1.00 |
-| **MUT-6** | **1.62** / **1.62** | **1.62** / **1.62** | 1.22 / **1.62** | 1.07 / **1.62** | 0.39 / 1.20 | 0.00 / 0.41 | 0.00 / 1.22 | 0.00 / 0.81 |
+| **MUT-1** | **23.94** / **23.97** | **23.94** / **23.97** | 17.69 / **23.97** | 17.14 / **23.97** | 10.03 / 19.88 | 6.53 / 8.94 | 5.00 / 13.00 | 6.34 / 14.58 |
+| **MUT-2** | **25.00** / **33.00** | **25.00** / **33.00** | 24.00 / **33.00** | 21.12 / **33.00** | 8.68 / 22.88 | 7.00 / 11.34 | 11.00 / 30.00 | 5.88 / 13.91 |
+| **MUT-3** | 24.00 / **27.00** | 24.10 / **27.00** | 21.03 / **27.00** | 17.24 / **27.00** | 7.19 / 18.94 | 7.16 / 12.06 | 9.00 / 21.00 | 5.00 / 11.29 |
+| **MUT-4** | **21.69** / **21.69** | **21.69** / **21.69** | 16.69 / **21.69** | 12.60 / **21.69** | 5.39 / 14.60 | 8.00 / 12.25 | 0.00 / 16.69 | 3.66 / 8.67 |
+| **MUT-5** | **2.00** / **2.00** | **2.00** / **2.00** | 1.81 / **2.00** | 1.31 / **2.00** | 0.89 / 1.58 | 0.00 / 0.00 | 1.00 / 1.00 | 0.53 / 1.22 |
+| **MUT-6** | **1.62** / **1.62** | **1.62** / **1.62** | 1.22 / **1.62** | 1.09 / **1.62** | 0.38 / 1.21 | 0.00 / 0.41 | 0.00 / 1.22 | 0.21 / 0.72 |
 | **MUT-7** | 0.00 / 0.00 | 0.00 / 0.00 | 0.00 / 0.00 | 0.00 / 0.00 | 0.00 / 0.00 | 0.00 / 0.00 | 0.00 / 0.00 | 0.00 / 0.00 |
-| **MUT-8** | **12.88** / **12.88** | **12.88** / **12.88** | 7.88 / **12.88** | 6.74 / 12.82 | 3.27 / 8.41 | 8.00 / 11.75 | 0.00 / 9.88 | 2.00 / 5.05 |
-| **MUT-9** | **25.00** / **27.00** | **25.00** / **27.00** | 20.00 / **27.00** | 17.78 / **27.00** | 5.57 / 17.44 | 7.00 / 10.94 | 5.00 / 26.00 | 3.03 / 9.83 |
+| **MUT-8** | **12.88** / **12.88** | **12.88** / **12.88** | 7.88 / **12.88** | 6.73 / 12.80 | 3.30 / 8.45 | 8.00 / 11.75 | 0.00 / 9.88 | 2.12 / 5.19 |
+| **MUT-9** | **25.00** / **27.00** | **25.00** / **27.00** | 20.00 / **27.00** | 17.75 / **27.00** | 5.61 / 17.49 | 7.00 / 10.94 | 5.00 / 26.00 | 3.31 / 9.79 |
 
 > **Note on MUT-6 $S_{25}$ Denominator:** In `benchmark_summary.csv` and the summary tables above, $S_{25}$ and $S_{100}$ are averaged across all 32 evaluated seeds ($52/32 = 1.62$). In `analysis/paired_stats.py`, paired statistical tests condition strictly on the 13 failing seeds with non-zero failure density ($m > 0$), reporting conditional mean $S_{25} = 4.00$ ($52/13$) for DCG (and $1.07$ vs. $2.64$ for R2). Both metrics describe the identical underlying run data.
 
@@ -760,7 +760,7 @@ The following scope boundaries are established empirically across 32 seeds:
 
 For step-by-step reproduction instructions, CLI invocations, and environment setup across Linux and Windows platforms, see the comprehensive [docs/reproduce.md](reproduce.md).
 
-Every quantitative claim is linked below to a command and committed artifact. Tag `v1.0-dcg-pr-freeze` (`67bbe7ded57d`) freezes only `internal/strategy/dcg.go` and `internal/graph/features.go`; it does not contain the later checkpoint, ingest, or workload-diversity extensions. The Stage 2 CSV artifacts record validation commit `ff6ac305e3e2`, which preserves the frozen ranking and feature files while including the post-freeze experiment code. Reproducing those measurements requires the recorded revision and the pinned analysis stack, not the freeze tag alone. Later ranking or feature revisions require a separate frozen snapshot and regenerated results; passing implementation tests does not establish equivalence to the historical rankings, and existing CSV provenance must not be changed independently of the measurements.
+Every quantitative claim is linked below to a command and committed artifact. The active evidence baseline is `v1.1.2-evaluation-freeze` (`f9202dfca579`), which freezes implementation, workloads, analysis, and generators after correcting B0 mean aggregation. All 14 Stage 2 CSVs with a `git_commit` column identify that source. Historical tags (`v1.0-dcg-pr-freeze`, `v1.1-evaluation-freeze`, and `v1.1.1-evaluation-freeze`) remain immutable for chronology; their artifacts are not mixed into current tables.
 
 > **Platform Note:** On Windows, invoke statistical analysis commands using `python` or `py` rather than `python3` (and build with `CGO_ENABLED=0`).
 
@@ -771,14 +771,14 @@ Every quantitative claim is linked below to a command and committed artifact. Ta
 | Paired stats (DCG vs. R1, R2, B0, B2) | `python3 analysis/paired_stats.py results/benchmark_per_seed.csv "Seeded Benchmark Faults (32 seeds)" MUT-1 MUT-2 MUT-3 MUT-4 MUT-5 MUT-6 MUT-8 MUT-9` | — |
 | Holdout `MUT-X1..X5` and out-of-contract `MUT-X6` | `go run ./cmd/cracontest benchmark -ops 120 -faults MUT-X1_k2,MUT-X1_k3,MUT-X1_k4,MUT-X1_k6,MUT-X1_k9,MUT-X2_k1,MUT-X2_k3,MUT-X2_k4,MUT-X2_k5,MUT-X3_k1,MUT-X3_k2,MUT-X3_k3,MUT-X4_p04,MUT-X5_p12,MUT-X6_k2,MUT-X6_k5,MUT-X6_k9 -csv results/holdout_summary.csv -per-seed-csv results/holdout_per_seed.csv -report "" && python3 analysis/paired_stats.py results/holdout_per_seed.csv "Holdout Faults" MUT-X1_k2 MUT-X1_k3 MUT-X1_k4 MUT-X1_k6 MUT-X1_k9 MUT-X2_k1 MUT-X2_k3 MUT-X3_k1 MUT-X3_k2 MUT-X3_k3 MUT-X4_p04 MUT-X5_p12` | `results/holdout_summary.csv`, `results/holdout_per_seed.csv` |
 | Pebble `#5825` case study A/B and `dcg-pr` | `go run ./cmd/cracontest benchmark -faults MUT-0,BARRIER-5825 -max-manifest-size 1 -policies 0,50,100 -csv results/casestudy_pebble5825_summary.csv -per-seed-csv results/casestudy_pebble5825_per_seed.csv -report ""` | `results/casestudy_pebble5825_summary.csv`, `results/casestudy_pebble5825_per_seed.csv` |
-| Checkpoint holdout A/B (frozen at `v1.0-dcg-pr-freeze`) | `go run ./cmd/cracontest benchmark -faults MUT-0,BARRIER-CKPT -checkpoint-at 60 -policies 0,50,100 -csv results/casestudy_checkpoint_summary.csv -per-seed-csv results/casestudy_checkpoint_per_seed.csv -report ""` | `results/casestudy_checkpoint_summary.csv`, `results/casestudy_checkpoint_per_seed.csv` |
+| Checkpoint A/B reevaluation | `go run ./cmd/cracontest benchmark -faults MUT-0,BARRIER-CKPT -checkpoint-at 60 -policies 0,50,100 -csv results/casestudy_checkpoint_summary.csv -per-seed-csv results/casestudy_checkpoint_per_seed.csv -report ""` | `results/casestudy_checkpoint_summary.csv`, `results/casestudy_checkpoint_per_seed.csv` |
 | `MUT-5` universe-scaling (`120..1200` ops) | `go test -v -count=1 -timeout 1200s -run TestScalingMUT5 ./internal/exp -update` | `results/scaling_mut5_summary.csv`, `results/scaling_mut5_per_seed.csv` |
 | Multi-shape null control (`108` runs, `12` shapes) | `go test -v -count=1 -timeout 1200s -run TestNullControlMultiShape ./internal/exp -update` | `results/null_control_multishape.csv` |
 | Subsystem empirical discovery (Workloads A, B, C under `MUT-0`) | `go test -v -count=1 -run TestSubsystemDiscovery ./internal/exp -update` | `results/subsystem_discovery.csv` |
 | Direct L0 `db.Ingest` 32-seed benchmark | `go test -v -count=1 -run TestCaseStudyIngestBenchmark ./internal/exp -update-artifacts` | `results/casestudy_ingest_summary.csv`, `results/casestudy_ingest_per_seed.csv` |
 | Workload diversity benchmark 5 presets | `go test -v -count=1 -run TestWorkloadDiversityBenchmark ./internal/exp -update-artifacts` | `results/workload_diversity_summary.csv`, `results/workload_diversity_per_seed.csv` |
 
-> **Note on Code Freeze & Pre vs. Post-Freeze Chronology:** Tag `v1.0-dcg-pr-freeze` (`67bbe7ded57d`) pins `internal/strategy/dcg.go` and `internal/graph/features.go`. Parameterized and stochastic fault models (`MUT-X1..X5`) and out-of-contract control (`MUT-X6`) were committed prior to freeze at `c67a44a` (2026-11-01). The three subsequent evaluations—the checkpoint race later fixed by `15b500fb` (§10), Direct L0 Ingest Cross-Channel Hole (§13.5), and Multi-Distribution Workload Suite (§14)—were designed and executed strictly post-freeze with 0 bytes of change to the frozen ranking and feature code.
+> **Freeze chronology:** `v1.0-dcg-pr-freeze` records the original ranking chronology; parameterized faults were defined before that tag, while checkpoint, ingest, and diversity were originally evaluated afterward. The current `v1.1.2-evaluation-freeze` campaign is a reevaluation of those known settings after implementation and accounting corrections, not a new blind holdout. No ranking was retuned after observing the regenerated outcomes.
 
 ---
 

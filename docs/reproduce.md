@@ -150,15 +150,15 @@ The multi-seed benchmark runs 32 deterministic workload seeds (`42, 100..900, 10
 | Fault Model | Fault Description | Failure Density | DCG $k_1$ | R2 $k_1$ | B0 $k_1$ | DCG $S_{25}$ / $S_{100}$ | R2 $S_{25}$ / $S_{100}$ | B0 $S_{25}$ / $S_{100}$ |
 |---|---|---|---|---|---|---|---|---|
 | **MUT-0** | Null Control (No Fault) | 0.0% | 0.00 | 0.00 | 0.00 | 0.00 / 0.00 | 0.00 / 0.00 | 0.00 / 0.00 |
-| **MUT-1** | All WAL Syncs Dropped | 36.4% | **1.00** | 1.44 | 2.00 | **23.94** / **23.97** | 17.12 / **23.97** | 6.12 / 14.61 |
-| **MUT-2** | MANIFEST Syncs Dropped | 47.3% | **1.00** | 1.17 | 1.55 | **25.00** / **33.00** | 21.14 / **33.00** | 5.64 / 13.75 |
-| **MUT-3** | Directory Syncs Dropped | 42.5% | **1.00** | 1.44 | 2.00 | 24.00 / **27.00** | 17.26 / **27.00** | 5.00 / 11.22 |
-| **MUT-4** | SST Flush Syncs Dropped | 29.8% | **1.00** | 1.95 | 2.39 | **21.69** / **21.69** | 12.57 / **21.69** | 3.53 / 8.59 |
-| **MUT-5** | Sparse $k$-th WAL Sync Dropped ($k=1$) | 2.7% | **1.00** | 13.01 | 25.97 | **2.00** / **2.00** | 1.30 / **2.00** | 0.48 / 1.00 |
-| **MUT-6** | Second Manifest Sync Dropped | 0.8% | **1.00** | 7.72 | 31.12 | **1.62** / **1.62** | 1.07 / **1.62** | 0.00 / 0.81 |
+| **MUT-1** | All WAL Syncs Dropped | 36.4% | **1.00** | 1.42 | 2.73 | **23.94** / **23.97** | 17.14 / **23.97** | 6.34 / 14.58 |
+| **MUT-2** | MANIFEST Syncs Dropped | 47.3% | **1.00** | 1.17 | 2.10 | **25.00** / **33.00** | 21.12 / **33.00** | 5.88 / 13.91 |
+| **MUT-3** | Directory Syncs Dropped | 42.5% | **1.00** | 1.42 | 2.32 | 24.00 / **27.00** | 17.24 / **27.00** | 5.00 / 11.29 |
+| **MUT-4** | SST Flush Syncs Dropped | 29.8% | **1.00** | 1.93 | 3.42 | **21.69** / **21.69** | 12.60 / **21.69** | 3.66 / 8.67 |
+| **MUT-5** | Sparse $k$-th WAL Sync Dropped ($k=1$) | 2.7% | **1.00** | 13.04 | 33.75 | **2.00** / **2.00** | 1.31 / **2.00** | 0.53 / 1.22 |
+| **MUT-6** | Second Manifest Sync Dropped | 0.8% | **1.00** | 7.59 | 41.24 | **1.62** / **1.62** | 1.09 / **1.62** | 0.21 / 0.72 |
 | **MUT-7** | Options Dir Sync (No-op Control) | 0.0% | 0.00 | 0.00 | 0.00 | 0.00 / 0.00 | 0.00 / 0.00 | 0.00 / 0.00 |
-| **MUT-8** | Compaction SST Sync Drop | 15.2% | **1.00** | 3.58 | 4.41 | **12.88** / **12.88** | 6.74 / 12.82 | 2.00 / 5.05 |
-| **MUT-9** | Single $k$-th Directory Sync Drop | 41.4% | **1.00** | 1.40 | 1.95 | **25.00** / **27.00** | 17.78 / **27.00** | 3.03 / 9.83 |
+| **MUT-8** | Compaction SST Sync Drop | 15.2% | **1.00** | 3.42 | 6.49 | **12.88** / **12.88** | 6.73 / 12.80 | 2.12 / 5.19 |
+| **MUT-9** | Single $k$-th Directory Sync Drop | 41.4% | **1.00** | 1.38 | 2.42 | **25.00** / **27.00** | 17.75 / **27.00** | 3.31 / 9.79 |
 
 > **Note on MUT-6 $S_{25}$ Denominator:** In `benchmark_summary.csv` and the summary tables above, $S_{25}$ and $S_{100}$ are averaged across all 32 evaluated seeds ($52/32 = 1.62$). In `analysis/paired_stats.py`, paired statistical tests condition strictly on the 13 failing seeds with non-zero failure density ($m > 0$), reporting conditional mean $S_{25} = 4.00$ ($52/13$) for DCG (and $1.07$ vs. $2.64$ for R2). Both metrics describe the identical underlying run data.
 
@@ -295,7 +295,7 @@ go run ./cmd/cracontest benchmark -faults MUT-0 -seeds 42,100,777 -ops 80 -inges
 - **0 engine recovery panics or hangs**.
 - **Workload A (External SSTable Ingestion):** 0 lost committed keys. 40 prefix violations across seeds 42 (15) and 777 (25) reveal a cross-channel commit-order hole on direct L0 ingest: when `db.Ingest` takes the non-overlapping direct L0 shortcut (`asFlushable = false`), Pebble allocates sequence number $s_2 > s_1$ (`ingest.go:1703`) and syncs `MANIFEST` (`version_set.go:649`) without syncing the active `.log` WAL containing preceding `NoSync` writes at sequence number $s_1 < s_2$. Upon a 0%-retention crash, $s_2$ survives via `MANIFEST` while $s_1$ is lost from the unsynced `WAL`, creating a cross-channel sequence hole (whereas overlapping flushable ingest syncs the shared WAL at `commit.go:289` and preserves strict prefix order).
 - **Workload B (Live Format-Version Ratcheting):** 0 violations, 0 panics, and 3 open errors under 50% retention at initial database creation cutoffs (0 on seed 42, 2 on seed 100, 1 on seed 777).
-- **Workload C (Combined Lifecycle Stress):** 0 lost committed keys, 0 panics. 13 open errors occur exclusively under 50% partial retention during manifest rotation and checkpointing prior to directory sync (4 on seed 42, 7 on seed 100, 2 on seed 777).
+- **Workload C (Combined Lifecycle Stress):** 0 lost committed keys, 0 panics. 15 open errors occur exclusively under 50% partial retention during manifest rotation and checkpointing prior to directory sync (5 on seed 42, 7 on seed 100, 3 on seed 777).
 
 ## 5. Acceptance Tests
 

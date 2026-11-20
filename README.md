@@ -186,32 +186,11 @@ To evaluate ranking strategies across both dense and sparse failure distribution
 
 #### Table 1: Cost-to-First-Failure ($k_1$ Mean [95% CI])
 
-| Fault Model | Fault Description | Failure Density | DCG | DCG-FlagOnly | RHG | R2 | R1 | LIFO | B6 | B0 |
-|---|---|---|---|---|---|---|---|---|---|---|
-| **MUT-0** | Null Control (No Fault) | 0.0% | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 |
-| **MUT-1** | All WAL Syncs Dropped | 36.4% | **1.00** [1.00, 1.00] | **1.00** [1.00, 1.00] | **1.00** [1.00, 1.00] | 1.44 [1.42, 1.46] | 1.37 [1.34, 1.39] | 5.00 [5.00, 5.00] | 17.00 [17.00, 17.00] | 2.00 [2.00, 2.00] |
-| **MUT-2** | MANIFEST Syncs Dropped | 47.3% | **1.00** [1.00, 1.00] | **1.00** [1.00, 1.00] | **1.00** [1.00, 1.00] | 1.17 [1.16, 1.19] | 1.04 [1.04, 1.05] | **1.00** [1.00, 1.00] | 5.00 [5.00, 5.00] | 1.55 [1.38, 1.71] |
-| **MUT-3** | Directory Syncs Dropped | 42.5% | **1.00** [1.00, 1.00] | 1.03 [1.03, 1.04] | **1.00** [1.00, 1.00] | 1.44 [1.40, 1.48] | 1.17 [1.15, 1.19] | **1.00** [1.00, 1.00] | 9.00 [9.00, 9.00] | 2.00 [2.00, 2.00] |
-| **MUT-4** | SST Flush Syncs Dropped | 29.8% | **1.00** [1.00, 1.00] | **1.00** [1.00, 1.00] | **1.00** [1.00, 1.00] | 1.95 [1.90, 2.01] | 1.67 [1.61, 1.74] | **1.00** [1.00, 1.00] | 31.62 [31.24, 32.01] | 2.39 [2.22, 2.56] |
-| **MUT-5** | Sparse $k$-th WAL Sync Dropped ($k=1$) | 2.7% | **1.00** [1.00, 1.00] | **1.00** [1.00, 1.00] | **1.00** [1.00, 1.00] | 13.01 [12.68, 13.34] | 17.04 [16.54, 17.53] | 262.25 [258.20, 266.30] | 17.00 [17.00, 17.00] | 25.97 [25.00, 26.94] |
-| **MUT-6** | Second Manifest Sync Dropped | 0.8% | **1.00** [1.00, 1.00] | 1.20 [1.17, 1.24] | 14.08 [13.50, 14.65] | 7.72 [7.46, 7.97] | 20.79 [19.89, 21.70] | 101.00 [97.37, 104.63] | 43.15 [42.38, 43.93] | 31.12 [29.02, 33.21] |
-| **MUT-7** | Options Dir Sync (No-op Control) | 0.0% | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 |
-| **MUT-8** | Compaction SST Sync Drop | 15.2% | **1.00** [1.00, 1.00] | **1.00** [1.00, 1.00] | **1.00** [1.00, 1.00] | 3.58 [3.50, 3.66] | 3.26 [3.12, 3.40] | **1.00** [1.00, 1.00] | 55.25 [54.85, 55.65] | 4.41 [4.23, 4.58] |
-| **MUT-9** | Single $k$-th Directory Sync Drop | 41.4% | **1.00** [1.00, 1.00] | **1.00** [1.00, 1.00] | **1.00** [1.00, 1.00] | 1.40 [1.36, 1.44] | 1.21 [1.18, 1.23] | **1.00** [1.00, 1.00] | 17.00 [17.00, 17.00] | 1.95 [1.90, 2.01] |
+The authoritative accounting-corrected table is in [the technical report](docs/report.md#81-multi-seed-benchmark-results) and is generated from [the summary CSV](results/benchmark_summary.csv). The active source is `v1.1.2-evaluation-freeze` (`f9202dfca579`).
 
 #### Table 2: Failing State Discovery ($S_{25}$ Early Budget / $S_{100}$ Exhaustive Budget Mean)
 
-| Fault Model | DCG ($S_{25}$ / $S_{100}$) | DCG-FlagOnly | RHG | R2 | R1 | LIFO | B6 | B0 |
-|---|---|---|---|---|---|---|---|---|
-| **MUT-1** | **23.94** / **23.97** | **23.94** / **23.97** | 17.69 / **23.97** | 17.12 / **23.97** | 10.02 / 19.80 | 6.53 / 8.94 | 5.00 / 13.00 | 6.12 / 14.61 |
-| **MUT-2** | **25.00** / **33.00** | **25.00** / **33.00** | 24.00 / **33.00** | 21.14 / **33.00** | 8.67 / 22.79 | 7.00 / 11.34 | 11.00 / 30.00 | 5.64 / 13.75 |
-| **MUT-3** | 24.00 / **27.00** | **24.12** / **27.00** | 21.03 / **27.00** | 17.26 / **27.00** | 7.27 / 19.00 | 7.16 / 12.06 | 9.00 / 21.00 | 5.00 / 11.22 |
-| **MUT-4** | **21.69** / **21.69** | **21.69** / **21.69** | 16.69 / **21.69** | 12.57 / **21.69** | 5.44 / 14.51 | 8.00 / 12.25 | 0.00 / 16.69 | 3.53 / 8.59 |
-| **MUT-5** | **2.00** / **2.00** | **2.00** / **2.00** | 1.81 / **2.00** | 1.30 / **2.00** | 0.87 / 1.60 | 0.00 / 0.00 | 1.00 / 1.00 | 0.48 / 1.00 |
-| **MUT-6** | **1.62** / **1.62** | **1.62** / **1.62** | 1.22 / **1.62** | 1.07 / **1.62** | 0.39 / 1.20 | 0.00 / 0.41 | 0.00 / 1.22 | 0.00 / 0.81 |
-| **MUT-7** | 0.00 / 0.00 | 0.00 / 0.00 | 0.00 / 0.00 | 0.00 / 0.00 | 0.00 / 0.00 | 0.00 / 0.00 | 0.00 / 0.00 | 0.00 / 0.00 |
-| **MUT-8** | **12.88** / **12.88** | **12.88** / **12.88** | 7.88 / **12.88** | 6.74 / 12.82 | 3.27 / 8.41 | 8.00 / 11.75 | 0.00 / 9.88 | 2.00 / 5.05 |
-| **MUT-9** | **25.00** / **27.00** | **25.00** / **27.00** | 20.00 / **27.00** | 17.78 / **27.00** | 5.57 / 17.44 | 7.00 / 10.94 | 5.00 / 26.00 | 3.03 / 9.83 |
+The corrected early/full-budget discovery values are reported alongside Table 1 in [the technical report](docs/report.md) and [the generated benchmark report](docs/benchmark-report.md).
 
 #### Analysis
 
@@ -229,7 +208,7 @@ To evaluate ranking strategies across both dense and sparse failure distribution
 
 ### 4. Parameterized & Stochastic Fault Generalization (MUT-X1..X5) and Out-of-Contract Control (MUT-X6)
 
-The parameterized $k$-index (`MUT-X1..X3`), stochastic probability-$p$ (`MUT-X4..X5`), and out-of-contract silent write-loss (`MUT-X6`) fault families were committed to `internal/faults/faults.go` on `2026-11-01` (`c67a44a`, prior to tag `v1.0-dcg-pr-freeze`) to evaluate whether the four binary POSIX durability-contract flags generalize across arbitrary sync-drop indices $k$ and drop probabilities $p$ without re-tuning (`287 wins / 0 losses / 43 ties` vs. `R2`, Holm $p \le 0.002$).
+The parameterized $k$-index (`MUT-X1..X3`), stochastic probability-$p$ (`MUT-X4..X5`), and out-of-contract silent write-loss (`MUT-X6`) families were reevaluated without retuning under `v1.1.2-evaluation-freeze`. Across 12 analyzed in-contract settings, DCG records 246 wins, 1 loss, and 48 ties versus R2 (Holm-adjusted sign $p\le0.006$); the loss is on stochastic `MUT-X4_p04`. MUT-X6 remains a non-significant negative control (21/38/4, Holm $p=1.0$).
 
 Subsequently, `internal/strategy/dcg.go` and `internal/graph/features.go` were frozen at Git tag **`v1.0-dcg-pr-freeze` (`67bbe7d`)**, following the development and calibration of the partial-retention prior `DCG-PR` on Pebble `#5825` (§5.1). **Three strictly post-freeze evaluations** were designed and executed with 0 bytes of modification to the ranking or feature code:
 1. **Post-Freeze Evaluation 1 (Intra-Class Subsystem Transfer — checkpoint race later fixed by `15b500fb`, §5.2)**: Evaluated across 32 seeds (`MUT-0` vs. `BARRIER-CKPT`).
@@ -245,19 +224,19 @@ CraConTest has been evaluated across two directory-sync crash bugs in Pebble v2.
 1. **Pebble #5825 (Manifest Rotation / Multi-Entry Directory Race) & `BARRIER-5825`:**
    - Under 50% partial retention during manifest rotation, an unsynced directory entry for the new `MANIFEST-XXXXXX` file coexists with an unsynced removal of the old manifest, resulting in 58 failures across 25 of 32 failing seeds under unpatched `MUT-0` (deterministic partial-retention sampler).
    - The `BARRIER-5825` intervention adds a parent-directory sync before marker creation; no failures are observed across the 32 evaluated seeds.
-   - Pre-frozen `DCG-PR` promotes candidates with coexisting unsynced directory entries (`UnsyncedDirEntryCount >= 2`), discovering the bug at median $k_1 = \mathbf{2.00}$ (mean $12.40$, $S_{25} = 1.44$, $S_{100} = 1.44$) vs $211.00$ for 0%-first `DCG` (mean $301.60$) and $148.00$ for `B0` (mean $180.74$).
+   - DCG-PR promotes candidates with coexisting unsynced directory entries (`UnsyncedDirEntryCount >= 2`), discovering the bug at median/mean $k_1=2.00/12.40$ versus DCG 203.00/243.84 and accounting-corrected B0 178.73/192.72.
 
 2. **Pebble Checkpoint Directory Race & `BARRIER-CKPT`:**
-   - In Pebble's checkpoint subsystem, during `db.Checkpoint(destDir)`, Pebble creates hard-linked SSTables, `MANIFEST`, and `marker.manifest.*` inside `destDir` before calling the directory sync inside `manifestMarker.Move` (`checkpoint.go:596`). When a crash occurs *inside that multi-entry window prior to `dirFD.Sync()`* under 50% partial retention, `marker.manifest.*` can survive while the newly created `MANIFEST-*` or hard-linked `.sst` entry in the same directory is dropped, causing reopening to fail with `open_error` (58 failures across 30 of 32 seeds under `MUT-0`).
+   - In Pebble's checkpoint subsystem, during `db.Checkpoint(destDir)`, Pebble creates hard-linked SSTables, `MANIFEST`, and `marker.manifest.*` inside `destDir` before directory synchronization. Under 50% partial retention this yields 53 open failures across 31 of 32 MUT-0 seeds in the accounting-corrected reevaluation.
    - Case Study 2 belongs to the same structural bug class as Case Study 1 (`#5825`) (multi-entry directory races in Pebble's `atomicfs` marker protocol), evaluating **intra-class subsystem transfer** of `dcg-pr` (from manifest rotation in `"db/"` to `db.Checkpoint` in `"checkpoint/"`), not generalization to an unseen bug class.
    - The `BARRIER-CKPT` intervention (`internal/faults/faults.go:602-625`) adds destination-directory synchronization; no checkpoint recovery failures are observed across the 32 evaluated seeds.
-   - Evaluated post-freeze on pre-frozen `DCG-PR` (intra-class subsystem transfer within Pebble's atomicfs marker protocol; because BARRIER-CKPT and dcg-pr share the same directory-entry mechanism as #5825, this tests subsystem transfer rather than a blind unseen bug class), `DCG-PR` discovers the first failure at median $k_1 = \mathbf{3.00}$ (mean $140.03$) vs $386.50$ for 0%-first `DCG` (mean $319.20$), $328.40$ for `R2` (mean $336.53$), and $172.00$ for `B0` (mean $190.73$).
+   - This is intra-class transfer within Pebble's marker protocol, not a blind unseen bug class. DCG-PR records median/mean $k_1=245.00/156.39$ versus DCG 288.00/258.65, R2 280.41/271.55, and corrected B0 262.26/238.53; DCG-PR/R2 paired W/L/T is 22/9/0.
 
 3. **Direct L0 `db.Ingest` Cross-Channel Prefix Hole & `BARRIER-INGEST`:**
    - When external SSTables do not overlap active memtables, Pebble bypasses the WAL (`asFlushable = false`), allocating sequence number $s_2 > s_1$ and committing via `MANIFEST` sync (`vs.manifestFile.Sync()`) while earlier un-synced WAL writes at $s_1$ remain unpersisted. Upon a 0%-retention crash, $s_2$ survives via `MANIFEST` while $s_1 < s_2$ is discarded from the unsynced WAL. Under endpoint (`0%/100%`) retention, **22 of 32 seeds** exhibit prefix violations (276 total failures; seeds `3, 5, 7, 8, 9, 16, 20, 23, 26, 29` have 0 failures because randomly generated ingest keys overlapped the active memtable and took the `asFlushable = true` branch, which synchronously flushes the WAL via `commit.directWrite` at `commit.go:289`).
    - RocksDB's `db.h` notes that `IngestExternalFile` does not imply `FlushWAL(true)`, and under a per-operation synced-only durability oracle (which permits individual unacknowledged NoSync writes to be lost independently), dropping $s_1$ while retaining $s_2$ is permissible. Direct L0 `db.Ingest` is an **undocumented cross-channel ordering behavior between unsynced `NoSync` WAL writes and synced `MANIFEST` ingests under a global prefix ("no-hole") oracle (not a loss of synced data and not reported upstream as a Pebble bug, as Pebble's contract guarantees durability only for synced operations)**.
    - The `BARRIER-INGEST` intervention (`db.LogData(nil, pebble.Sync)`) flushes the active WAL before MANIFEST version edit; no prefix violations are observed across the 32 evaluated seeds ($S_{25}=0.00, S_{100}=0.00$).
-   - Pre-frozen `DCG-PR` achieves median $k_1 = \mathbf{9.00}$ (mean $15.32$) and `DCG` achieves $9.00$ (mean $15.32$), compared to $27.88$ (mean $27.64$) for `R2`, $28.60$ (mean $30.61$) for `R1`, $28.18$ (mean $29.88$) for `DCG Flag-Only`, $81.00$ (mean $80.18$) for `sync-boundary`, and $21.50$ (mean $24.73$) for `B0` across 276 total failures on 22 failing seeds.
+   - DCG/DCG-PR median/mean $k_1$ is 9.00/15.32, R2 is 26.77/27.00, and corrected B0 is 33.74/34.32. The paired DCG-PR/R2 sign test is not significant at 0.05 (13/6/3, $p=0.0835$).
 
 ### 6. Candidate Universe Scaling (MUT-5, 120..1200 ops) & Multi-Shape Null Control (108 Runs)
 
