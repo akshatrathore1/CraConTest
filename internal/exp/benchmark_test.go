@@ -453,9 +453,13 @@ func TestWriteMultiSeedPerSeedCSV(t *testing.T) {
 						UniverseSize:  120,
 						TotalFailures: 5,
 						B0: exp.B0Metrics{
+							K1FailureMean:   21.5,
 							K1FailureMedian: 20.0,
+							S25Mean:         3.5,
 							S25Median:       3.0,
+							S100Mean:        5.5,
 							S100Median:      5.0,
+							BFullMean:       26.5,
 							BFullMedian:     25.0,
 							AUCNormFailures: 0.4500,
 							AUCNormBugs:     0.6500,
@@ -493,9 +497,13 @@ func TestWriteMultiSeedPerSeedCSV(t *testing.T) {
 						UniverseSize:  120,
 						TotalFailures: 6,
 						B0: exp.B0Metrics{
+							K1FailureMean:   20.5,
 							K1FailureMedian: 19.0,
+							S25Mean:         3.5,
 							S25Median:       3.0,
+							S100Mean:        6.5,
 							S100Median:      6.0,
+							BFullMean:       25.5,
 							BFullMedian:     24.0,
 							AUCNormFailures: 0.4600,
 							AUCNormBugs:     0.6600,
@@ -576,6 +584,7 @@ func TestWriteMultiSeedPerSeedCSV(t *testing.T) {
 
 	// Check sample row values
 	foundDCG := false
+	foundB0 := false
 	for _, row := range records[1:] {
 		if row[0] == faults.MUT1 && row[1] == "42" && row[5] == "dcg" {
 			foundDCG = true
@@ -589,9 +598,18 @@ func TestWriteMultiSeedPerSeedCSV(t *testing.T) {
 				t.Errorf("expected git_commit 34728d40930c, got %s", row[15])
 			}
 		}
+		if row[0] == faults.MUT1 && row[1] == "42" && row[5] == "b0" {
+			foundB0 = true
+			if row[9] != "21.50" || row[10] != "3.50" || row[11] != "5.50" || row[12] != "26.50" {
+				t.Errorf("B0 mean columns contain medians or another estimand: %v", row[9:13])
+			}
+		}
 	}
 	if !foundDCG {
 		t.Errorf("expected row for MUT-1, seed 42, dcg not found")
+	}
+	if !foundB0 {
+		t.Errorf("expected row for MUT-1, seed 42, b0 not found")
 	}
 }
 

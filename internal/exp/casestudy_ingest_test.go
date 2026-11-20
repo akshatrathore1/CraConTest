@@ -450,10 +450,10 @@ func TestCaseStudyIngestBenchmark(t *testing.T) {
 				if spec.code == "b0" {
 					k1Single = res.B0.K1SingleSeed
 					s25Single = res.B0.S25SingleSeed
-					k1Mean = res.B0.K1FailureMedian
-					s25Mean = res.B0.S25Median
-					s100Mean = res.B0.S100Median
-					bFullMean = res.B0.BFullMedian
+					k1Mean = res.B0.K1FailureMean
+					s25Mean = res.B0.S25Mean
+					s100Mean = res.B0.S100Mean
+					bFullMean = res.B0.BFullMean
 					aucF = res.B0.AUCNormFailures
 					aucB = res.B0.AUCNormBugs
 				} else {
@@ -501,11 +501,11 @@ func TestCaseStudyIngestBenchmark(t *testing.T) {
 
 				if spec.code == "b0" {
 					if r.TotalFailures > 0 {
-						k1Val = r.B0.K1FailureMedian
-						bfVal = r.B0.BFullMedian
+						k1Val = r.B0.K1FailureMean
+						bfVal = r.B0.BFullMean
 					}
-					s25Val = r.B0.S25Median
-					s100Val = r.B0.S100Median
+					s25Val = r.B0.S25Mean
+					s100Val = r.B0.S100Mean
 					aF = r.B0.AUCNormFailures
 					aB = r.B0.AUCNormBugs
 				} else {

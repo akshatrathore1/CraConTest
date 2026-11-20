@@ -116,20 +116,25 @@ type StrategyMetrics struct {
 
 // B0Metrics captures statistical discovery performance for B0 random across shuffle seeds.
 type B0Metrics struct {
+	K1FailureMean     float64 `json:"k1_failure_mean"`
 	K1FailureMedian   float64 `json:"k1_failure_median"`
 	K1FailureP10      float64 `json:"k1_failure_p10"`
 	K1FailureP90      float64 `json:"k1_failure_p90"`
+	K1ViolationMean   float64 `json:"k1_violation_mean"`
 	K1ViolationMedian float64 `json:"k1_violation_median"`
 	K1ViolationP10    float64 `json:"k1_violation_p10"`
 	K1ViolationP90    float64 `json:"k1_violation_p90"`
 	K1SingleSeed      int     `json:"k1_single_seed,omitempty"`
+	BFullMean         float64 `json:"b_full_mean"`
 	BFullMedian       float64 `json:"b_full_median"`
 	BFullP10          float64 `json:"b_full_p10"`
 	BFullP90          float64 `json:"b_full_p90"`
+	S25Mean           float64 `json:"s25_mean"`
 	S25Median         float64 `json:"s25_median"`
 	S25P10            float64 `json:"s25_p10"`
 	S25P90            float64 `json:"s25_p90"`
 	S25SingleSeed     int     `json:"s25_single_seed,omitempty"`
+	S100Mean          float64 `json:"s100_mean"`
 	S100Median        float64 `json:"s100_median"`
 	S100P10           float64 `json:"s100_p10"`
 	S100P90           float64 `json:"s100_p90"`
@@ -588,20 +593,25 @@ func RunSingleSeedFault(seed uint64, faultID string, cfg BenchmarkConfig) (*Sing
 
 	rankedSingleB0 := strategy.NewRandom(seed).Rank(view, universe)
 	b0Metrics := B0Metrics{
+		K1FailureMean:     average(k1Fails),
 		K1FailureMedian:   percentile(k1Fails, 50),
 		K1FailureP10:      percentile(k1Fails, 10),
 		K1FailureP90:      percentile(k1Fails, 90),
+		K1ViolationMean:   average(k1Viols),
 		K1ViolationMedian: percentile(k1Viols, 50),
 		K1ViolationP10:    percentile(k1Viols, 10),
 		K1ViolationP90:    percentile(k1Viols, 90),
 		K1SingleSeed:      CalculateK1(rankedSingleB0, normOutcomes, false),
+		BFullMean:         average(bFulls),
 		BFullMedian:       percentile(bFulls, 50),
 		BFullP10:          percentile(bFulls, 10),
 		BFullP90:          percentile(bFulls, 90),
+		S25Mean:           average(s25Fails),
 		S25Median:         percentile(s25Fails, 50),
 		S25P10:            percentile(s25Fails, 10),
 		S25P90:            percentile(s25Fails, 90),
 		S25SingleSeed:     CalculateS25(rankedSingleB0, normOutcomes, view),
+		S100Mean:          average(s100Fails),
 		S100Median:        percentile(s100Fails, 50),
 		S100P10:           percentile(s100Fails, 10),
 		S100P90:           percentile(s100Fails, 90),
@@ -1010,22 +1020,14 @@ func aggregateFaultSummary(fs *FaultModelSummary) {
 		for _, r := range fs.Runs {
 			if code == "b0" {
 				if r.TotalFailures > 0 {
-					val := r.B0.K1FailureMedian
-					if r.B0.K1SingleSeed > 0 {
-						val = float64(r.B0.K1SingleSeed)
-					}
-					k1FailVals = append(k1FailVals, val)
-					bFullVals = append(bFullVals, r.B0.BFullMedian)
+					k1FailVals = append(k1FailVals, r.B0.K1FailureMean)
+					bFullVals = append(bFullVals, r.B0.BFullMean)
 				}
 				if r.TotalViolations > 0 {
-					k1ViolVals = append(k1ViolVals, r.B0.K1ViolationMedian)
+					k1ViolVals = append(k1ViolVals, r.B0.K1ViolationMean)
 				}
-				s25Val := r.B0.S25Median
-				if r.B0.S25SingleSeed > 0 {
-					s25Val = float64(r.B0.S25SingleSeed)
-				}
-				s25Vals = append(s25Vals, s25Val)
-				s100Vals = append(s100Vals, r.B0.S100Median)
+				s25Vals = append(s25Vals, r.B0.S25Mean)
+				s100Vals = append(s100Vals, r.B0.S100Mean)
 				sumAUCF += r.B0.AUCNormFailures
 				sumAUCB += r.B0.AUCNormBugs
 
