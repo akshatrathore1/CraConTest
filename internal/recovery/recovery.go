@@ -8,13 +8,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"iter"
-	"os"
-	"runtime"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/cockroachdb/pebble/v2"
@@ -34,19 +30,6 @@ func (PanicLogger) Errorf(format string, args ...any) {}
 
 // Fatalf converts a fatal log into a panic so it can be caught by recover().
 func (PanicLogger) Fatalf(format string, args ...any) {
-	panic(fmt.Sprintf("pebble fatal: "+format, args...))
-}
-
-type cancelLogger struct {
-	canceled *atomic.Bool
-}
-
-func (cancelLogger) Infof(format string, args ...any)  {}
-func (cancelLogger) Errorf(format string, args ...any) {}
-func (c cancelLogger) Fatalf(format string, args ...any) {
-	if c.canceled != nil && c.canceled.Load() {
-		runtime.Goexit()
-	}
 	panic(fmt.Sprintf("pebble fatal: "+format, args...))
 }
 
@@ -70,9 +53,11 @@ type OpenResult struct {
 // Any logger fatals are intercepted by PanicLogger and converted to panics,
 // which SafeOpen recovers and reports in OpenResult.Panic.
 // Because pebble.Open does not accept a context.Context, a call blocked inside an
-// uncooperative VFS operation cannot be preempted by the Go runtime on timeout;
-// the background drain goroutine acts as a bounded reaper (at most one per timed-out
-// candidate) that closes the DB if pebble.Open eventually unblocks.
+// uncooperative VFS operation cannot be preempted by the Go runtime on timeout.
+// The open goroutine closes a DB that finishes after the deadline. It deliberately
+// does not inject cancellation errors into the VFS: Pebble treats fsync errors as
+// unrecoverable, and returning a synthetic deadline error from an in-flight sync can
+// panic a background flush after SafeOpen has already returned.
 func SafeOpen(fs vfs.FS, dir string, timeout time.Duration) OpenResult {
 	type result struct {
 		db  *pebble.DB
@@ -85,7 +70,6 @@ func SafeOpen(fs vfs.FS, dir string, timeout time.Duration) OpenResult {
 	ch := make(chan result, 1)
 	var mu sync.Mutex
 	timedOut := false
-	var canceled atomic.Bool
 
 	go func() {
 		defer func() {
@@ -98,10 +82,9 @@ func SafeOpen(fs vfs.FS, dir string, timeout time.Duration) OpenResult {
 			}
 		}()
 
-		cancelableFS := &cancelFS{FS: fs, canceled: &canceled}
 		opts := &pebble.Options{
-			FS:                          cancelableFS,
-			Logger:                      cancelLogger{canceled: &canceled},
+			FS:                          fs,
+			Logger:                      PanicLogger{},
 			DisableAutomaticCompactions: true,
 		}
 		db, err := pebble.Open(dir, opts)
@@ -131,7 +114,6 @@ func SafeOpen(fs vfs.FS, dir string, timeout time.Duration) OpenResult {
 		}
 		return OpenResult{DB: r.db}
 	case <-ctx.Done():
-		canceled.Store(true)
 		mu.Lock()
 		timedOut = true
 		mu.Unlock()
@@ -285,185 +267,4 @@ func AllEntries(db *pebble.DB) iter.Seq2[string, string] {
 			panic(fmt.Sprintf("recovery: AllEntries iterator closed with error: %v", err))
 		}
 	}
-}
-
-type cancelFS struct {
-	vfs.FS
-	canceled *atomic.Bool
-}
-
-func (c *cancelFS) check() error {
-	if c.canceled.Load() {
-		return context.DeadlineExceeded
-	}
-	return nil
-}
-
-func (c *cancelFS) Unwrap() vfs.FS {
-	return c.FS
-}
-
-func (c *cancelFS) Create(name string, category vfs.DiskWriteCategory) (vfs.File, error) {
-	if err := c.check(); err != nil {
-		return nil, err
-	}
-	f, err := c.FS.Create(name, category)
-	if err != nil {
-		return nil, err
-	}
-	return &cancelFile{File: f, canceled: c.canceled}, nil
-}
-
-func (c *cancelFS) Link(oldname, newname string) error {
-	if err := c.check(); err != nil {
-		return err
-	}
-	return c.FS.Link(oldname, newname)
-}
-
-func (c *cancelFS) Open(name string, opts ...vfs.OpenOption) (vfs.File, error) {
-	if err := c.check(); err != nil {
-		return nil, err
-	}
-	f, err := c.FS.Open(name, opts...)
-	if err != nil {
-		return nil, err
-	}
-	return &cancelFile{File: f, canceled: c.canceled}, nil
-}
-
-func (c *cancelFS) OpenReadWrite(name string, category vfs.DiskWriteCategory, opts ...vfs.OpenOption) (vfs.File, error) {
-	if err := c.check(); err != nil {
-		return nil, err
-	}
-	f, err := c.FS.OpenReadWrite(name, category, opts...)
-	if err != nil {
-		return nil, err
-	}
-	return &cancelFile{File: f, canceled: c.canceled}, nil
-}
-
-func (c *cancelFS) OpenDir(name string) (vfs.File, error) {
-	if err := c.check(); err != nil {
-		return nil, err
-	}
-	f, err := c.FS.OpenDir(name)
-	if err != nil {
-		return nil, err
-	}
-	return &cancelFile{File: f, canceled: c.canceled}, nil
-}
-
-func (c *cancelFS) Remove(name string) error {
-	if err := c.check(); err != nil {
-		return err
-	}
-	return c.FS.Remove(name)
-}
-
-func (c *cancelFS) RemoveAll(name string) error {
-	if err := c.check(); err != nil {
-		return err
-	}
-	return c.FS.RemoveAll(name)
-}
-
-func (c *cancelFS) Rename(oldname, newname string) error {
-	if err := c.check(); err != nil {
-		return err
-	}
-	return c.FS.Rename(oldname, newname)
-}
-
-func (c *cancelFS) ReuseForWrite(oldname, newname string, category vfs.DiskWriteCategory) (vfs.File, error) {
-	if err := c.check(); err != nil {
-		return nil, err
-	}
-	f, err := c.FS.ReuseForWrite(oldname, newname, category)
-	if err != nil {
-		return nil, err
-	}
-	return &cancelFile{File: f, canceled: c.canceled}, nil
-}
-
-func (c *cancelFS) MkdirAll(dir string, perm os.FileMode) error {
-	if err := c.check(); err != nil {
-		return err
-	}
-	return c.FS.MkdirAll(dir, perm)
-}
-
-func (c *cancelFS) Lock(name string) (io.Closer, error) {
-	if err := c.check(); err != nil {
-		return nil, err
-	}
-	return c.FS.Lock(name)
-}
-
-func (c *cancelFS) List(dir string) ([]string, error) {
-	if err := c.check(); err != nil {
-		return nil, err
-	}
-	return c.FS.List(dir)
-}
-
-func (c *cancelFS) Stat(name string) (vfs.FileInfo, error) {
-	if err := c.check(); err != nil {
-		return nil, err
-	}
-	return c.FS.Stat(name)
-}
-
-type cancelFile struct {
-	vfs.File
-	canceled *atomic.Bool
-}
-
-func (f *cancelFile) Read(p []byte) (int, error) {
-	if f.canceled.Load() {
-		return 0, context.DeadlineExceeded
-	}
-	return f.File.Read(p)
-}
-
-func (f *cancelFile) ReadAt(p []byte, off int64) (int, error) {
-	if f.canceled.Load() {
-		return 0, context.DeadlineExceeded
-	}
-	return f.File.ReadAt(p, off)
-}
-
-func (f *cancelFile) Write(p []byte) (int, error) {
-	if f.canceled.Load() {
-		return 0, context.DeadlineExceeded
-	}
-	return f.File.Write(p)
-}
-
-func (f *cancelFile) WriteAt(p []byte, off int64) (int, error) {
-	if f.canceled.Load() {
-		return 0, context.DeadlineExceeded
-	}
-	return f.File.WriteAt(p, off)
-}
-
-func (f *cancelFile) Sync() error {
-	if f.canceled.Load() {
-		return context.DeadlineExceeded
-	}
-	return f.File.Sync()
-}
-
-func (f *cancelFile) SyncData() error {
-	if f.canceled.Load() {
-		return context.DeadlineExceeded
-	}
-	return f.File.SyncData()
-}
-
-func (f *cancelFile) SyncTo(length int64) (bool, error) {
-	if f.canceled.Load() {
-		return false, context.DeadlineExceeded
-	}
-	return f.File.SyncTo(length)
 }

@@ -304,15 +304,46 @@ func TestCrashCycleManyOperations(t *testing.T) {
 
 type blockingFS struct {
 	vfs.FS
-	delayChan  chan struct{}
-	lockClosed chan struct{}
+	delayChan    chan struct{}
+	lockClosed   chan struct{}
+	postListSync chan struct{}
+	mu           sync.Mutex
+	listReturned bool
+	dirSyncOnce  sync.Once
 }
 
 func (b *blockingFS) List(dir string) ([]string, error) {
 	if b.delayChan != nil {
 		<-b.delayChan
 	}
+	b.mu.Lock()
+	b.listReturned = true
+	b.mu.Unlock()
 	return b.FS.List(dir)
+}
+
+func (b *blockingFS) OpenDir(name string) (vfs.File, error) {
+	f, err := b.FS.OpenDir(name)
+	if err != nil {
+		return nil, err
+	}
+	return &blockingDirFile{File: f, fs: b}, nil
+}
+
+type blockingDirFile struct {
+	vfs.File
+	fs *blockingFS
+}
+
+func (f *blockingDirFile) Sync() error {
+	err := f.File.Sync()
+	f.fs.mu.Lock()
+	postList := f.fs.listReturned
+	f.fs.mu.Unlock()
+	if postList && f.fs.postListSync != nil {
+		f.fs.dirSyncOnce.Do(func() { close(f.fs.postListSync) })
+	}
+	return err
 }
 
 func (b *blockingFS) Lock(name string) (io.Closer, error) {
@@ -360,11 +391,13 @@ func TestSafeOpenTimeoutClosesLateDB(t *testing.T) {
 
 	delayChan := make(chan struct{})
 	lockClosed := make(chan struct{})
+	postListSync := make(chan struct{})
 
 	bfs := &blockingFS{
-		FS:         memFS,
-		delayChan:  delayChan,
-		lockClosed: lockClosed,
+		FS:           memFS,
+		delayChan:    delayChan,
+		lockClosed:   lockClosed,
+		postListSync: postListSync,
 	}
 
 	res := recovery.SafeOpen(bfs, "testdb", 20*time.Millisecond)
@@ -374,6 +407,14 @@ func TestSafeOpenTimeoutClosesLateDB(t *testing.T) {
 
 	// Unblock pebble.Open now.
 	close(delayChan)
+
+	select {
+	case <-postListSync:
+		// Late recovery continued through the underlying filesystem without
+		// converting the timeout into an injected fsync failure.
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for late pebble.Open to complete its directory sync")
+	}
 
 	select {
 	case <-lockClosed:
