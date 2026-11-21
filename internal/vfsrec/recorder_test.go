@@ -251,6 +251,103 @@ type partialWriteFile struct {
 	limit int
 }
 
+type orderedWriteFS struct {
+	vfs.FS
+	aMutated chan struct{}
+	releaseA chan struct{}
+	bEntered chan struct{}
+	aOnce    sync.Once
+	bOnce    sync.Once
+}
+
+func (fs *orderedWriteFS) Create(name string, category vfs.DiskWriteCategory) (vfs.File, error) {
+	f, err := fs.FS.Create(name, category)
+	if err != nil {
+		return nil, err
+	}
+	return &orderedWriteFile{File: f, name: name, fs: fs}, nil
+}
+
+type orderedWriteFile struct {
+	vfs.File
+	name string
+	fs   *orderedWriteFS
+}
+
+func (f *orderedWriteFile) Write(p []byte) (int, error) {
+	if f.name == "a" {
+		n, err := f.File.Write(p)
+		f.fs.aOnce.Do(func() { close(f.fs.aMutated) })
+		<-f.fs.releaseA
+		return n, err
+	}
+	if f.name == "b" {
+		f.fs.bOnce.Do(func() { close(f.fs.bEntered) })
+	}
+	return f.File.Write(p)
+}
+
+func TestRecFileMutationAndTraceLinearizeTogether(t *testing.T) {
+	inner := &orderedWriteFS{
+		FS:       vfs.NewMem(),
+		aMutated: make(chan struct{}),
+		releaseA: make(chan struct{}),
+		bEntered: make(chan struct{}),
+	}
+	recorder := vfsrec.New(inner)
+	a, err := recorder.Create("a", vfs.WriteCategoryUnspecified)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := recorder.Create("b", vfs.WriteCategoryUnspecified)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var writes sync.WaitGroup
+	writes.Add(2)
+	errCh := make(chan error, 2)
+	go func() {
+		defer writes.Done()
+		_, err := a.Write([]byte("a"))
+		errCh <- err
+	}()
+	<-inner.aMutated
+	go func() {
+		defer writes.Done()
+		_, err := b.Write([]byte("b"))
+		errCh <- err
+	}()
+
+	enteredBeforeFirstEvent := false
+	select {
+	case <-inner.bEntered:
+		enteredBeforeFirstEvent = true
+	case <-time.After(time.Second):
+	}
+	close(inner.releaseA)
+	writes.Wait()
+	close(errCh)
+	for writeErr := range errCh {
+		if writeErr != nil {
+			t.Fatal(writeErr)
+		}
+	}
+	if enteredBeforeFirstEvent {
+		t.Fatal("second filesystem mutation began before the first mutation was recorded")
+	}
+
+	var writeFiles []string
+	for _, event := range recorder.Events() {
+		if event.Kind == trace.KindWrite {
+			writeFiles = append(writeFiles, event.File)
+		}
+	}
+	if len(writeFiles) != 2 || writeFiles[0] != "a" || writeFiles[1] != "b" {
+		t.Fatalf("recorded writes %v, want [a b]", writeFiles)
+	}
+}
+
 var errPartialWrite = errors.New("short write occurred")
 
 func (f *partialWriteFile) Write(p []byte) (int, error) {

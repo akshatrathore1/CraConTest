@@ -32,6 +32,8 @@ func (f *recFile) Close() error {
 		return nil
 	}
 	f.closed = true
+	f.fs.mu.Lock()
+	defer f.fs.mu.Unlock()
 
 	var err error
 	if f.inner != nil {
@@ -46,9 +48,7 @@ func (f *recFile) Close() error {
 	if err != nil {
 		event.Err = err.Error()
 	}
-	f.fs.mu.Lock()
 	f.fs.appendEventLocked(event)
-	f.fs.mu.Unlock()
 	return err
 }
 
@@ -59,6 +59,8 @@ func (f *recFile) Read(p []byte) (int, error) {
 	if f.closed {
 		return 0, os.ErrClosed
 	}
+	f.fs.mu.Lock()
+	defer f.fs.mu.Unlock()
 
 	off := f.cursor
 	size := int64(len(p))
@@ -76,9 +78,7 @@ func (f *recFile) Read(p []byte) (int, error) {
 	if err != nil {
 		event.Err = err.Error()
 	}
-	f.fs.mu.Lock()
 	f.fs.appendEventLocked(event)
-	f.fs.mu.Unlock()
 	return n, err
 }
 
@@ -89,6 +89,8 @@ func (f *recFile) Write(p []byte) (int, error) {
 	if f.closed {
 		return 0, os.ErrClosed
 	}
+	f.fs.mu.Lock()
+	defer f.fs.mu.Unlock()
 
 	dataCopy := bytes.Clone(p)
 	off := f.cursor
@@ -109,7 +111,6 @@ func (f *recFile) Write(p []byte) (int, error) {
 		err = io.ErrShortWrite
 		event.Err = err.Error()
 	}
-	f.fs.mu.Lock()
 	f.fs.appendEventLocked(event)
 	if err == nil && isDBWALPath(f.label) && (f.cat == "pebble-wal" || f.cat == vfs.WriteCategoryUnspecified || f.cat == "") {
 		f.fs.walWrites++
@@ -117,7 +118,6 @@ func (f *recFile) Write(p []byte) (int, error) {
 			f.fs.walCond.Broadcast()
 		}
 	}
-	f.fs.mu.Unlock()
 	return n, err
 }
 
@@ -128,6 +128,8 @@ func (f *recFile) WriteAt(p []byte, off int64) (int, error) {
 	if f.closed {
 		return 0, os.ErrClosed
 	}
+	f.fs.mu.Lock()
+	defer f.fs.mu.Unlock()
 
 	dataCopy := bytes.Clone(p)
 	n, err := f.inner.WriteAt(p, off)
@@ -146,7 +148,6 @@ func (f *recFile) WriteAt(p []byte, off int64) (int, error) {
 		err = io.ErrShortWrite
 		event.Err = err.Error()
 	}
-	f.fs.mu.Lock()
 	f.fs.appendEventLocked(event)
 	if err == nil && isDBWALPath(f.label) && (f.cat == "pebble-wal" || f.cat == vfs.WriteCategoryUnspecified || f.cat == "") {
 		f.fs.walWrites++
@@ -154,7 +155,6 @@ func (f *recFile) WriteAt(p []byte, off int64) (int, error) {
 			f.fs.walCond.Broadcast()
 		}
 	}
-	f.fs.mu.Unlock()
 	return n, err
 }
 
@@ -165,6 +165,8 @@ func (f *recFile) Sync() error {
 	if f.closed {
 		return os.ErrClosed
 	}
+	f.fs.mu.Lock()
+	defer f.fs.mu.Unlock()
 
 	err := f.inner.Sync()
 	event := trace.Event{
@@ -176,13 +178,11 @@ func (f *recFile) Sync() error {
 	if err != nil {
 		event.Err = err.Error()
 	}
-	f.fs.mu.Lock()
 	if !f.isDir && event.Err == "" {
 		f.fs.appendSyncEventLocked(event)
 	} else {
 		f.fs.appendEventLocked(event)
 	}
-	f.fs.mu.Unlock()
 	return err
 }
 
@@ -193,6 +193,8 @@ func (f *recFile) SyncData() error {
 	if f.closed {
 		return os.ErrClosed
 	}
+	f.fs.mu.Lock()
+	defer f.fs.mu.Unlock()
 
 	err := f.inner.SyncData()
 	event := trace.Event{
@@ -204,13 +206,11 @@ func (f *recFile) SyncData() error {
 	if err != nil {
 		event.Err = err.Error()
 	}
-	f.fs.mu.Lock()
 	if !f.isDir && event.Err == "" {
 		f.fs.appendSyncEventLocked(event)
 	} else {
 		f.fs.appendEventLocked(event)
 	}
-	f.fs.mu.Unlock()
 	return err
 }
 
@@ -221,6 +221,8 @@ func (f *recFile) SyncTo(length int64) (bool, error) {
 	if f.closed {
 		return false, os.ErrClosed
 	}
+	f.fs.mu.Lock()
+	defer f.fs.mu.Unlock()
 
 	fullSync, err := f.inner.SyncTo(length)
 	event := trace.Event{
@@ -234,13 +236,11 @@ func (f *recFile) SyncTo(length int64) (bool, error) {
 	if err != nil {
 		event.Err = err.Error()
 	}
-	f.fs.mu.Lock()
 	if !f.isDir && event.Err == "" {
 		f.fs.appendSyncEventLocked(event)
 	} else {
 		f.fs.appendEventLocked(event)
 	}
-	f.fs.mu.Unlock()
 	return fullSync, err
 }
 
@@ -271,6 +271,8 @@ func (f *recFile) Preallocate(offset, length int64) error {
 	if f.closed {
 		return os.ErrClosed
 	}
+	f.fs.mu.Lock()
+	defer f.fs.mu.Unlock()
 	err := f.inner.Preallocate(offset, length)
 	event := trace.Event{
 		Kind:   trace.KindPreallocate,
@@ -282,9 +284,7 @@ func (f *recFile) Preallocate(offset, length int64) error {
 	if err != nil {
 		event.Err = err.Error()
 	}
-	f.fs.mu.Lock()
 	f.fs.appendEventLocked(event)
-	f.fs.mu.Unlock()
 	return err
 }
 
