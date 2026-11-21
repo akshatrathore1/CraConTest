@@ -541,5 +541,5 @@ func TestTraceV1ReplayFilesystemEffects(test *testing.T) {
 	if _, err = filesystem.Stat("db/link"); !os.IsNotExist(err) {
 		test.Fatalf("failed rename side effect was lost: %v", err)
 	}
-	test.Log(fmt.Sprintf("replayed %d events; failed rename effects retained", len(contractTrace())))
+	test.Logf("replayed %d events; failed rename effects retained", len(contractTrace()))
 }
