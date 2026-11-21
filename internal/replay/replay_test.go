@@ -861,8 +861,9 @@ func TestDeterministicPartialCloneStatisticalFidelity(t *testing.T) {
 			t.Fatalf("pct %d: |R_det,block (%.4f) - R_pebble,block (%.4f)| > 0.05", pct, rDetBlock, rPebbleBlock)
 		}
 
-		// Repeating state.Clone(pct, 42) 32 times yields 1 unique digest, whereas repeating
-		// memFS.CrashClone(pct, 42) 32 times yields >1 digests due to Go map iteration order.
+		// Repeating state.Clone(pct, 42) must yield one digest. Raw MemFS CrashClone
+		// remains a comparison point, but a particular runtime is allowed to traverse
+		// its maps in the same order across these diagnostic repetitions.
 		detDigests := make(map[string]bool)
 		for r := 0; r < 32; r++ {
 			cloned, err := state.Clone(pct, 42)
@@ -883,9 +884,7 @@ func TestDeterministicPartialCloneStatisticalFidelity(t *testing.T) {
 			})
 			pebbleDigests[computeFSSHA256(t, cloned)] = true
 		}
-		if len(pebbleDigests) <= 1 {
-			t.Fatalf("pct %d: expected >1 unique digests for memFS.CrashClone(pct, 42) due to map iteration order, got %d", pct, len(pebbleDigests))
-		}
+		t.Logf("pct %d: raw MemFS produced %d unique digests in 32 diagnostic repetitions", pct, len(pebbleDigests))
 	}
 }
 

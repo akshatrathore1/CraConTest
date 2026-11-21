@@ -220,12 +220,11 @@ func TestTraceV1PartialWrite(test *testing.T) {
 	}
 }
 
-// TestCrashCloneSeedReproducibility directly probes upstream vfs.MemFS.CrashClone,
-// demonstrating why raw MemFS.CrashClone produces multiple distinct images at 50%
-// retention due to Go map iteration order (f.children). This nondeterminism motivates
-// replay.State.Clone's deterministicPartialClone (internal/replay/replay.go), which
-// traverses sorted directory entries and blocks in ascending order to produce exactly
-// 1 single digest across 32 repeats in TestReplayClonePartialRetentionSeedDeterminism.
+// TestCrashCloneSeedReproducibility directly probes upstream vfs.MemFS.CrashClone.
+// Intermediate-retention traversal depends on map iteration order, but a particular
+// runtime may still produce one image across a bounded set of repetitions. The test
+// therefore records the observed count and asserts only endpoint behavior; deterministic
+// partial replay is verified independently by replay package tests.
 func TestCrashCloneSeedReproducibility(test *testing.T) {
 	filesystem := vfs.NewCrashableMem()
 	for fileIndex := 0; fileIndex < 20; fileIndex++ {
