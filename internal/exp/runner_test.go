@@ -231,6 +231,11 @@ func TestReadJournalRejectsInvalidRecords(t *testing.T) {
 	valid := oracle.Outcome{Candidate: candidate.Candidate{Event: 1}, Class: oracle.ClassValid}
 	mismatched := valid
 	mismatched.Candidate.Event = 2
+	mismatchedOracleError := oracle.Outcome{
+		Candidate: candidate.Candidate{Event: 2},
+		Class:     oracle.ClassOracleError,
+		Detail:    "injected infrastructure failure",
+	}
 	unknownClass := valid
 	unknownClass.Class = "unknown"
 	cases := []struct {
@@ -238,6 +243,7 @@ func TestReadJournalRejectsInvalidRecords(t *testing.T) {
 		record exp.JournalRecord
 	}{
 		{"mismatched candidate", exp.JournalRecord{Stage: exp.StageFinished, Candidate: valid.Candidate, Outcome: &mismatched}},
+		{"mismatched oracle error candidate", exp.JournalRecord{Stage: exp.StageFinished, Candidate: valid.Candidate, Outcome: &mismatchedOracleError}},
 		{"missing outcome", exp.JournalRecord{Stage: exp.StageFinished, Candidate: valid.Candidate}},
 		{"unknown stage", exp.JournalRecord{Stage: "unknown", Candidate: valid.Candidate}},
 		{"invalid outcome", exp.JournalRecord{Stage: exp.StageFinished, Candidate: valid.Candidate, Outcome: &unknownClass}},

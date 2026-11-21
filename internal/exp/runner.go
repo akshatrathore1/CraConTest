@@ -128,6 +128,9 @@ func readJournal(reader io.Reader, expectedContext string) (map[candidate.Candid
 			if record.Outcome == nil {
 				return nil, nil, errors.New("read journal: finished record missing outcome")
 			}
+			if record.Outcome.Candidate != record.Candidate {
+				return nil, nil, errors.New("read journal: finished outcome candidate differs from record candidate")
+			}
 			if record.Outcome.Class != oracle.ClassOracleError {
 				if err := ValidateTable([]candidate.Candidate{record.Candidate}, []oracle.Outcome{*record.Outcome}); err != nil {
 					return nil, nil, fmt.Errorf("read journal: %w", err)
