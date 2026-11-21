@@ -384,25 +384,25 @@ Because all parameterized and stochastic fault settings in Table 8.4 involve onl
 
 | Fault | Fault Family | Seeds Fail (Density) | DCG / DCG-PR — Median $k_1$ [95% CI] | DCG / DCG-PR — Mean $k_1$ | Sync-Boundary (B6) — Median [Mean] | State-Representative (B5) — Median [Mean] | Uniform Random (B0) — Median [Mean] | R2 — Median [Mean] | R1 — Median [Mean] |
 |---|---|---|---|---|---|---|---|---|---|
-| MUT-X1\_k2 | Delayed WAL Sync ($k=2$) | 32/32 (2.6%) | **1.00** [1.00, 1.00] | **1.00** | 19.00 [19.00] | 27.00 [27.00] | 25.00 [24.14] | 13.09 [13.02] | 16.86 [16.94] |
-| MUT-X1\_k3 | Delayed WAL Sync ($k=3$) | 31/32 (2.2%) | **1.00** [1.00, 1.00] | **1.00** | 21.00 [21.00] | 29.00 [29.00] | 30.00 [36.52] | 12.94 [13.01] | 18.95 [22.65] |
-| MUT-X1\_k4 | Delayed WAL Sync ($k=4$) | 12/32 (1.1%) | **1.00** [1.00, 1.00] | **1.00** | 23.00 [23.67] | 31.00 [31.67] | 69.75 [62.21] | 13.25 [13.13] | 40.37 [40.50] |
-| MUT-X1\_k6 | Delayed WAL Sync ($k=6$) | 32/32 (2.7%) | **1.00** [1.00, 1.00] | **1.00** | 35.00 [35.00] | 43.00 [43.00] | 26.50 [25.95] | 13.46 [13.38] | 16.88 [17.04] |
-| MUT-X1\_k9 | Delayed WAL Sync ($k=9$) | 10/32 (1.6%) | **1.00** [1.00, 1.00] | **1.00** | 41.00 [43.40] | 49.00 [51.40] | 49.50 [59.95] | 12.55 [12.71] | 28.45 [34.04] |
-| MUT-X2\_k1 | Delayed Manifest Sync ($k=1$) | 32/32 (17.3%) | **1.00** [1.00, 1.00] | **1.00** | 5.00 [5.00] | 13.00 [13.00] | 4.00 [4.14] | 2.55 [2.54] | 2.85 [2.94] |
-| MUT-X2\_k3 | Delayed Manifest Sync ($k=3$) | 21/32 (2.1%) | **1.00** [1.00, 1.00] | **1.00** | 61.00 [61.10] | 69.00 [69.10] | 30.50 [31.86] | 7.83 [7.81] | 21.28 [21.16] |
+| MUT-X1\_k2 | Delayed WAL Sync ($k=2$) | 32/32 (2.6%) | **1.00** [1.00, 1.00] | **1.00** | 19.00 [19.00] | 27.00 [27.00] | 34.08 [34.22] | 12.95 [12.77] | 16.49 [16.79] |
+| MUT-X1\_k3 | Delayed WAL Sync ($k=3$) | 31/32 (2.2%) | **1.00** [1.00, 1.00] | **1.00** | 21.00 [21.00] | 29.00 [29.00] | 38.07 [45.94] | 12.64 [12.88] | 17.68 [21.88] |
+| MUT-X1\_k4 | Delayed WAL Sync ($k=4$) | 12/32 (0.4%) | **1.00** [1.00, 1.00] | **1.00** | 23.00 [23.67] | 31.00 [31.67] | 82.41 [77.95] | 12.76 [12.80] | 39.70 [40.47] |
+| MUT-X1\_k6 | Delayed WAL Sync ($k=6$) | 32/32 (2.7%) | **1.00** [1.00, 1.00] | **1.00** | 35.00 [35.00] | 43.00 [43.00] | 34.64 [34.66] | 12.89 [12.84] | 17.16 [17.36] |
+| MUT-X1\_k9 | Delayed WAL Sync ($k=9$) | 10/32 (0.5%) | **1.00** [1.00, 1.00] | **1.00** | 41.00 [43.40] | 49.00 [51.40] | 59.99 [66.96] | 13.03 [12.94] | 29.01 [34.30] |
+| MUT-X2\_k1 | Delayed Manifest Sync ($k=1$) | 32/32 (17.3%) | **1.00** [1.00, 1.00] | **1.00** | 5.00 [5.00] | 13.00 [13.00] | 5.53 [5.63] | 2.59 [2.62] | 2.88 [2.89] |
+| MUT-X2\_k3 | Delayed Manifest Sync ($k=3$) | 21/32 (1.4%) | **1.00** [1.00, 1.00] | **1.00** | 61.00 [61.10] | 69.00 [69.10] | 43.13 [42.39] | 7.69 [7.59] | 20.77 [21.35] |
 | MUT-X2\_k4 | Delayed Manifest Sync ($k=4$) | 0/32 (0.0%) | 0.00 [0.00, 0.00] | 0.00 | 0.00 [0.00] | 0.00 [0.00] | 0.00 [0.00] | 0.00 [0.00] | 0.00 [0.00] |
 | MUT-X2\_k5 | Delayed Manifest Sync ($k=5$) | 0/32 (0.0%) | 0.00 [0.00, 0.00] | 0.00 | 0.00 [0.00] | 0.00 [0.00] | 0.00 [0.00] | 0.00 [0.00] | 0.00 [0.00] |
-| MUT-X3\_k1 | Delayed SST Sync ($k=1$) | 32/32 (30.0%) | **1.00** [1.00, 1.00] | **1.00** | 31.00 [31.62] | 41.00 [41.62] | 2.00 [2.28] | 2.05 [2.04] | 1.62 [1.64] |
-| MUT-X3\_k2 | Delayed SST Sync ($k=2$) | 32/32 (15.4%) | **1.00** [1.00, 1.00] | **1.00** | 49.00 [49.25] | 59.00 [59.25] | 4.00 [4.28] | 3.74 [3.70] | 3.24 [3.21] |
-| MUT-X3\_k3 | Delayed SST Sync ($k=3$) | 32/32 (0.9%) | **1.00** [1.00, 1.00] | **1.00** | 67.00 [67.00] | 77.00 [77.00] | 75.50 [74.34] | 19.46 [19.88] | 42.34 [42.84] |
-| MUT-X4\_p04 | Stochastic File Sync ($p=0.04$) | 32/32 (2.6%) | **1.00** [1.00, 1.00] | **1.00** | 37.00 [37.00] | 45.00 [45.00] | 26.50 [25.62] | 13.32 [13.32] | 17.17 [17.50] |
-| MUT-X5\_p12 | Stochastic Dir Sync ($p=0.12$) | 32/32 (0.9%) | **1.00** [1.00, 1.00] | **1.00** | 65.00 [65.00] | 75.00 [75.00] | 72.50 [74.28] | 19.30 [19.46] | 42.49 [42.16] |
-| MUT-X6\_k2 | Silent WAL Write Loss ($k=2$) | 32/32 (14.6%) | 6.00 [4.00, 6.00] | 6.84 | 21.00 [21.00] | 25.00 [25.00] | 5.00 [5.33] | 5.21 [6.74] | 6.60 [7.10] |
-| MUT-X6\_k5 | Silent WAL Write Loss ($k=5$) | 22/32 (12.3%) | 16.00 [13.00, 22.00] | 16.36 | 35.00 [34.50] | 39.00 [38.68] | 7.00 [8.02] | 12.81 [12.56] | 8.99 [10.15] |
-| MUT-X6\_k9 | Silent WAL Write Loss ($k=9$) | 10/32 (11.7%) | 3.00 [3.00, 8.00] | 5.60 | 43.00 [45.40] | 47.00 [49.40] | 10.00 [8.70] | 6.75 [6.69] | 12.05 [10.40] |
+| MUT-X3\_k1 | Delayed SST Sync ($k=1$) | 32/32 (30.0%) | **1.00** [1.00, 1.00] | **1.00** | 31.00 [31.62] | 41.00 [41.62] | 3.35 [3.35] | 2.01 [2.03] | 1.65 [1.67] |
+| MUT-X3\_k2 | Delayed SST Sync ($k=2$) | 32/32 (15.4%) | **1.00** [1.00, 1.00] | **1.00** | 49.00 [49.25] | 59.00 [59.25] | 6.37 [6.48] | 3.60 [3.67] | 3.17 [3.21] |
+| MUT-X3\_k3 | Delayed SST Sync ($k=3$) | 32/32 (0.9%) | **1.00** [1.00, 1.00] | **1.00** | 67.00 [67.00] | 77.00 [77.00] | 84.41 [84.86] | 19.71 [19.86] | 41.66 [42.29] |
+| MUT-X4\_p04 | Stochastic File Sync ($p=0.04$) | 15/32 (2.7%) | **1.00** [1.00, 1.00] | **1.33** | 21.00 [34.33] | 29.00 [42.87] | 35.08 [38.43] | 12.75 [11.41] | 17.90 [19.91] |
+| MUT-X5\_p12 | Stochastic Dir Sync ($p=0.12$) | 14/32 (6.9%) | **1.00** [1.00, 1.00] | **1.00** | 47.00 [42.43] | 58.00 [52.43] | 7.46 [40.72] | 5.82 [10.33] | 3.84 [20.29] |
+| MUT-X6\_k2 | Silent WAL Write Loss ($k=2$) | 32/32 (14.6%) | 6.00 [4.00, 6.00] | 6.84 | 21.00 [21.00] | 25.00 [25.00] | 6.63 [7.59] | 5.36 [6.78] | 6.27 [7.14] |
+| MUT-X6\_k5 | Silent WAL Write Loss ($k=5$) | 21/32 (8.1%) | 16.00 [13.00, 22.00] | 16.76 | 35.00 [35.00] | 39.00 [39.00] | 8.97 [10.77] | 12.51 [12.62] | 8.55 [10.14] |
+| MUT-X6\_k9 | Silent WAL Write Loss ($k=9$) | 10/32 (3.6%) | 3.00 [3.00, 8.00] | 5.60 | 43.00 [45.40] | 47.00 [49.40] | 13.27 [10.82] | 6.51 [6.61] | 11.72 [10.76] |
 
-Each holdout setting ran 32 deterministic seeds at 120 ops/seed (544 total seeds, 17 fault settings) from `v1.1.2-evaluation-freeze` (`f9202dfca579`). `MUT-X2_k4` and `MUT-X2_k5` produced zero failures under all strategies (fault density below the trace-length detection threshold); they are excluded from paired statistics. The detailed table immediately below is retained from the historical `v1.0-dcg-pr-freeze` evaluation for chronology; the authoritative revised values are in the regenerated `results/holdout_summary.csv` and `results/holdout_per_seed.csv`.
+Each holdout setting ran 32 deterministic seeds at 120 ops/seed (544 total seeds, 17 fault settings) from `v1.1.2-evaluation-freeze` (`f9202dfca579`). The table above is transcribed from the regenerated `results/holdout_summary.csv` and `results/holdout_per_seed.csv`; densities use aggregate failures divided by aggregate candidate counts. `MUT-X2_k4` and `MUT-X2_k5` produced zero failures under all strategies (fault density below the trace-length detection threshold) and are excluded from paired statistics.
 
 **Paired statistical summary** (`python3 analysis/paired_stats.py results/holdout_per_seed.csv "Holdout Faults" MUT-X1_k2 MUT-X1_k3 MUT-X1_k4 MUT-X1_k6 MUT-X1_k9 MUT-X2_k1 MUT-X2_k3 MUT-X3_k1 MUT-X3_k2 MUT-X3_k3 MUT-X4_p04 MUT-X5_p12`):
 
