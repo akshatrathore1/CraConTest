@@ -1215,7 +1215,7 @@ func TestWaitForWALWriteAndFlushBeginDeadlinePanics(t *testing.T) {
 			rec.WaitForWALWrite(1)
 		}()
 
-		want := "vfsrec: WaitForWALWrite exceeded 5s deadline"
+		want := "vfsrec: WaitForWALWrite exceeded 15ms deadline"
 		if panicked != want {
 			t.Fatalf("WaitForWALWrite panic mismatch: got %v, want %q", panicked, want)
 		}
@@ -1235,7 +1235,7 @@ func TestWaitForWALWriteAndFlushBeginDeadlinePanics(t *testing.T) {
 			listener.FlushBegin(pebble.FlushInfo{JobID: 1})
 		}()
 
-		want := "vfsrec: FlushBegin manifestCond wait exceeded 5s deadline"
+		want := "vfsrec: FlushBegin manifestCond wait exceeded 15ms deadline"
 		if panicked != want {
 			t.Fatalf("FlushBegin panic mismatch: got %v, want %q", panicked, want)
 		}

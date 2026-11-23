@@ -161,7 +161,7 @@ func (fs *FS) WaitForWALWrite(target uint64) {
 		if timedOut {
 			close(done)
 			fs.mu.Unlock()
-			panic("vfsrec: WaitForWALWrite exceeded 5s deadline")
+			panic(fmt.Sprintf("vfsrec: WaitForWALWrite exceeded %v deadline", timeout))
 		}
 		fs.walCond.Wait()
 	}

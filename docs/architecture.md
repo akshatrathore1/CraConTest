@@ -53,19 +53,18 @@ exclusively in Phase 3 EXPLORE by replaying trace prefixes into a fresh `vfs.New
   concurrent background `Close` or `EngineEvent` records from splitting write-sync
   pairs.
 - `Sync` client mutations (`set`, `delete`, `batch`, `range_delete`) wait on `walCond`
-  (`WaitForWALWrite` in `internal/vfsrec/recorder.go:127-166`, with `NotifyDroppedWALWrite` for
-  `MUT-X6`) so `LogWriter.flushLoop` emits the operation's `.log` `Write` before `OpEnd`.
+  (`WaitForWALWrite` in `internal/vfsrec/recorder.go:133-170`, with `NotifyDroppedWALWrite` for
+  `MUT-X6`) when `walSync.NeedWALWriteBarrier()` is true (fault-wrapped FS) so `LogWriter.flushLoop` emits the operation's `.log` `Write` before `OpEnd`.
 - During ingest workloads, `inIngestSection` gates non-staging, non-marker background `Remove`
-  calls (`internal/vfsrec/recorder.go:498-550`) on `ingestCond` until a deferred `EndIngestSection()`
-  call broadcasts upon `db.Ingest` return, while `FlushBegin` (`internal/vfsrec/listener.go:102-136`)
+  calls (`internal/vfsrec/recorder.go:629-666`) on `ingestCond` until a deferred `EndIngestSection()`
+  call broadcasts upon `db.Ingest` return, while `FlushBegin` (`internal/vfsrec/listener.go:118-162`)
   executes `runtime.Gosched()` and, when outside `inIngestSection`, waits on
-  `manifestCond` while `pendingManifestDeletions > 0` (`ManifestCreated` at `listener.go:152-159`
-  when `dbManifestCount > 2` until `ManifestDeleted` at `listener.go:160-170`) so obsolete manifest
-  cleanup from a prior manifest rotation completes before the next flush begins. All synchronization
-  barriers (`WaitForWALWrite` on `walCond`, `FlushBegin` on `manifestCond`, and `drainBackgroundWork`)
-  wait purely on condition-variable / counter predicates during normal execution and enforce a configurable
-  fail-fast safety bound (default 30 seconds, overridable via `CRACONTEST_WAIT_TIMEOUT`) that panics loudly (`panic(...)`) if a background goroutine ever stalls,
-  ensuring traces never silently fall back to wall-clock timing. The fail-fast timers in
+  `manifestCond` while `pendingManifestDeletions > 0` (`ManifestCreated` at `listener.go:175-182`
+  when `dbManifestCount > 2` until `ManifestDeleted` at `listener.go:183-196`) so obsolete manifest
+  cleanup from a prior manifest rotation completes before the next flush begins. Recorder barriers
+  (`WaitForWALWrite` on `walCond`, `FlushBegin` on `manifestCond`) enforce a configurable
+  fail-fast safety bound (default 30 seconds, overridable via `CRACONTEST_WAIT_TIMEOUT`) that panics loudly (`panic(...)`) if a background goroutine ever stalls, ensuring recorder barriers never silently fall back to wall-clock timing,
+  whereas `drainBackgroundWork` returns an error on deadline expiry and uses cooperative yielding (`runtime.Gosched()`), 100µs backoff sleeps, and 2ms settling delays. The fail-fast timers in
   `WaitForWALWrite` and `FlushBegin` set a mutex-protected `timedOut` boolean flag prior to `Broadcast()`
   (preventing any clock-skew lost wakeup); because `FlushBegin` runs inside Pebble's flush callback,
   its panic propagates unrecoverably through Pebble's background flush goroutine by design. This synchronization
@@ -116,7 +115,7 @@ crash candidates, and rank them by strategy.
   `faults.FS` intercepts and drops specific sync barriers prior to trace recording.
 - **Rankings**: one ordered list of candidates per strategy.
 
-To eliminate trace and clone nondeterminism and guarantee bit-for-bit reproducibility across all retention policies, `replay.State.Clone(percent, seed)` (`internal/replay/replay.go:89-110`) explicitly handles all three retention regimes:
+To eliminate trace and clone nondeterminism and guarantee bit-for-bit reproducibility across all retention policies, `replay.State.Clone(percent, seed)` (`internal/replay/replay.go:93-111`) explicitly handles all three retention regimes:
 - `percent == 0`: delegates directly to `MemFS.CrashClone` with `UnsyncedDataPercent: 0` (RNG-free).
 - `percent == 100`: delegates directly to `MemFS.CrashClone` with `UnsyncedDataPercent: 100` and `rand.New(rand.NewPCG(0, seed))` (seed-invariant because every `IntN(100) < 100` check succeeds unconditionally).
 - `1 <= percent <= 99`: constructs `base0` (`UnsyncedDataPercent: 0`) and `full100` (`UnsyncedDataPercent: 100` with `rand.New(rand.NewPCG(0, 0))`), then runs `deterministicPartialClone` using `rng := rand.New(rand.NewPCG(0, seed))`, ensuring every intermediate state is bounded between `base0` and `full100` (`TestReplayEndpointEquivalenceAndBoundaryContainment`). Note that while `0%` and `100%` bound every intermediate policy `p%`, two distinct intermediate percentages `p1 < p2` are not guaranteed to be bitwise subsets at every offset because retaining an unsynced directory at `p2` that was skipped at `p1` consumes additional RNG draws for its children.
@@ -146,7 +145,7 @@ outcome table.
   Preserve open resource handles and cursor/alias behavior. Do not close
   or synchronize those handles before the snapshot.
 
-2. **Clone**: call `State.Clone(p, seed)` (`internal/replay/replay.go:89-110`) on the
+2. **Clone**: call `State.Clone(p, seed)` (`internal/replay/replay.go:93-111`) on the
    replayed filesystem to produce the post-crash state across all three retention cases:
    - `p == 0`: delegates to `MemFS.CrashClone` with `UnsyncedDataPercent: 0` (RNG-free).
    - `p == 100`: delegates to `MemFS.CrashClone` with `UnsyncedDataPercent: 100` and `rand.New(rand.NewPCG(0, seed))` (seed-invariant because every `IntN(100) < 100` check succeeds unconditionally).

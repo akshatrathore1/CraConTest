@@ -468,4 +468,13 @@ func TestWorkloadDiversityBenchmark(t *testing.T) {
 			}
 		}
 	}
+
+	wSeed.Flush()
+	if err := wSeed.Error(); err != nil {
+		t.Fatalf("flush per-seed csv: %v", err)
+	}
+	wSummary.Flush()
+	if err := wSummary.Error(); err != nil {
+		t.Fatalf("flush summary csv: %v", err)
+	}
 }

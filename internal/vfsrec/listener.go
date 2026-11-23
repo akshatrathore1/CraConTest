@@ -1,6 +1,7 @@
 package vfsrec
 
 import (
+	"fmt"
 	"runtime"
 	"time"
 
@@ -141,7 +142,7 @@ func (fs *FS) EventListener() pebble.EventListener {
 				for !fs.inIngestSection && fs.pendingManifestDeletions > 0 {
 					if timedOut {
 						close(done)
-						msg := "FlushBegin manifestCond wait exceeded 5s deadline"
+						msg := fmt.Sprintf("FlushBegin manifestCond wait exceeded %v deadline", timeout)
 						event := trace.Event{
 							Kind: trace.KindEngineEvent,
 							Note: "BackgroundError",

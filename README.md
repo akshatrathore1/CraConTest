@@ -229,7 +229,7 @@ CraConTest has been evaluated across two directory-sync crash bugs in Pebble v2.
 2. **Pebble Checkpoint Directory Race & `BARRIER-CKPT`:**
    - In Pebble's checkpoint subsystem, during `db.Checkpoint(destDir)`, Pebble creates hard-linked SSTables, `MANIFEST`, and `marker.manifest.*` inside `destDir` before directory synchronization. Under 50% partial retention this yields 53 open failures across 31 of 32 MUT-0 seeds in the accounting-corrected reevaluation.
    - Case Study 2 belongs to the same structural bug class as Case Study 1 (`#5825`) (multi-entry directory races in Pebble's `atomicfs` marker protocol), evaluating **intra-class subsystem transfer** of `dcg-pr` (from manifest rotation in `"db/"` to `db.Checkpoint` in `"checkpoint/"`), not generalization to an unseen bug class.
-   - The `BARRIER-CKPT` intervention (`internal/faults/faults.go:602-625`) adds destination-directory synchronization; no checkpoint recovery failures are observed across the 32 evaluated seeds.
+   - The `BARRIER-CKPT` intervention (`internal/faults/faults.go:682-705`) adds destination-directory synchronization; no checkpoint recovery failures are observed across the 32 evaluated seeds.
    - This is intra-class transfer within Pebble's marker protocol, not a blind unseen bug class. DCG-PR records median/mean $k_1=245.00/156.39$ versus DCG 288.00/258.65, R2 280.41/271.55, and corrected B0 262.26/238.53; DCG-PR/R2 paired W/L/T is 22/9/0.
 
 3. **Direct L0 `db.Ingest` Cross-Channel Prefix Hole & `BARRIER-INGEST`:**

@@ -491,8 +491,8 @@ func runExploreCmd(args []string) error {
 	if err != nil {
 		return fmt.Errorf("create outcomes.json: %w", err)
 	}
-	defer outFile.Close()
 	if err := exp.EncodeOutcomes(outFile, universe, res.Outcomes); err != nil {
+		_ = outFile.Close()
 		return fmt.Errorf("encode outcomes.json: %w", err)
 	}
 	if err := outFile.Close(); err != nil {
@@ -644,6 +644,9 @@ func runEvaluate(args []string) error {
 	if err := w.Error(); err != nil {
 		return fmt.Errorf("flush curves.csv: %w", err)
 	}
+	if err := csvFile.Close(); err != nil {
+		return fmt.Errorf("close curves.csv: %w", err)
+	}
 
 	fmt.Printf("\nSaved discovery curves to %s\n", filepath.Join(*runDir, "curves.csv"))
 
@@ -763,6 +766,9 @@ func writePositions(runDir string, universe []candidate.Candidate, outcomes []or
 	w.Flush()
 	if err := w.Error(); err != nil {
 		return err
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("close positions.csv: %w", err)
 	}
 	fmt.Printf("Saved discovery positions to %s\n", path)
 	return nil

@@ -322,7 +322,7 @@ To address these limitations, the expanded evaluation incorporates principled sp
 
 ### 32-Seed Benchmark Summary Tables
 
-> **Note on Per-Seed Shuffle Aggregation:** Within each workload seed (`RunSingleSeedFault` in `internal/exp/benchmark.go`), `R1`, `R2`, and `DCG-FlagOnly` average metrics across 100 shuffles (`seed*1000 + i*31 + 17`), whereas `B0` records the per-seed median across 100 fixed shuffles (`i*31 + 17`) before computing the cross-seed mean and median across the 32 workload seeds (making `B0` a stricter, lower-$k_1$ baseline than the analytical mean expectation $E[K_1] = (N+1)/(m+1)$, e.g., $2.00$ vs. $2.73$ on `MUT-1`). Note that while `benchmark.go` defaults to 100 shuffles (`B0PercentileCnt: 100`), `casestudy_ingest_test.go:429` and the 16-seed benchmark in `workload_diversity_test.go:303` configure `B0PercentileCnt: 50` (and the smoke check in `workload_diversity_test.go:50, 75` configures `B0PercentileCnt: 10`). Furthermore, `analysis/paired_stats.py` reports the 100-shuffle means (`k1_failure_mean`, matching the summary tables) for strategy mean columns and speedup ratios while computing paired sign/Wilcoxon tests and W/L/T tallies on the canonical single-seed rankings (`k1_single`).
+> **Note on Per-Seed Shuffle Aggregation:** Within each workload seed (`RunSingleSeedFault` in `internal/exp/benchmark.go`), under `v1.1.2-evaluation-freeze`, `R1`, `R2`, `DCG-FlagOnly`, and `B0` all compute true per-seed shuffle means across 100 shuffles (matching $E[K_1] = (N+1)/(m+1)$, e.g., $2.73$ on `MUT-1`), while `B0` also records percentile bounds across those shuffles. Note that while `benchmark.go` defaults to 100 shuffles (`B0PercentileCnt: 100`), `casestudy_ingest_test.go:431` and the 16-seed benchmark in `workload_diversity_test.go:306` configure `B0PercentileCnt: 50` (and the smoke check in `workload_diversity_test.go:51, 77` configures `B0PercentileCnt: 10`). Furthermore, `analysis/paired_stats.py` reports the 100-shuffle means (`k1_failure_mean`, matching the summary tables) for strategy mean columns and speedup ratios while computing paired sign/Wilcoxon tests and W/L/T tallies on the canonical single-seed rankings (`k1_single`).
 
 Across 32 deterministic workload seeds (>11,000 evaluated crash candidates):
 
@@ -460,7 +460,7 @@ In Pebble v2.1.7, `db.Checkpoint(destDir)` creates hard-linked SSTables, `MANIFE
 
 Crucially, the checkpoint race fixed by `15b500fb` belongs to the same structural bug class as Case Study 1 (`#5825`): both are multi-entry directory races in Pebble's marker protocol. Case Study 2 therefore evaluates **intra-class subsystem transfer** of `dcg-pr` from manifest rotation in `"db/"` to `db.Checkpoint` in `"checkpoint/"`, not generalization to an unseen bug class.
 
-Enforcing immediate per-entry parent-directory synchronization (`BARRIER-CKPT`, `internal/faults/faults.go:641-653`, which syncs `parentDir` on `marker.manifest` operations across both `"db/"` and `"checkpoint/"`) eliminates this intra-window multi-entry race (`0/32` failing seeds).
+Enforcing immediate per-entry parent-directory synchronization (`BARRIER-CKPT`, `internal/faults/faults.go:682-705`, which syncs `parentDir` on `marker.manifest` operations across both `"db/"` and `"checkpoint/"`) eliminates this intra-window multi-entry race (`0/32` failing seeds).
 
 ### 10.2 Pre-Evaluation Code Freeze & Barrier A/B Evaluation
 To guard against methodological overfitting, all prioritization algorithms—including `dcg` and `dcg-pr`—were frozen under git tag `v1.0-dcg-pr-freeze` (`67bbe7ded57d`) before evaluating this intra-class subsystem transfer case study (since BARRIER-CKPT and dcg-pr share the same multi-entry directory mechanism as #5825, this is an intra-class transfer check rather than a blind test of an unseen bug class). Workload operations were extended with `-checkpoint-at 60`, executing a checkpoint creation operation mid-workload.
@@ -633,9 +633,9 @@ We evaluated 32 canonical seeds (`seed = 1..32`, 25 ops, `SyncEvery: 4, FlushEve
 | **MUT-0 (Unpatched)** | **DCG-PR** | **9.00** [9.00, 19.00] | **15.32** [9.88, 20.76] | **4.00** | **35.70** | **0.75** | **1.41** |
 | **MUT-0 (Unpatched)** | **DCG** | **9.00** [9.00, 19.00] | **15.32** [9.88, 20.76] | 4.00 | 35.70 | 0.75 | 1.41 |
 | **MUT-0 (Unpatched)** | Uniform Random (B0) | 33.74 [24.58, 43.58] | 34.32 [28.69, 39.94] | 19.86 | 50.55 | 0.53 | 1.88 |
-| **MUT-0 (Unpatched)** | State-Representative Random (R2) | 27.88 [22.65, 32.28] | 27.64 [23.57, 31.70] | 16.53 | 34.58 | 0.51 | 1.94 |
-| **MUT-0 (Unpatched)** | 0%-Retention Random (R1) | 28.60 [21.80, 41.51] | 30.61 [24.93, 36.28] | 16.34 | 47.18 | 0.53 | 1.73 |
-| **MUT-0 (Unpatched)** | DCG Flag-Only (Ablation) | 28.18 [26.92, 29.26] | 29.88 [25.85, 33.90] | 19.78 | 45.93 | 0.42 | 1.75 |
+| **MUT-0 (Unpatched)** | State-Representative Random (R2) | 26.77 [23.18, 30.66] | 27.00 [23.34, 30.66] | 17.30 | 35.05 | 0.51 | 1.93 |
+| **MUT-0 (Unpatched)** | 0%-Retention Random (R1) | 31.60 [23.44, 38.08] | 30.46 [25.91, 35.02] | 16.99 | 41.41 | 0.53 | 1.73 |
+| **MUT-0 (Unpatched)** | DCG Flag-Only (Ablation) | 28.50 [26.61, 29.88] | 29.80 [25.95, 33.65] | 20.89 | 46.02 | 0.43 | 1.75 |
 | **MUT-0 (Unpatched)** | sync-boundary (B6) | 81.00 [52.00, 90.00] | 80.18 [59.96, 100.40] | 24.00 | 152.00 | 0.31 | 1.31 |
 | **BARRIER-INGEST** | **All Strategies** | **0 observed prefix violations** across 32 seeds ($S_{25}=0.00, S_{100}=0.00$) |
 
@@ -655,8 +655,8 @@ Real-world storage systems encounter workloads with radically divergent access p
 1. **`ycsb-a` (Update-Heavy):** 50% update (`set`), 50% point read (`get`) over 8 hot keys (`keyCount = 8`) with periodic sync/flush. Simulates high-write transactional key-value serving.
 2. **`ycsb-b` (Read-Predominant):** 75% point read (`get`), 25% update (`set`, 3 reads per write operation via `i%4 == 3`, adapted from YCSB-B for 25-operation traces so multiple sync cycles occur per run) over 12 keys (`keyCount = 12`) with periodic sync/flush. Tests sparse write persistence within dense read sequences.
 3. **`ycsb-f` (Read-Modify-Write Transactions):** 100% read-modify-write two-key atomic batch transactions (reading 2 keys via `Get` and updating 2 distinct keys atomically via `Batch` per transaction) over 8 keys (`keyCount = 8`) with periodic sync/flush. Tests batch commit atomicity and multi-key durability horizons.
-4. **`overwrite-heavy` (Deep Version Chains):** 100% overwrite (`set`) across 4 hot keys (`keyCount = 4`), driving deep per-key version chains and frequent memtable flush pressure. (Note in §14.3/§14.4 that `ycsb-f` and `overwrite-heavy` produce identical discovery metrics because both execute 100% mutating operations under the same sync/flush cadence.)
-5. **`delete-heavy` (Tombstone & Lifecycle Stress):** Equal 1/3 cycling (`i%3`) of point `set`, point `delete`, and `range_delete` (`DeleteRange`) over 8 keys (`keyCount = 8`) with periodic checkpoints (`checkpointAt = 10`). Exercises range tombstones and directory hard-linking.
+4. **`overwrite-heavy` (Deep Version Chains):** 100% overwrite (`set`) across 4 hot keys (`keyCount = 4`), driving deep per-key version chains and frequent memtable flush pressure.
+5. **`delete-heavy` (Tombstone & Lifecycle Stress):** Equal 1/3 cycling (`i%3`) of point `set`, point `delete`, and `range_delete` (`DeleteRange`) over 8 keys (`keyCount = 8`) with periodic checkpoints (`checkpointAt = 10`). Exercises range tombstones and directory hard-linking. (In 25-operation traces with `checkpointAt = 10`, the second checkpoint at op 24 attempts to reuse the existing `checkpoint` directory and returns a deterministic `file already exists` error; this behavior is preserved under the `v1.1.2-evaluation-freeze` dataset.)
 
 ### 14.2 Multi-Fault Evaluation Matrix
 

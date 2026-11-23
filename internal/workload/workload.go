@@ -811,6 +811,12 @@ func Run(db *pebble.DB, marker Marker, cfg Config) ([]history.Entry, error) {
 			}
 
 		case "checkpoint":
+			// In workloads with periodic checkpoints (e.g., PresetDeleteHeavy with 25 ops
+			// and checkpointAt=10, triggering at op 12 and op 24), the second checkpoint
+			// returns "checkpoint checkpoint: file already exists" because the target
+			// directory "checkpoint" already exists from the first checkpoint. Since
+			// results/workload_diversity_*.csv is frozen at f9202dfca579, this deterministic
+			// behavior is preserved and documented.
 			opErr = db.Checkpoint("checkpoint")
 
 		case "ingest":

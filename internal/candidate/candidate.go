@@ -19,7 +19,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"unsafe"
 
 	"github.com/akshatrathore1/CraConTest/internal/trace"
 )
@@ -329,7 +328,6 @@ func (s *cutoffState) Key(percent int) string {
 }
 
 type cutoffCacheEntry struct {
-	ptr    uintptr
 	length int
 	hash   uint64
 	states []*cutoffState
@@ -396,6 +394,10 @@ func traceFingerprint(events []trace.Event) uint64 {
 			h ^= 2
 			h *= prime
 		}
+		if events[i].Created {
+			h ^= 4
+			h *= prime
+		}
 	}
 	return h
 }
@@ -407,7 +409,6 @@ func buildCutoffStates(events []trace.Event) []*cutoffState {
 		return buildCutoffStatesUncached(events)
 	}
 
-	ptr := uintptr(unsafe.Pointer(&events[0]))
 	length := len(events)
 	fp := traceFingerprint(events)
 
@@ -429,7 +430,6 @@ func buildCutoffStates(events []trace.Event) []*cutoffState {
 
 	cutoffCacheMu.Lock()
 	newEntry := cutoffCacheEntry{
-		ptr:    ptr,
 		length: length,
 		hash:   fp,
 		states: states,

@@ -31,7 +31,7 @@ Stage 1 contains full trace, execution history, candidate universe, crash explor
 
 Stage 2 stores aggregated 95%-confidence-interval summaries and unaggregated per-seed discovery tables across multi-seed benchmark evaluations (120 operations/seed, 32 deterministic seeds: `42, 100..900, 1001..1022`). These tables enable full statistical reproduction and hypothesis testing via `analysis/paired_stats.py` without requiring the repository to commit hundreds of megabytes of raw per-run trace and universe JSONs.
 
-Within each workload seed (`RunSingleSeedFault` in `internal/exp/benchmark.go`), `R1`, `R2`, and `DCG-FlagOnly` average metrics across 100 shuffles (`seed*1000 + i*31 + 17`), whereas `B0` records the per-seed median across 100 fixed shuffles (`i*31 + 17`) before computing the cross-seed mean and median across the 32 workload seeds (making `B0` a stricter, lower-$k_1$ baseline than the analytical mean expectation $E[K_1] = (N+1)/(m+1)$, e.g., $2.00$ vs. $2.73$ on `MUT-1`).
+Within each workload seed (`RunSingleSeedFault` in `internal/exp/benchmark.go`), under `v1.1.2-evaluation-freeze`, `R1`, `R2`, `DCG-FlagOnly`, and `B0` all compute true per-seed shuffle means across 100 shuffles (matching $E[K_1] = (N+1)/(m+1)$, e.g., $2.73$ on `MUT-1`), while `B0` also records percentile bounds across those shuffles.
 
 1. **In-Sample Multi-Seed Benchmark (`results/benchmark_summary.csv`, `results/benchmark_per_seed.csv`):**
    - Scope: 10 in-sample fault models (`MUT-0` through `MUT-9`, 320 runs total).
