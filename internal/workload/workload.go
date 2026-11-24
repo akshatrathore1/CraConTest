@@ -63,6 +63,7 @@ type walWriteSyncer interface {
 // (ycsb-a, ycsb-b, ycsb-f, overwrite-heavy, delete-heavy).
 type Config struct {
 	Preset              string `json:"preset,omitempty"`
+	Dir                 string `json:"dir,omitempty"` // Optional primary DB directory name; when non-empty, passed to vfsrec.SetPrimaryDBDir.
 	Seed                uint64 `json:"seed"`
 	Operations          int    `json:"operations"`
 	KeyCount            int    `json:"key_count"`
@@ -712,9 +713,10 @@ func Run(db *pebble.DB, marker Marker, cfg Config) ([]history.Entry, error) {
 		return nil, errors.New("workload: ingest requires a valid VFS")
 	}
 
-	dir := "db"
-	if setter := findPrimaryDirSetter(targetFS, cfg.FS); setter != nil {
-		setter.SetPrimaryDBDir(dir)
+	if cfg.Dir != "" {
+		if setter := findPrimaryDirSetter(targetFS, cfg.FS); setter != nil {
+			setter.SetPrimaryDBDir(cfg.Dir)
+		}
 	}
 
 	var ingestGate ingestSectionGate
