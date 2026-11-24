@@ -55,14 +55,16 @@ exclusively in Phase 3 EXPLORE by replaying trace prefixes into a fresh `vfs.New
 - `Sync` client mutations (`set`, `delete`, `batch`, `range_delete`) wait on `walCond`
   (`WaitForWALWrite` in `internal/vfsrec/recorder.go:133-170`, with `NotifyDroppedWALWrite` for
   `MUT-X6`) when `walSync.NeedWALWriteBarrier()` is true (fault-wrapped FS) so `LogWriter.flushLoop` emits the operation's `.log` `Write` before `OpEnd`.
-- During ingest workloads, `inIngestSection` gates non-staging, non-marker background `Remove`
+- During ingest workloads, `inIngestSection` gates non-manifest, non-staging, non-marker background `Remove`
   calls (`internal/vfsrec/recorder.go:629-666`) on `ingestCond` until a deferred `EndIngestSection()`
-  call broadcasts upon `db.Ingest` return, while `FlushBegin` (`internal/vfsrec/listener.go:118-162`)
-  executes `runtime.Gosched()` and, when outside `inIngestSection`, waits on
-  `manifestCond` while `pendingManifestDeletions > 0` (`ManifestCreated` at `listener.go:175-182`
-  when `dbManifestCount > 2` until `ManifestDeleted` at `listener.go:183-196`) so obsolete manifest
-  cleanup from a prior manifest rotation completes before the next flush begins. Recorder barriers
-  (`WaitForWALWrite` on `walCond`, `FlushBegin` on `manifestCond`) enforce a configurable
+  call broadcasts upon `db.Ingest` return, while both `FlushBegin` (`internal/vfsrec/listener.go:118-162`, executing `runtime.Gosched()`)
+  and staging `Remove` calls (`internal/vfsrec/recorder.go:668-702`) wait on
+  `manifestCond` while `pendingManifestDeletions > 0` (armed on primary-DB `marker.manifest.*` removal
+  when `dbManifestCount > 2` at `internal/vfsrec/recorder.go:708-710` until `ManifestDeleted` at
+  `internal/vfsrec/listener.go:180-190`, with `dbManifestCount` decremented once on `db/MANIFEST-*`
+  removal at `recorder.go:705-707`) so obsolete manifest cleanup from a prior manifest rotation completes
+  before the next flush begins or staging files are removed. Recorder barriers
+  (`WaitForWALWrite` on `walCond`, `FlushBegin` and staging `Remove` on `manifestCond`) enforce a configurable
   fail-fast safety bound (default 30 seconds, overridable via `CRACONTEST_WAIT_TIMEOUT`) that panics loudly (`panic(...)`) if a background goroutine ever stalls, ensuring recorder barriers never silently fall back to wall-clock timing,
   whereas `drainBackgroundWork` returns an error on deadline expiry and uses cooperative yielding (`runtime.Gosched()`), 100µs backoff sleeps, and 2ms settling delays. The fail-fast timers in
   `WaitForWALWrite` and `FlushBegin` set a mutex-protected `timedOut` boolean flag prior to `Broadcast()`

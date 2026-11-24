@@ -120,7 +120,7 @@ func (fs *FS) EventListener() pebble.EventListener {
 				runtime.Gosched()
 			}
 			fs.mu.Lock()
-			if !fs.inIngestSection && fs.pendingManifestDeletions > 0 && fs.manifestCond != nil {
+			if fs.pendingManifestDeletions > 0 && fs.manifestCond != nil {
 				timeout := fs.waitTimeout
 				if timeout <= 0 {
 					timeout = defaultWaitTimeout()
@@ -139,7 +139,7 @@ func (fs *FS) EventListener() pebble.EventListener {
 					case <-done:
 					}
 				}()
-				for !fs.inIngestSection && fs.pendingManifestDeletions > 0 {
+				for fs.pendingManifestDeletions > 0 {
 					if timedOut {
 						close(done)
 						msg := fmt.Sprintf("FlushBegin manifestCond wait exceeded %v deadline", timeout)
@@ -175,17 +175,11 @@ func (fs *FS) EventListener() pebble.EventListener {
 		ManifestCreated: func(info pebble.ManifestCreateInfo) {
 			fs.mu.Lock()
 			defer fs.mu.Unlock()
-			if fs.dbManifestCount > 2 {
-				fs.pendingManifestDeletions++
-			}
 			fs.recordEngineEventLocked("ManifestCreated", jobID(info.JobID), nil, pathSlice(info.Path))
 		},
 		ManifestDeleted: func(info pebble.ManifestDeleteInfo) {
 			fs.mu.Lock()
 			defer fs.mu.Unlock()
-			if fs.dbManifestCount > 0 {
-				fs.dbManifestCount--
-			}
 			if fs.pendingManifestDeletions > 0 {
 				fs.pendingManifestDeletions--
 				if fs.pendingManifestDeletions == 0 && fs.manifestCond != nil {

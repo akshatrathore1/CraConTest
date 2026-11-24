@@ -626,7 +626,7 @@ func (fs *FS) Remove(name string) error {
 		}
 	}
 
-	if fs.inIngestSection && !isIngestOp && !strings.Contains(canon, "ingest_staging") && !strings.Contains(canon, "ingest_") && !strings.Contains(canon, "marker.manifest") {
+	if fs.inIngestSection && !isIngestOp && !isDBManifestPath(canon) && !strings.Contains(canon, "ingest_staging") && !strings.Contains(canon, "ingest_") && !strings.Contains(canon, "marker.manifest") {
 		if fs.ingestCond == nil {
 			fs.ingestCond = sync.NewCond(&fs.mu)
 		}
@@ -665,9 +665,48 @@ func (fs *FS) Remove(name string) error {
 		close(done)
 	}
 
+	if strings.Contains(canon, "ingest_staging") && fs.pendingManifestDeletions > 0 && fs.manifestCond != nil {
+		timeout := fs.waitTimeout
+		if timeout <= 0 {
+			timeout = defaultWaitTimeout()
+		}
+		var timedOut bool
+		done := make(chan struct{})
+		go func() {
+			timer := time.NewTimer(timeout)
+			defer timer.Stop()
+			select {
+			case <-timer.C:
+				fs.mu.Lock()
+				timedOut = true
+				fs.manifestCond.Broadcast()
+				fs.mu.Unlock()
+			case <-done:
+			}
+		}()
+		for fs.pendingManifestDeletions > 0 {
+			if timedOut {
+				close(done)
+				timeoutErr := fmt.Errorf("vfsrec: FS.Remove manifestCond wait exceeded %v deadline", timeout)
+				event := trace.Event{
+					Kind: trace.KindRemove,
+					File: canon,
+					Err:  timeoutErr.Error(),
+				}
+				fs.appendEventLocked(event)
+				return timeoutErr
+			}
+			fs.manifestCond.Wait()
+		}
+		close(done)
+	}
+
 	err = fs.inner.Remove(name)
 	if err == nil && isDBManifestPath(canon) && fs.dbManifestCount > 0 {
 		fs.dbManifestCount--
+	}
+	if err == nil && isPrimaryDBDir(canon) && strings.Contains(canon, "marker.manifest.") && fs.dbManifestCount > 2 {
+		fs.pendingManifestDeletions++
 	}
 	event := trace.Event{
 		Kind: trace.KindRemove,
