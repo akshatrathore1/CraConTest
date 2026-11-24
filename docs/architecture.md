@@ -53,20 +53,18 @@ exclusively in Phase 3 EXPLORE by replaying trace prefixes into a fresh `vfs.New
   concurrent background `Close` or `EngineEvent` records from splitting write-sync
   pairs.
 - `Sync` client mutations (`set`, `delete`, `batch`, `range_delete`) wait on `walCond`
-  (`WaitForWALWrite` in `internal/vfsrec/recorder.go:133-170`, with `NotifyDroppedWALWrite` for
-  `MUT-X6`) when `walSync.NeedWALWriteBarrier()` is true (fault-wrapped FS) so `LogWriter.flushLoop` emits the operation's `.log` `Write` before `OpEnd`.
+  (`WaitForWALWrite` in `internal/vfsrec/recorder.go:192-229`, with `NotifyDroppedWALWrite` for
+  `MUT-X6` at `internal/vfsrec/recorder.go:173-179`) when `walSync.NeedWALWriteBarrier()` is true (fault-wrapped FS) so `LogWriter.flushLoop` emits the operation's `.log` `Write` before `OpEnd`.
 - During ingest workloads, `inIngestSection` gates non-manifest, non-staging, non-marker background `Remove`
-  calls (`internal/vfsrec/recorder.go:629-666`) on `ingestCond` until a deferred `EndIngestSection()`
+  calls (`internal/vfsrec/recorder.go:688-725`) on `ingestCond` until a deferred `EndIngestSection()`
   call broadcasts upon `db.Ingest` return, while both `FlushBegin` (`internal/vfsrec/listener.go:118-162`, executing `runtime.Gosched()`)
-  and staging `Remove` calls (`internal/vfsrec/recorder.go:668-702`) wait on
+  and staging `Remove` calls (`internal/vfsrec/recorder.go:727-761`) wait on
   `manifestCond` while `pendingManifestDeletions > 0` (armed on primary-DB `marker.manifest.*` removal
-  when `dbManifestCount > 2` at `internal/vfsrec/recorder.go:708-710` until `ManifestDeleted` at
+  when `dbManifestCount > 2` at `internal/vfsrec/recorder.go:767-769` until `ManifestDeleted` at
   `internal/vfsrec/listener.go:180-190`, with `dbManifestCount` decremented once on `db/MANIFEST-*`
-  removal at `recorder.go:705-707`) so obsolete manifest cleanup from a prior manifest rotation completes
+  removal at `recorder.go:764-766`) so obsolete manifest cleanup from a prior manifest rotation completes
   before the next flush begins or staging files are removed. Recorder barriers
-  (`WaitForWALWrite` on `walCond`, `FlushBegin` and staging `Remove` on `manifestCond`) enforce a configurable
-  fail-fast safety bound (default 30 seconds, overridable via `CRACONTEST_WAIT_TIMEOUT`) that panics loudly (`panic(...)`) if a background goroutine ever stalls, ensuring recorder barriers never silently fall back to wall-clock timing,
-  whereas `drainBackgroundWork` returns an error on deadline expiry and uses cooperative yielding (`runtime.Gosched()`), 100µs backoff sleeps, and 2ms settling delays. The fail-fast timers in
+  enforce a configurable fail-fast safety bound (default 30 seconds, overridable via `CRACONTEST_WAIT_TIMEOUT`): `WaitForWALWrite` (on `walCond`) and `FlushBegin` (on `manifestCond`) panic loudly (`panic(...)`) on deadline expiry to ensure barriers never silently fall back to wall-clock timing, whereas `FS.Remove` waits (`ingestCond` and staging `manifestCond`) record an error `Remove` event and return a timeout error, and `drainBackgroundWork` returns an error on deadline expiry. The workload also uses cooperative yielding (`runtime.Gosched()`), 100µs polling backoff (`internal/workload/workload.go:603, 618`), and 2ms settling delays (at `internal/workload/workload.go:627` in `drainBackgroundWork` and `:861` post-`WaitForWALWrite`), which are preserved for `v1.1.2-evaluation-freeze` trace parity because Pebble's internal flush/cleaner loops do not expose a post-drain condition variable. The fail-fast timers in
   `WaitForWALWrite` and `FlushBegin` set a mutex-protected `timedOut` boolean flag prior to `Broadcast()`
   (preventing any clock-skew lost wakeup); because `FlushBegin` runs inside Pebble's flush callback,
   its panic propagates unrecoverably through Pebble's background flush goroutine by design. This synchronization

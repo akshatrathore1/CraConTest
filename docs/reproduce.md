@@ -12,6 +12,12 @@ three MUT-0 recordings of the main workload). This is why crash states are alway
 from a stored trace and never by re-running the engine. The committed run directories
 under `results/` are the reference data for every figure and table.
 
+**Exact Artifact Reproduction (`v1.1.2-evaluation-freeze`).** All 14 Stage 2 CSVs carry `git_commit = f9202dfca579` (`v1.1.2-evaluation-freeze`). Subsequent commits on `main` are post-freeze maintenance, CI, and determinism fixes. Readers reproducing the exact frozen baseline should run:
+
+```bash
+git checkout v1.1.2-evaluation-freeze
+```
+
 ---
 
 ## 1. Build

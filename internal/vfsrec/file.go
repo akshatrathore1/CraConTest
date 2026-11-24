@@ -112,7 +112,7 @@ func (f *recFile) Write(p []byte) (int, error) {
 		event.Err = err.Error()
 	}
 	f.fs.appendEventLocked(event)
-	if err == nil && isDBWALPath(f.label) && (f.cat == "pebble-wal" || f.cat == vfs.WriteCategoryUnspecified || f.cat == "") {
+	if err == nil && f.fs.isDBWALPathLocked(f.label) && (f.cat == "pebble-wal" || f.cat == vfs.WriteCategoryUnspecified || f.cat == "") {
 		f.fs.walWrites++
 		if f.fs.walCond != nil {
 			f.fs.walCond.Broadcast()
@@ -149,7 +149,7 @@ func (f *recFile) WriteAt(p []byte, off int64) (int, error) {
 		event.Err = err.Error()
 	}
 	f.fs.appendEventLocked(event)
-	if err == nil && isDBWALPath(f.label) && (f.cat == "pebble-wal" || f.cat == vfs.WriteCategoryUnspecified || f.cat == "") {
+	if err == nil && f.fs.isDBWALPathLocked(f.label) && (f.cat == "pebble-wal" || f.cat == vfs.WriteCategoryUnspecified || f.cat == "") {
 		f.fs.walWrites++
 		if f.fs.walCond != nil {
 			f.fs.walCond.Broadcast()

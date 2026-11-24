@@ -504,16 +504,21 @@ func TestAllEntriesPropagatesYieldPanic(t *testing.T) {
 
 type hangingFS struct {
 	vfs.FS
+	block chan struct{}
 }
 
 func (h hangingFS) Create(name string, category vfs.DiskWriteCategory) (vfs.File, error) {
-	time.Sleep(100 * time.Millisecond)
+	if h.block != nil {
+		<-h.block
+	}
 	return h.FS.Create(name, category)
 }
 
 func TestSafeOpenTimeoutNoGoroutineLeak(t *testing.T) {
 	mem := vfs.NewCrashableMem()
-	fs := hangingFS{FS: mem}
+	block := make(chan struct{})
+	t.Cleanup(func() { close(block) })
+	fs := hangingFS{FS: mem, block: block}
 	res := recovery.SafeOpen(fs, "db", 20*time.Millisecond)
 	if !res.Timeout {
 		t.Fatalf("expected timeout, got: %+v", res)

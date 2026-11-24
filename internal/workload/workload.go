@@ -623,7 +623,29 @@ func drainBackgroundWork(db *pebble.DB) error {
 	if err := waitClean(); err != nil {
 		return err
 	}
+	// 2 ms settling delay is preserved for v1.1.2-evaluation-freeze trace-timing parity because Pebble's internal flush/cleaner loops do not expose a post-drain condition variable.
 	time.Sleep(2 * time.Millisecond)
+	return nil
+}
+
+type primaryDirSetter interface {
+	SetPrimaryDBDir(string)
+}
+
+func findPrimaryDirSetter(targets ...any) primaryDirSetter {
+	for _, t := range targets {
+		curr := t
+		for curr != nil {
+			if ps, ok := curr.(primaryDirSetter); ok {
+				return ps
+			}
+			if u, ok := curr.(interface{ Unwrap() vfs.FS }); ok {
+				curr = u.Unwrap()
+			} else {
+				break
+			}
+		}
+	}
 	return nil
 }
 
@@ -688,6 +710,11 @@ func Run(db *pebble.DB, marker Marker, cfg Config) ([]history.Entry, error) {
 	}
 	if targetFS == nil && cfg.IngestEvery > 0 {
 		return nil, errors.New("workload: ingest requires a valid VFS")
+	}
+
+	dir := "db"
+	if setter := findPrimaryDirSetter(targetFS, cfg.FS); setter != nil {
+		setter.SetPrimaryDBDir(dir)
 	}
 
 	var ingestGate ingestSectionGate
@@ -830,6 +857,7 @@ func Run(db *pebble.DB, marker Marker, cfg Config) ([]history.Entry, error) {
 			switch op.Kind {
 			case OpSet, OpDelete, OpBatch, OpRangeDelete:
 				walSync.WaitForWALWrite(prevWAL + 1)
+				// 2 ms settling delay is preserved for v1.1.2-evaluation-freeze trace-timing parity because Pebble's internal flush/cleaner loops do not expose a post-drain condition variable.
 				time.Sleep(2 * time.Millisecond)
 			}
 		}

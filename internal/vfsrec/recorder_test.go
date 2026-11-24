@@ -1113,6 +1113,96 @@ func TestIsDBWALAndManifestPathPredicates(t *testing.T) {
 	}
 }
 
+func TestIsDBManifestPathAndCustomPrimaryDBDir(t *testing.T) {
+	posCases := []string{
+		"MANIFEST-000001",
+		"db/MANIFEST-000001",
+		"db_1/MANIFEST-000002",
+		"testdb/MANIFEST-000003",
+	}
+	for _, p := range posCases {
+		if !vfsrec.IsDBManifestPathForTesting(p) {
+			t.Errorf("IsDBManifestPathForTesting(%q) = false, want true", p)
+		}
+	}
+
+	negCases := []string{
+		"checkpoint/MANIFEST-000001",
+		"db/marker.manifest.000001.MANIFEST-000001",
+		"other/MANIFEST-000001",
+		"db/000001.log",
+		"db/sub/MANIFEST-000001",
+	}
+	for _, p := range negCases {
+		if vfsrec.IsDBManifestPathForTesting(p) {
+			t.Errorf("IsDBManifestPathForTesting(%q) = true, want false", p)
+		}
+	}
+
+	mem := vfs.NewMem()
+	rec := vfsrec.New(mem)
+	rec.SetPrimaryDBDir("custom_db")
+
+	if err := rec.MkdirAll("custom_db", 0755); err != nil {
+		t.Fatalf("MkdirAll(custom_db): %v", err)
+	}
+	if err := rec.MkdirAll("checkpoint", 0755); err != nil {
+		t.Fatalf("MkdirAll(checkpoint): %v", err)
+	}
+	if err := rec.MkdirAll("db", 0755); err != nil {
+		t.Fatalf("MkdirAll(db): %v", err)
+	}
+
+	fCustom, err := rec.Create("custom_db/000001.log", "pebble-wal")
+	if err != nil {
+		t.Fatalf("Create custom_db/000001.log: %v", err)
+	}
+	if _, err := fCustom.Write([]byte("custom wal entry")); err != nil {
+		t.Fatalf("Write custom_db/000001.log: %v", err)
+	}
+	_ = fCustom.Close()
+
+	if got := rec.WALWriteCount(); got != 1 {
+		t.Fatalf("WALWriteCount() after custom_db WAL write: got %d, want 1", got)
+	}
+
+	fCkpt, err := rec.Create("checkpoint/000001.log", "pebble-wal")
+	if err != nil {
+		t.Fatalf("Create checkpoint/000001.log: %v", err)
+	}
+	if _, err := fCkpt.Write([]byte("checkpoint wal")); err != nil {
+		t.Fatalf("Write checkpoint/000001.log: %v", err)
+	}
+	_ = fCkpt.Close()
+
+	if got := rec.WALWriteCount(); got != 1 {
+		t.Fatalf("WALWriteCount() after checkpoint WAL write: got %d, want 1", got)
+	}
+
+	fDB, err := rec.Create("db/000001.log", "pebble-wal")
+	if err != nil {
+		t.Fatalf("Create db/000001.log: %v", err)
+	}
+	if _, err := fDB.Write([]byte("db wal")); err != nil {
+		t.Fatalf("Write db/000001.log: %v", err)
+	}
+	_ = fDB.Close()
+
+	if got := rec.WALWriteCount(); got != 1 {
+		t.Fatalf("WALWriteCount() after db WAL write with custom_db set: got %d, want 1", got)
+	}
+
+	fMan, err := rec.Create("custom_db/MANIFEST-000001", "")
+	if err != nil {
+		t.Fatalf("Create custom_db/MANIFEST-000001: %v", err)
+	}
+	_ = fMan.Close()
+
+	if err := rec.Remove("custom_db/MANIFEST-000001"); err != nil {
+		t.Fatalf("Remove custom_db/MANIFEST-000001: %v", err)
+	}
+}
+
 func TestWaitForWALWriteSynchronizationAndExclusion(t *testing.T) {
 	mem := vfs.NewMem()
 	rec := vfsrec.New(mem)
@@ -1187,12 +1277,13 @@ func TestWaitForWALWriteSynchronizationAndExclusion(t *testing.T) {
 	// Spawns a goroutine that writes to "db/000002.log" and another goroutine that calls
 	// NotifyDroppedWALWrite(), verifying that a foreground call to WaitForWALWrite(4) blocks
 	// until woken by those broadcasts and returns cleanly once WALWriteCount() == 4.
+	writeDone := make(chan struct{})
 	go func() {
-		time.Sleep(10 * time.Millisecond)
 		_, _ = f2.Write([]byte("more data"))
+		close(writeDone)
 	}()
 	go func() {
-		time.Sleep(20 * time.Millisecond)
+		<-writeDone
 		rec.NotifyDroppedWALWrite()
 	}()
 

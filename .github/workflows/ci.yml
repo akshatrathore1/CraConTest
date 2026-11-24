@@ -19,6 +19,7 @@ jobs:
         uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: "go.mod"
+          # Intentionally tracks the latest patch release for the go.mod minor line.
           check-latest: true
 
       - name: Verify Dependencies
@@ -48,6 +49,7 @@ jobs:
         uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: "go.mod"
+          # Intentionally tracks the latest patch release for the go.mod minor line.
           check-latest: true
 
       - name: Verify Dependencies

@@ -28,6 +28,7 @@ type FS struct {
 	events                   []trace.Event
 	hook                     func(id uint64)
 	waitTimeout              time.Duration
+	primaryDBDir             string
 	inIngestSection          bool
 	ingestGoroutineID        uint64
 	ingestGoroutines         map[uint64]int
@@ -86,6 +87,64 @@ func isDBWALPath(path string) bool {
 // and other non-primary directories).
 func isDBManifestPath(path string) bool {
 	if !isPrimaryDBDir(path) {
+		return false
+	}
+	base := path
+	if slash := strings.LastIndexByte(path, '/'); slash >= 0 {
+		base = path[slash+1:]
+	}
+	return !strings.HasPrefix(base, "marker.") && strings.HasPrefix(base, "MANIFEST-")
+}
+
+// cleanPath normalizes a directory path using forward slashes, stripping leading/trailing
+// slashes and relative "./" prefixes, treating "." and "" as "".
+func cleanPath(dir string) string {
+	dir = strings.ReplaceAll(dir, "\\", "/")
+	dir = strings.Trim(dir, "/")
+	if dir == "" || dir == "." {
+		return ""
+	}
+	for strings.HasPrefix(dir, "./") {
+		dir = strings.Trim(strings.TrimPrefix(dir, "./"), "/")
+	}
+	if dir == "." {
+		return ""
+	}
+	return dir
+}
+
+// SetPrimaryDBDir configures the primary database directory path for the recording FS.
+// It normalizes dir with cleanPath (treating "." as "") under fs.mu.
+func (fs *FS) SetPrimaryDBDir(dir string) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	fs.primaryDBDir = cleanPath(dir)
+}
+
+// isPrimaryDBDirLocked reports whether path is directly inside the configured primaryDBDir
+// (if set, requiring a matching single-level directory prefix with no deeper subdirectories)
+// or falls back to the package-level isPrimaryDBDir allowlist if primaryDBDir is unset.
+// Must be called with fs.mu held.
+func (fs *FS) isPrimaryDBDirLocked(path string) bool {
+	if fs.primaryDBDir != "" {
+		prefix := fs.primaryDBDir + "/"
+		if !strings.HasPrefix(path, prefix) {
+			return false
+		}
+		rest := path[len(prefix):]
+		return rest != "" && strings.IndexByte(rest, '/') < 0
+	}
+	return isPrimaryDBDir(path)
+}
+
+// isDBWALPathLocked reports whether path is a primary-DB WAL segment, called while holding fs.mu.
+func (fs *FS) isDBWALPathLocked(path string) bool {
+	return fs.isPrimaryDBDirLocked(path) && strings.HasSuffix(path, ".log")
+}
+
+// isDBManifestPathLocked reports whether path is a primary-DB MANIFEST file, called while holding fs.mu.
+func (fs *FS) isDBManifestPathLocked(path string) bool {
+	if !fs.isPrimaryDBDirLocked(path) {
 		return false
 	}
 	base := path
@@ -424,7 +483,7 @@ func (fs *FS) Create(name string, category vfs.DiskWriteCategory) (vfs.File, err
 	if err != nil {
 		return nil, err
 	}
-	if isDBManifestPath(canon) {
+	if fs.isDBManifestPathLocked(canon) {
 		fs.dbManifestCount++
 	}
 	innerFile, err := fs.inner.Create(name, category)
@@ -626,7 +685,7 @@ func (fs *FS) Remove(name string) error {
 		}
 	}
 
-	if fs.inIngestSection && !isIngestOp && !isDBManifestPath(canon) && !strings.Contains(canon, "ingest_staging") && !strings.Contains(canon, "ingest_") && !strings.Contains(canon, "marker.manifest") {
+	if fs.inIngestSection && !isIngestOp && !fs.isDBManifestPathLocked(canon) && !strings.Contains(canon, "ingest_staging") && !strings.Contains(canon, "ingest_") && !strings.Contains(canon, "marker.manifest") {
 		if fs.ingestCond == nil {
 			fs.ingestCond = sync.NewCond(&fs.mu)
 		}
@@ -702,10 +761,10 @@ func (fs *FS) Remove(name string) error {
 	}
 
 	err = fs.inner.Remove(name)
-	if err == nil && isDBManifestPath(canon) && fs.dbManifestCount > 0 {
+	if err == nil && fs.isDBManifestPathLocked(canon) && fs.dbManifestCount > 0 {
 		fs.dbManifestCount--
 	}
-	if err == nil && isPrimaryDBDir(canon) && strings.Contains(canon, "marker.manifest.") && fs.dbManifestCount > 2 {
+	if err == nil && fs.isPrimaryDBDirLocked(canon) && strings.Contains(canon, "marker.manifest.") && fs.dbManifestCount > 2 {
 		fs.pendingManifestDeletions++
 	}
 	event := trace.Event{
