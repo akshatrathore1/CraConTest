@@ -1915,3 +1915,63 @@ func TestFaultMUTX6UnwrapNotifier(t *testing.T) {
 		t.Fatalf("expected NotifyDroppedWALWrite called via Unwrap traversal, got %d", notifier.droppedCount)
 	}
 }
+
+func TestFaultMUTX6ZeroWriteAndWriteAtAndMUT7OpenReadWrite(t *testing.T) {
+	t.Run("MUTX6SkipsZeroByteWriteAndDropsKthWriteAt", func(t *testing.T) {
+		mem := vfs.NewMem()
+		fs, err := faults.NewWithConfig(faults.Config{ID: faults.MUTX6, XK: 1}, mem)
+		if err != nil {
+			t.Fatalf("NewWithConfig: %v", err)
+		}
+		f, err := fs.Create("000001.log", "pebble-wal")
+		if err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		if n, err := f.Write([]byte{}); err != nil || n != 0 {
+			t.Fatalf("0-byte Write: (%d, %v)", n, err)
+		}
+		if n, err := f.WriteAt([]byte("abc"), 0); err != nil || n != 3 {
+			t.Fatalf("1st WriteAt (dropped by MUT-X6 k=1): (%d, %v)", n, err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		rf, err := mem.Open("000001.log")
+		if err != nil {
+			t.Fatalf("mem.Open: %v", err)
+		}
+		defer rf.Close()
+		var buf [16]byte
+		n, _ := rf.Read(buf[:])
+		if n != 0 {
+			t.Fatalf("expected 0 bytes on disk after MUT-X6 dropped WriteAt, got %q", buf[:n])
+		}
+	})
+
+	t.Run("MUT7ArmsOnOpenReadWrite", func(t *testing.T) {
+		mem := vfs.NewMem()
+		_ = mem.MkdirAll("db", 0755)
+		fs, err := faults.New(faults.MUT7, mem)
+		if err != nil {
+			t.Fatalf("faults.New: %v", err)
+		}
+		stateFS := fs.(*faults.FS)
+		f, err := fs.OpenReadWrite("db/CURRENT", vfs.WriteCategoryUnspecified)
+		if err != nil {
+			t.Fatalf("OpenReadWrite: %v", err)
+		}
+		_ = f.Close()
+		if !stateFS.PendingDirSyncDrop() {
+			t.Fatal("expected PendingDirSyncDrop=true after OpenReadWrite(db/CURRENT)")
+		}
+		df, err := fs.OpenDir("db")
+		if err != nil {
+			t.Fatalf("OpenDir: %v", err)
+		}
+		_ = df.Sync()
+		_ = df.Close()
+		if !stateFS.DirSyncDropped() {
+			t.Fatal("expected DirSyncDropped=true after Sync on db")
+		}
+	})
+}

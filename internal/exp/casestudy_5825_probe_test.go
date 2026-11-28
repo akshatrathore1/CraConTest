@@ -68,12 +68,12 @@ func run5825ProbeWorkload(t *testing.T, seed uint64, faultID string) (
 
 	rawHist, err := workload.Run(db, rec, wCfg)
 	if err != nil {
-		_ = db.Close()
+		_, _ = safeCloseDB(db)
 		t.Fatalf("seed %d fault %s: run workload: %v", seed, faultID, err)
 	}
 	db.TestOnlyWaitForCleaning()
-	if err := db.Close(); err != nil {
-		t.Fatalf("seed %d fault %s: close pebble: %v", seed, faultID, err)
+	if panicked, closeErr := safeCloseDB(db); panicked || closeErr != nil {
+		t.Fatalf("seed %d fault %s: close pebble (panic=%v): %v", seed, faultID, panicked, closeErr)
 	}
 
 	traceEvents := rec.Events()
@@ -107,6 +107,12 @@ func run5825ProbeWorkload(t *testing.T, seed uint64, faultID string) (
 	if err != nil {
 		t.Fatalf("seed %d fault %s: run explore: %v", seed, faultID, err)
 	}
+	if expRes.Summary.OracleErrors != 0 {
+		t.Fatalf("seed %d fault %s: expected 0 oracle_errors, got %d", seed, faultID, expRes.Summary.OracleErrors)
+	}
+	if err := ValidateTable(universe, NormalizeTable(expRes.Outcomes)); err != nil {
+		t.Fatalf("seed %d fault %s: ValidateTable failed: %v", seed, faultID, err)
+	}
 
 	return universe, traceEvents, expRes.Outcomes, view, correlated
 }
@@ -129,6 +135,11 @@ func TestCaseStudyPebble5825CrashPointProbe(t *testing.T) {
 		t.Run(strconv.FormatUint(seed, 10), func(t *testing.T) {
 			_, traceEvents, outcomes, view, correlated := run5825ProbeWorkload(t, seed, faults.MUT0)
 
+			type siblingKey struct {
+				event   uint64
+				percent int
+			}
+			byCand := make(map[siblingKey]oracle.Outcome, len(outcomes))
 			type failureRecord struct {
 				cand    candidate.Candidate
 				outcome oracle.Outcome
@@ -136,7 +147,11 @@ func TestCaseStudyPebble5825CrashPointProbe(t *testing.T) {
 			var failingCandidates []failureRecord
 
 			for _, o := range outcomes {
+				byCand[siblingKey{event: o.Candidate.Event, percent: o.Candidate.Percent}] = o
 				if o.Class != oracle.ClassValid {
+					if o.Class != oracle.ClassOpenError {
+						t.Fatalf("seed %d: expected failing candidate class open_error, got %s (detail=%q)", seed, o.Class, o.Detail)
+					}
 					if o.Candidate.Percent != 50 {
 						t.Fatalf("seed %d: expected failing candidate to have Percent==50, got %d", seed, o.Candidate.Percent)
 					}
@@ -150,7 +165,16 @@ func TestCaseStudyPebble5825CrashPointProbe(t *testing.T) {
 			if len(failingCandidates) == 0 {
 				t.Fatalf("seed %d: expected failing candidates on MUT-0, got 0", seed)
 			}
-			t.Logf("seed %d: verified %d failing candidates (100%% at 50%% retention)", seed, len(failingCandidates))
+			for _, rec := range failingCandidates {
+				for _, pct := range []int{0, 100} {
+					sib, ok := byCand[siblingKey{event: rec.cand.Event, percent: pct}]
+					if !ok || sib.Class != oracle.ClassValid {
+						t.Fatalf("seed %d event %d pct=%d sibling: ok=%v class=%s, want ClassValid",
+							seed, rec.cand.Event, pct, ok, sib.Class)
+					}
+				}
+			}
+			t.Logf("seed %d: verified %d failing candidates (100%% open_error at 50%% retention, valid 0%%/100%% siblings)", seed, len(failingCandidates))
 
 			for _, rec := range failingCandidates {
 				cand := rec.cand
@@ -202,9 +226,12 @@ func TestCaseStudyPebble5825CrashPointProbe(t *testing.T) {
 					if strings.HasPrefix(e, "marker.manifest.") {
 						parts := strings.Split(e, ".")
 						if len(parts) >= 4 {
-							iter, err := strconv.ParseUint(parts[2], 16, 64)
+							iter, err := strconv.ParseUint(parts[2], 10, 64)
 							if err != nil {
-								iter, err = strconv.ParseUint(parts[2], 10, 64)
+								iter, err = strconv.ParseUint(parts[2], 16, 64)
+							}
+							if err != nil {
+								t.Fatalf("seed %d cand %v: parse marker iter %q: %v", seed, cand, parts[2], err)
 							}
 							if iter >= latestIter {
 								latestIter = iter
@@ -219,8 +246,8 @@ func TestCaseStudyPebble5825CrashPointProbe(t *testing.T) {
 					t.Fatalf("seed %d cand %v: could not find latest marker.manifest in full100", seed, cand)
 				}
 
-				t.Logf("seed %d cand %v detail=%q\n  base0=%v\n  full100=%v\n  crash50=%v\n  latestMarker=%s targetManifest=%s",
-					seed, cand, outcome.Detail, entries0, entries100, entries50, latestMarker, targetManifest)
+				t.Logf("seed %d cand %v class=%s rule=%s detail=%q\n  base0=%v\n  full100=%v\n  crash50=%v\n  latestMarker=%s targetManifest=%s",
+					seed, cand, outcome.Class, outcome.Rule, outcome.Detail, entries0, entries100, entries50, latestMarker, targetManifest)
 
 				// Assert in full100 both exist, neither in base0
 				if !contains(entries100, targetManifest) {
@@ -276,11 +303,26 @@ func TestCaseStudyPebble5825CrashPointProbe(t *testing.T) {
 					t.Fatalf("seed %d cand %v: create freshCrash50 %s: %v", seed, cand, srcPath, err)
 				}
 				if _, err := dstF.Write(data); err != nil {
+					_ = dstF.Close()
 					t.Fatalf("seed %d cand %v: write freshCrash50 %s: %v", seed, cand, srcPath, err)
 				}
-				_ = dstF.Sync()
+				if err := dstF.Sync(); err != nil {
+					_ = dstF.Close()
+					t.Fatalf("seed %d cand %v: sync freshCrash50 %s: %v", seed, cand, srcPath, err)
+				}
 				if err := dstF.Close(); err != nil {
 					t.Fatalf("seed %d cand %v: close freshCrash50 %s: %v", seed, cand, srcPath, err)
+				}
+				dirH, err := freshCrash50.OpenDir("db")
+				if err != nil {
+					t.Fatalf("seed %d cand %v: OpenDir db for surgical sync: %v", seed, cand, err)
+				}
+				if err := dirH.Sync(); err != nil {
+					_ = dirH.Close()
+					t.Fatalf("seed %d cand %v: sync db dir for surgical repair: %v", seed, cand, err)
+				}
+				if err := dirH.Close(); err != nil {
+					t.Fatalf("seed %d cand %v: close db dir: %v", seed, cand, err)
 				}
 
 				openRes := recovery.SafeOpen(freshCrash50, "db", 3*time.Second)
@@ -288,11 +330,14 @@ func TestCaseStudyPebble5825CrashPointProbe(t *testing.T) {
 					t.Fatalf("seed %d cand %v: SafeOpen after repair failed: %v (detail: %s)", seed, cand, openRes.Err, openRes.Panic)
 				}
 				if err := recovery.CheckIntegrity(openRes.DB); err != nil {
-					_ = openRes.DB.Close()
+					_, _ = safeCloseDB(openRes.DB)
 					t.Fatalf("seed %d cand %v: CheckIntegrity after repair failed: %v", seed, cand, err)
 				}
 				dump, err := recovery.DumpContents(openRes.DB)
-				_ = openRes.DB.Close()
+				panicked, closeErr := safeCloseDB(openRes.DB)
+				if panicked || closeErr != nil {
+					t.Fatalf("seed %d cand %v: close after repair (panic=%v): %v", seed, cand, panicked, closeErr)
+				}
 				if err != nil {
 					t.Fatalf("seed %d cand %v: DumpContents after repair failed: %v", seed, cand, err)
 				}
@@ -311,15 +356,18 @@ func TestCaseStudyPebble5825CrashPointProbe(t *testing.T) {
 				}
 			}
 
-			// Assert that running the same seed with BARRIER-5825 produces 0 failures
+			// Assert that running the same seed with BARRIER-5825 produces non-empty valid outcomes (0 failures)
 			_, _, barrierOutcomes, _, _ := run5825ProbeWorkload(t, seed, faults.Barrier5825)
+			if len(barrierOutcomes) == 0 {
+				t.Fatalf("seed %d BARRIER-5825: expected non-empty outcomes", seed)
+			}
 			for _, bo := range barrierOutcomes {
 				if bo.Class != oracle.ClassValid {
 					t.Fatalf("seed %d BARRIER-5825: expected 0 failures, got outcome %v (class: %s, detail: %s)",
 						seed, bo.Candidate, bo.Class, bo.Detail)
 				}
 			}
-			t.Logf("seed %d: verified BARRIER-5825 produces 0 failures across full universe (PASS)", seed)
+			t.Logf("seed %d: verified BARRIER-5825 produces 0 failures across %d candidates (PASS)", seed, len(barrierOutcomes))
 		})
 	}
 }

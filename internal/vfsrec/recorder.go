@@ -3,11 +3,11 @@
 package vfsrec
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"runtime"
 	"strconv"
 	"strings"
@@ -24,12 +24,14 @@ type FS struct {
 	mu                       sync.Mutex
 	inner                    vfs.FS
 	nextHandle               uint64
-	nextEvent                uint64
 	events                   []trace.Event
+	pinnedLen                int
 	hook                     func(id uint64)
 	waitTimeout              time.Duration
 	primaryDBDir             string
+	primaryDBDirSet          bool
 	inIngestSection          bool
+	ingestDepth              int
 	ingestGoroutineID        uint64
 	ingestGoroutines         map[uint64]int
 	ingestCond               *sync.Cond
@@ -38,6 +40,7 @@ type FS struct {
 	dbManifestCount          int
 	pendingManifestDeletions int
 	manifestCond             *sync.Cond
+	listenerCreated          bool
 }
 
 // Compile-time interface checks.
@@ -58,22 +61,59 @@ func New(inner vfs.FS) *FS {
 	fs.ingestCond = sync.NewCond(&fs.mu)
 	fs.walCond = sync.NewCond(&fs.mu)
 	fs.manifestCond = sync.NewCond(&fs.mu)
+	fs.mu.Lock()
+	fs.recountDBManifestsLocked()
+	fs.mu.Unlock()
 	return fs
+}
+
+func baseName(p string) string {
+	if slash := strings.LastIndexByte(p, '/'); slash >= 0 {
+		return p[slash+1:]
+	}
+	return p
+}
+
+func dirOf(p string) string {
+	if slash := strings.LastIndexByte(p, '/'); slash >= 0 {
+		return p[:slash]
+	}
+	return ""
+}
+
+func isInPrimaryDBDir(p, primaryDBDir string, primaryDBDirSet bool) bool {
+	if primaryDBDirSet {
+		if primaryDBDir == "" {
+			return p != "" && strings.IndexByte(p, '/') < 0
+		}
+		prefix := primaryDBDir + "/"
+		if !strings.HasPrefix(p, prefix) {
+			return false
+		}
+		rest := p[len(prefix):]
+		return rest != "" && strings.IndexByte(rest, '/') < 0
+	}
+	slash := strings.IndexByte(p, '/')
+	if slash < 0 {
+		return p != ""
+	}
+	if strings.IndexByte(p[slash+1:], '/') >= 0 {
+		return false
+	}
+	dir := p[:slash]
+	return dir == "db" || strings.HasPrefix(dir, "db_") || dir == "testdb"
+}
+
+func isManifestFileName(p string) bool {
+	base := baseName(p)
+	return !strings.HasPrefix(base, "marker.") && strings.HasPrefix(base, "MANIFEST-")
 }
 
 // isPrimaryDBDir reports whether path resides in the root directory ("") or a
 // primary database directory ("db", "db_*", or "testdb"), excluding secondary
 // or staging directories such as "checkpoint/", "ingest_staging/", or unrelated folders.
 func isPrimaryDBDir(path string) bool {
-	slash := strings.IndexByte(path, '/')
-	if slash < 0 {
-		return path != ""
-	}
-	if strings.IndexByte(path[slash+1:], '/') >= 0 {
-		return false
-	}
-	dir := path[:slash]
-	return dir == "db" || strings.HasPrefix(dir, "db_") || dir == "testdb"
+	return isInPrimaryDBDir(path, "", false)
 }
 
 // isDBWALPath reports whether path is a primary-DB WAL segment ("*.log" in the
@@ -86,55 +126,100 @@ func isDBWALPath(path string) bool {
 // in the root or primary DB directory, excluding "checkpoint/", atomic "marker." files,
 // and other non-primary directories).
 func isDBManifestPath(path string) bool {
-	if !isPrimaryDBDir(path) {
-		return false
-	}
-	base := path
-	if slash := strings.LastIndexByte(path, '/'); slash >= 0 {
-		base = path[slash+1:]
-	}
-	return !strings.HasPrefix(base, "marker.") && strings.HasPrefix(base, "MANIFEST-")
+	return isPrimaryDBDir(path) && isManifestFileName(path)
 }
 
-// cleanPath normalizes a directory path using forward slashes, stripping leading/trailing
-// slashes and relative "./" prefixes, treating "." and "" as "".
+// cleanPath normalizes a directory path using forward slashes, collapsing
+// redundant separators and relative "./" segments, treating "." and "" as "".
 func cleanPath(dir string) string {
 	dir = strings.ReplaceAll(dir, "\\", "/")
-	dir = strings.Trim(dir, "/")
-	if dir == "" || dir == "." {
+	dir = strings.TrimSpace(dir)
+	if dir == "" {
 		return ""
 	}
-	for strings.HasPrefix(dir, "./") {
-		dir = strings.Trim(strings.TrimPrefix(dir, "./"), "/")
-	}
-	if dir == "." {
+	cleaned := path.Clean(dir)
+	cleaned = strings.Trim(cleaned, "/")
+	if cleaned == "" || cleaned == "." {
 		return ""
 	}
-	return dir
+	return cleaned
+}
+
+func (fs *FS) listDirLocked(dir string) ([]string, error) {
+	if dir != "" {
+		return fs.inner.List(dir)
+	}
+	entries, err := fs.inner.List("")
+	if err == nil {
+		return entries, nil
+	}
+	return fs.inner.List(".")
+}
+
+func (fs *FS) countManifestsInDirLocked(dir string) int {
+	if fs.inner == nil {
+		return 0
+	}
+	// Calling fs.inner.List under fs.mu is safe because fs.inner is the underlying VFS and never calls back into fs.
+	entries, err := fs.listDirLocked(dir)
+	if err != nil {
+		return 0
+	}
+	count := 0
+	for _, entry := range entries {
+		p := entry
+		if dir != "" {
+			p = dir + "/" + entry
+		}
+		if fs.isDBManifestPathLocked(p) {
+			count++
+		}
+	}
+	return count
+}
+
+func (fs *FS) recountDBManifestsLocked() {
+	if fs.inner == nil {
+		fs.dbManifestCount = 0
+		return
+	}
+	if fs.primaryDBDirSet {
+		fs.dbManifestCount = fs.countManifestsInDirLocked(fs.primaryDBDir)
+		return
+	}
+	count := fs.countManifestsInDirLocked("")
+	if entries, err := fs.listDirLocked(""); err == nil {
+		for _, entry := range entries {
+			if entry == "db" || strings.HasPrefix(entry, "db_") || entry == "testdb" {
+				count += fs.countManifestsInDirLocked(entry)
+			}
+		}
+	}
+	fs.dbManifestCount = count
 }
 
 // SetPrimaryDBDir configures the primary database directory path for the recording FS.
-// It normalizes dir with cleanPath (treating "." as "") under fs.mu.
+// It normalizes dir with cleanPath (treating "." and "/" as explicit root-only and "" as reset
+// to the default primary directory allowlist) and recounts live manifests under fs.mu.
 func (fs *FS) SetPrimaryDBDir(dir string) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
-	fs.primaryDBDir = cleanPath(dir)
+	if strings.TrimSpace(dir) == "" {
+		fs.primaryDBDir = ""
+		fs.primaryDBDirSet = false
+	} else {
+		fs.primaryDBDir = cleanPath(dir)
+		fs.primaryDBDirSet = true
+	}
+	fs.recountDBManifestsLocked()
 }
 
 // isPrimaryDBDirLocked reports whether path is directly inside the configured primaryDBDir
-// (if set, requiring a matching single-level directory prefix with no deeper subdirectories)
-// or falls back to the package-level isPrimaryDBDir allowlist if primaryDBDir is unset.
+// (or root directory only when SetPrimaryDBDir(".") was configured), falling back to the
+// package-level isPrimaryDBDir allowlist if primaryDBDir has not been configured.
 // Must be called with fs.mu held.
-func (fs *FS) isPrimaryDBDirLocked(path string) bool {
-	if fs.primaryDBDir != "" {
-		prefix := fs.primaryDBDir + "/"
-		if !strings.HasPrefix(path, prefix) {
-			return false
-		}
-		rest := path[len(prefix):]
-		return rest != "" && strings.IndexByte(rest, '/') < 0
-	}
-	return isPrimaryDBDir(path)
+func (fs *FS) isPrimaryDBDirLocked(p string) bool {
+	return isInPrimaryDBDir(p, fs.primaryDBDir, fs.primaryDBDirSet)
 }
 
 // isDBWALPathLocked reports whether path is a primary-DB WAL segment, called while holding fs.mu.
@@ -144,14 +229,7 @@ func (fs *FS) isDBWALPathLocked(path string) bool {
 
 // isDBManifestPathLocked reports whether path is a primary-DB MANIFEST file, called while holding fs.mu.
 func (fs *FS) isDBManifestPathLocked(path string) bool {
-	if !fs.isPrimaryDBDirLocked(path) {
-		return false
-	}
-	base := path
-	if slash := strings.LastIndexByte(path, '/'); slash >= 0 {
-		base = path[slash+1:]
-	}
-	return !strings.HasPrefix(base, "marker.") && strings.HasPrefix(base, "MANIFEST-")
+	return fs.isPrimaryDBDirLocked(path) && isManifestFileName(path)
 }
 
 // WALWriteCount returns the number of recorded primary-DB WAL write/drop events.
@@ -171,11 +249,11 @@ func (fs *FS) NeedWALWriteBarrier() bool { return false }
 // when a fault injector drops a primary-DB WAL write before it reaches vfsrec.FS.
 func (fs *FS) NotifyDroppedWALWrite() {
 	fs.mu.Lock()
+	defer fs.mu.Unlock()
 	fs.walWrites++
 	if fs.walCond != nil {
 		fs.walCond.Broadcast()
 	}
-	fs.mu.Unlock()
 }
 
 func defaultWaitTimeout() time.Duration {
@@ -187,22 +265,13 @@ func defaultWaitTimeout() time.Duration {
 	return 30 * time.Second
 }
 
-// WaitForWALWrite blocks until WALWriteCount() >= target, panicking if a safety
-// deadline expires before the expected WAL write is recorded.
-func (fs *FS) WaitForWALWrite(target uint64) {
-	fs.mu.Lock()
-	if fs.walWrites >= target {
-		fs.mu.Unlock()
-		return
-	}
-	if fs.walCond == nil {
-		fs.walCond = sync.NewCond(&fs.mu)
-	}
-	timeout := fs.waitTimeout
+// waitCondWithTimeoutLocked waits on cond until ready() returns true or the configured
+// safety deadline expires. Must be called with fs.mu held; returns with fs.mu held.
+func (fs *FS) waitCondWithTimeoutLocked(cond *sync.Cond, ready func() bool) (timedOut bool, timeout time.Duration) {
+	timeout = fs.waitTimeout
 	if timeout <= 0 {
 		timeout = defaultWaitTimeout()
 	}
-	var timedOut bool
 	done := make(chan struct{})
 	go func() {
 		timer := time.NewTimer(timeout)
@@ -211,21 +280,37 @@ func (fs *FS) WaitForWALWrite(target uint64) {
 		case <-timer.C:
 			fs.mu.Lock()
 			timedOut = true
-			fs.walCond.Broadcast()
+			cond.Broadcast()
 			fs.mu.Unlock()
 		case <-done:
 		}
 	}()
-	for fs.walWrites < target {
+	defer close(done)
+	for !ready() {
 		if timedOut {
-			close(done)
-			fs.mu.Unlock()
-			panic(fmt.Sprintf("vfsrec: WaitForWALWrite exceeded %v deadline", timeout))
+			return true, timeout
 		}
-		fs.walCond.Wait()
+		cond.Wait()
 	}
-	close(done)
-	fs.mu.Unlock()
+	return false, timeout
+}
+
+// WaitForWALWrite blocks until WALWriteCount() >= target, panicking if a safety
+// deadline expires before the expected WAL write is recorded.
+func (fs *FS) WaitForWALWrite(target uint64) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	if fs.walWrites >= target {
+		return
+	}
+	if fs.walCond == nil {
+		fs.walCond = sync.NewCond(&fs.mu)
+	}
+	if timedOut, timeout := fs.waitCondWithTimeoutLocked(fs.walCond, func() bool {
+		return fs.walWrites >= target
+	}); timedOut {
+		panic(fmt.Sprintf("vfsrec: WaitForWALWrite exceeded %v deadline", timeout))
+	}
 }
 
 // Begin records an OpBegin marker event for a client operation.
@@ -242,6 +327,7 @@ func (fs *FS) BeginEvent(op uint64, kind string) uint64 {
 		Op:     op,
 		OpKind: kind,
 	})
+	fs.pinnedLen = len(fs.events)
 	return fs.events[len(fs.events)-1].ID
 }
 
@@ -260,6 +346,7 @@ func (fs *FS) EndEvent(op uint64, kind string, err string) uint64 {
 		OpKind: kind,
 		Err:    err,
 	})
+	fs.pinnedLen = len(fs.events)
 	return fs.events[len(fs.events)-1].ID
 }
 
@@ -270,6 +357,7 @@ func (fs *FS) CurrentEventID() uint64 {
 	if len(fs.events) == 0 {
 		return 0
 	}
+	fs.pinnedLen = len(fs.events)
 	return fs.events[len(fs.events)-1].ID
 }
 
@@ -296,42 +384,52 @@ func (fs *FS) appendEventLocked(event trace.Event) {
 	}
 }
 
+func (fs *FS) insertEventAtLocked(event trace.Event, insertIdx int) {
+	fs.events = append(fs.events, trace.Event{})
+	copy(fs.events[insertIdx+1:], fs.events[insertIdx:len(fs.events)-1])
+	event.ID = uint64(insertIdx + 1)
+	fs.events[insertIdx] = event
+	for j := insertIdx + 1; j < len(fs.events); j++ {
+		fs.events[j].ID = uint64(j + 1)
+	}
+	if fs.hook != nil {
+		for j := insertIdx; j < len(fs.events); j++ {
+			fs.hook(fs.events[j].ID)
+		}
+	}
+}
+
 // syncReorderScanWindow bounds the backward scan over trailing non-mutating
 // events when placing a file Sync/SyncData/SyncTo adjacent to its preceding
 // Write/WriteAt on the same handle.
 const syncReorderScanWindow = 8
 
 // appendSyncEventLocked repositions a Sync/SyncData/SyncTo barrier event adjacent
-// to its preceding Write/WriteAt on the same handle when only non-mutating events
-// (such as Read, Stat, Close on unrelated handles, or EngineEvent markers) intervene.
+// to its preceding Write/WriteAt on the same handle when only unrelated Close
+// or EngineEvent records intervene.
 //
 // Boundary Invariants:
-//  1. Causal & Mutation Barrier: Reordering stops immediately (breaks scan) upon
-//     encountering any mutating event (e.IsMutation() is true, excluding EngineEvent).
-//     A sync barrier is never moved before another handle's mutating operation.
-//  2. Same-Handle Boundary: Reordering stops immediately if another event on the
-//     same handle is encountered (e.Handle == event.Handle). A sync is never moved
-//     across earlier operations on the same file.
-//  3. Concurrency & Transaction Boundary: Reordering stops immediately upon encountering
-//     KindLock, KindUnlock, KindOpBegin, or KindOpEnd. Syncs are never reordered across
-//     synchronization or client-visible transaction boundaries.
-//  4. Bounded Scan Window: The backward scan checks at most syncReorderScanWindow (8)
+//  1. Intervening Filter: Only KindEngineEvent and KindClose on unrelated handles
+//     (e.Handle != event.Handle) may be crossed. Any other event (Open, OpenDir,
+//     Read, Write, WriteAt, Preallocate, Sync, SyncData, SyncTo, Lock, Unlock,
+//     OpBegin, OpEnd, or namespace operations) halts the scan immediately.
+//  2. Same-Handle & Observed-ID Boundary: Reordering stops at any event on the
+//     same handle and never crosses fs.pinnedLen (events whose IDs were already
+//     returned by CurrentEventID/BeginEvent/EndEvent).
+//  3. Bounded Scan Window: The backward scan checks at most syncReorderScanWindow (8)
 //     events. If the preceding Write/WriteAt is farther back, the event is appended
 //     to the trace tail without reordering.
-//  5. Sequential ID Invariant: If inserted, trailing events are shifted and all IDs
+//  4. Sequential ID Invariant: If inserted, trailing events are shifted and all IDs
 //     from insertIdx onwards are re-indexed to strictly preserve the 1-based contiguous
 //     trace invariant: events[k].ID == k+1 for all k in [0, len(fs.events)).
-//     If a hook is registered, it is called with the final assigned event ID.
+//     If a hook is registered, it is notified for the inserted event and all
+//     re-indexed trailing events.
 func (fs *FS) appendSyncEventLocked(event trace.Event) {
 	insertIdx := -1
 	n := len(fs.events)
-	for i := n - 1; i >= 0 && (n-1-i) < syncReorderScanWindow; i-- {
+	for i := n - 1; i >= fs.pinnedLen && (n-1-i) < syncReorderScanWindow; i-- {
 		e := fs.events[i]
-		if e.Handle == event.Handle || e.Kind == trace.KindLock || e.Kind == trace.KindUnlock || e.Kind == trace.KindOpBegin || e.Kind == trace.KindOpEnd {
-			break
-		}
-		isNonMutating := !e.IsMutation() || e.Kind == trace.KindEngineEvent
-		if !isNonMutating {
+		if e.Kind != trace.KindEngineEvent && !(e.Kind == trace.KindClose && e.Handle != event.Handle) {
 			break
 		}
 		if i > 0 {
@@ -347,20 +445,7 @@ func (fs *FS) appendSyncEventLocked(event trace.Event) {
 		fs.appendEventLocked(event)
 		return
 	}
-
-	// Insert event at insertIdx and shift trailing non-mutating events right by 1
-	fs.events = append(fs.events, trace.Event{})
-	copy(fs.events[insertIdx+1:], fs.events[insertIdx:n])
-	event.ID = uint64(insertIdx + 1)
-	fs.events[insertIdx] = event
-	for j := insertIdx + 1; j < len(fs.events); j++ {
-		fs.events[j].ID = uint64(j + 1)
-	}
-	fs.nextEvent = uint64(len(fs.events))
-
-	if fs.hook != nil {
-		fs.hook(event.ID)
-	}
+	fs.insertEventAtLocked(event, insertIdx)
 }
 
 func curGoroutineID() uint64 {
@@ -369,22 +454,7 @@ func curGoroutineID() uint64 {
 	if n == 0 {
 		return 0
 	}
-	b := buf[:n]
-	prefix := []byte("goroutine ")
-	idx := bytes.Index(b, prefix)
-	if idx < 0 {
-		return 0
-	}
-	b = b[idx+len(prefix):]
-	for len(b) > 0 && b[0] == ' ' {
-		b = b[1:]
-	}
-	var id uint64
-	for len(b) > 0 && b[0] >= '0' && b[0] <= '9' {
-		id = id*10 + uint64(b[0]-'0')
-		b = b[1:]
-	}
-	return id
+	return parseGoroutineID(string(buf[:n]))
 }
 
 func parseGoroutineID(s string) uint64 {
@@ -412,34 +482,40 @@ func parseGoroutineID(s string) uint64 {
 // BeginIngestSection marks the start of an ingest section, pausing background flushes.
 func (fs *FS) BeginIngestSection() {
 	fs.mu.Lock()
+	defer fs.mu.Unlock()
 	gid := curGoroutineID()
 	if fs.ingestGoroutines == nil {
 		fs.ingestGoroutines = make(map[uint64]int)
 	}
+	fs.ingestDepth++
 	fs.ingestGoroutines[gid]++
 	fs.inIngestSection = true
 	fs.ingestGoroutineID = gid
-	fs.mu.Unlock()
 }
 
 // EndIngestSection marks the end of an ingest section and unpauses background flushes.
 func (fs *FS) EndIngestSection() {
 	fs.mu.Lock()
+	defer fs.mu.Unlock()
 	gid := curGoroutineID()
+	if fs.ingestDepth > 0 {
+		fs.ingestDepth--
+	}
 	if fs.ingestGoroutines != nil && fs.ingestGoroutines[gid] > 0 {
 		fs.ingestGoroutines[gid]--
 		if fs.ingestGoroutines[gid] == 0 {
 			delete(fs.ingestGoroutines, gid)
 		}
 	}
-	if len(fs.ingestGoroutines) == 0 {
+	if fs.ingestDepth == 0 || len(fs.ingestGoroutines) == 0 {
+		fs.ingestDepth = 0
+		clear(fs.ingestGoroutines)
 		fs.inIngestSection = false
 		fs.ingestGoroutineID = 0
 		if fs.ingestCond != nil {
 			fs.ingestCond.Broadcast()
 		}
 	}
-	fs.mu.Unlock()
 }
 
 // ErrUnrepresentablePath is returned, without calling the wrapped filesystem,
@@ -474,17 +550,25 @@ func canonical(name string) (string, error) {
 	return strings.Join(kept, "/"), nil
 }
 
+func canonicalNonRoot(name string) (string, error) {
+	canon, err := canonical(name)
+	if err != nil {
+		return "", err
+	}
+	if canon == "" {
+		return "", fmt.Errorf("%w: %q", ErrUnrepresentablePath, name)
+	}
+	return canon, nil
+}
+
 // Create creates the named file for reading and writing.
 func (fs *FS) Create(name string, category vfs.DiskWriteCategory) (vfs.File, error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
-	canon, err := canonical(name)
+	canon, err := canonicalNonRoot(name)
 	if err != nil {
 		return nil, err
-	}
-	if fs.isDBManifestPathLocked(canon) {
-		fs.dbManifestCount++
 	}
 	innerFile, err := fs.inner.Create(name, category)
 	event := trace.Event{
@@ -497,17 +581,21 @@ func (fs *FS) Create(name string, category vfs.DiskWriteCategory) (vfs.File, err
 		fs.appendEventLocked(event)
 		return nil, err
 	}
+	if fs.isDBManifestPathLocked(canon) {
+		fs.recountDBManifestsLocked()
+	}
 
 	fs.nextHandle++
 	event.Handle = fs.nextHandle
 	fs.appendEventLocked(event)
 	return &recFile{
-		fs:     fs,
-		inner:  innerFile,
-		handle: fs.nextHandle,
-		label:  canon,
-		isDir:  false,
-		cat:    category,
+		fs:       fs,
+		inner:    innerFile,
+		handle:   fs.nextHandle,
+		label:    canon,
+		isDir:    false,
+		writable: true,
+		cat:      category,
 	}, nil
 }
 
@@ -516,11 +604,11 @@ func (fs *FS) Link(oldname, newname string) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
-	canonOld, err := canonical(oldname)
+	canonOld, err := canonicalNonRoot(oldname)
 	if err != nil {
 		return err
 	}
-	canonNew, err := canonical(newname)
+	canonNew, err := canonicalNonRoot(newname)
 	if err != nil {
 		return err
 	}
@@ -532,6 +620,8 @@ func (fs *FS) Link(oldname, newname string) error {
 	}
 	if err != nil {
 		event.Err = err.Error()
+	} else if fs.isDBManifestPathLocked(canonNew) {
+		fs.recountDBManifestsLocked()
 	}
 	fs.appendEventLocked(event)
 	return err
@@ -542,7 +632,7 @@ func (fs *FS) Open(name string, opts ...vfs.OpenOption) (vfs.File, error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
-	canon, err := canonical(name)
+	canon, err := canonicalNonRoot(name)
 	if err != nil {
 		return nil, err
 	}
@@ -574,7 +664,7 @@ func (fs *FS) OpenReadWrite(name string, category vfs.DiskWriteCategory, opts ..
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
-	canon, err := canonical(name)
+	canon, err := canonicalNonRoot(name)
 	if err != nil {
 		return nil, err
 	}
@@ -597,15 +687,19 @@ func (fs *FS) OpenReadWrite(name string, category vfs.DiskWriteCategory, opts ..
 	event.Handle = fs.nextHandle
 	if wasAbsent {
 		event.Created = true
+		if fs.isDBManifestPathLocked(canon) {
+			fs.recountDBManifestsLocked()
+		}
 	}
 	fs.appendEventLocked(event)
 	return &recFile{
-		fs:     fs,
-		inner:  innerFile,
-		handle: fs.nextHandle,
-		label:  canon,
-		isDir:  false,
-		cat:    category,
+		fs:       fs,
+		inner:    innerFile,
+		handle:   fs.nextHandle,
+		label:    canon,
+		isDir:    false,
+		writable: true,
+		cat:      category,
 	}, nil
 }
 
@@ -647,124 +741,59 @@ func (fs *FS) Remove(name string) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
-	canon, err := canonical(name)
+	canon, err := canonicalNonRoot(name)
 	if err != nil {
 		return err
 	}
 
-	isIngestOp := false
-	if strings.Contains(canon, "ingest_staging") || strings.Contains(canon, "ingest_") {
-		isIngestOp = true
-	} else if fs.inIngestSection {
+	base := baseName(canon)
+	isStagingPath := canon == "ingest_staging" || strings.HasPrefix(canon, "ingest_staging/")
+	isIngestNamed := isStagingPath || strings.HasPrefix(base, "ingest_")
+	isMarkerManifest := strings.HasPrefix(base, "marker.manifest.")
+	isIngestOp := isIngestNamed
+	if !isIngestOp && fs.inIngestSection {
 		gid := curGoroutineID()
 		if (fs.ingestGoroutines != nil && fs.ingestGoroutines[gid] > 0) || (fs.ingestGoroutineID != 0 && gid == fs.ingestGoroutineID) {
 			isIngestOp = true
-		} else {
-			// Defensively walk stack frames to detect ingest callers.
-			var pcs [32]uintptr
-			n := runtime.Callers(2, pcs[:])
-			if n > 0 {
-				frames := runtime.CallersFrames(pcs[:n])
-				for {
-					frame, more := frames.Next()
-					fnLower := strings.ToLower(frame.Function)
-					fileLower := strings.ToLower(frame.File)
-					if strings.Contains(fnLower, "ingest") || strings.Contains(fileLower, "ingest") {
-						isIngestOp = true
-						break
-					}
-					if !more {
-						break
-					}
-				}
-			}
-			// Safe fallback: if stack frames could not be matched, check file path.
-			if !isIngestOp && strings.Contains(strings.ToLower(canon), "ingest") {
-				isIngestOp = true
-			}
 		}
 	}
 
-	if fs.inIngestSection && !isIngestOp && !fs.isDBManifestPathLocked(canon) && !strings.Contains(canon, "ingest_staging") && !strings.Contains(canon, "ingest_") && !strings.Contains(canon, "marker.manifest") {
+	if fs.inIngestSection && !isIngestOp && !fs.isDBManifestPathLocked(canon) && !isMarkerManifest {
 		if fs.ingestCond == nil {
 			fs.ingestCond = sync.NewCond(&fs.mu)
 		}
-		timeout := fs.waitTimeout
-		if timeout <= 0 {
-			timeout = defaultWaitTimeout()
+		if timedOut, timeout := fs.waitCondWithTimeoutLocked(fs.ingestCond, func() bool {
+			return !fs.inIngestSection
+		}); timedOut {
+			timeoutErr := fmt.Errorf("vfsrec: FS.Remove ingestCond wait exceeded %v deadline (ingest section never ended)", timeout)
+			fs.appendEventLocked(trace.Event{
+				Kind: trace.KindRemove,
+				File: canon,
+				Err:  timeoutErr.Error(),
+			})
+			return timeoutErr
 		}
-		var timedOut bool
-		done := make(chan struct{})
-		go func() {
-			timer := time.NewTimer(timeout)
-			defer timer.Stop()
-			select {
-			case <-timer.C:
-				fs.mu.Lock()
-				timedOut = true
-				fs.ingestCond.Broadcast()
-				fs.mu.Unlock()
-			case <-done:
-			}
-		}()
-		for fs.inIngestSection {
-			if timedOut {
-				close(done)
-				timeoutErr := fmt.Errorf("vfsrec: FS.Remove ingestCond wait exceeded %v deadline (ingest section never ended)", timeout)
-				event := trace.Event{
-					Kind: trace.KindRemove,
-					File: canon,
-					Err:  timeoutErr.Error(),
-				}
-				fs.appendEventLocked(event)
-				return timeoutErr
-			}
-			fs.ingestCond.Wait()
-		}
-		close(done)
 	}
 
-	if strings.Contains(canon, "ingest_staging") && fs.pendingManifestDeletions > 0 && fs.manifestCond != nil {
-		timeout := fs.waitTimeout
-		if timeout <= 0 {
-			timeout = defaultWaitTimeout()
+	if isStagingPath && fs.pendingManifestDeletions > 0 && fs.manifestCond != nil {
+		if timedOut, timeout := fs.waitCondWithTimeoutLocked(fs.manifestCond, func() bool {
+			return fs.pendingManifestDeletions <= 0
+		}); timedOut {
+			timeoutErr := fmt.Errorf("vfsrec: FS.Remove manifestCond wait exceeded %v deadline", timeout)
+			fs.appendEventLocked(trace.Event{
+				Kind: trace.KindRemove,
+				File: canon,
+				Err:  timeoutErr.Error(),
+			})
+			return timeoutErr
 		}
-		var timedOut bool
-		done := make(chan struct{})
-		go func() {
-			timer := time.NewTimer(timeout)
-			defer timer.Stop()
-			select {
-			case <-timer.C:
-				fs.mu.Lock()
-				timedOut = true
-				fs.manifestCond.Broadcast()
-				fs.mu.Unlock()
-			case <-done:
-			}
-		}()
-		for fs.pendingManifestDeletions > 0 {
-			if timedOut {
-				close(done)
-				timeoutErr := fmt.Errorf("vfsrec: FS.Remove manifestCond wait exceeded %v deadline", timeout)
-				event := trace.Event{
-					Kind: trace.KindRemove,
-					File: canon,
-					Err:  timeoutErr.Error(),
-				}
-				fs.appendEventLocked(event)
-				return timeoutErr
-			}
-			fs.manifestCond.Wait()
-		}
-		close(done)
 	}
 
 	err = fs.inner.Remove(name)
-	if err == nil && fs.isDBManifestPathLocked(canon) && fs.dbManifestCount > 0 {
-		fs.dbManifestCount--
+	if fs.isDBManifestPathLocked(canon) {
+		fs.recountDBManifestsLocked()
 	}
-	if err == nil && fs.isPrimaryDBDirLocked(canon) && strings.Contains(canon, "marker.manifest.") && fs.dbManifestCount > 2 {
+	if err == nil && fs.listenerCreated && fs.isPrimaryDBDirLocked(canon) && isMarkerManifest && fs.countManifestsInDirLocked(dirOf(canon)) > 2 {
 		fs.pendingManifestDeletions++
 	}
 	event := trace.Event{
@@ -783,7 +812,7 @@ func (fs *FS) RemoveAll(name string) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
-	canon, err := canonical(name)
+	canon, err := canonicalNonRoot(name)
 	if err != nil {
 		return err
 	}
@@ -795,6 +824,7 @@ func (fs *FS) RemoveAll(name string) error {
 	if err != nil {
 		event.Err = err.Error()
 	}
+	fs.recountDBManifestsLocked()
 	fs.appendEventLocked(event)
 	return err
 }
@@ -804,11 +834,11 @@ func (fs *FS) Rename(oldname, newname string) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
-	canonOld, err := canonical(oldname)
+	canonOld, err := canonicalNonRoot(oldname)
 	if err != nil {
 		return err
 	}
-	canonNew, err := canonical(newname)
+	canonNew, err := canonicalNonRoot(newname)
 	if err != nil {
 		return err
 	}
@@ -821,6 +851,7 @@ func (fs *FS) Rename(oldname, newname string) error {
 	if err != nil {
 		event.Err = err.Error()
 	}
+	fs.recountDBManifestsLocked()
 	fs.appendEventLocked(event)
 	return err
 }
@@ -830,11 +861,11 @@ func (fs *FS) ReuseForWrite(oldname, newname string, category vfs.DiskWriteCateg
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
-	canonOld, err := canonical(oldname)
+	canonOld, err := canonicalNonRoot(oldname)
 	if err != nil {
 		return nil, err
 	}
-	canonNew, err := canonical(newname)
+	canonNew, err := canonicalNonRoot(newname)
 	if err != nil {
 		return nil, err
 	}
@@ -845,6 +876,7 @@ func (fs *FS) ReuseForWrite(oldname, newname string, category vfs.DiskWriteCateg
 		File2: canonNew,
 		Cat:   string(category),
 	}
+	fs.recountDBManifestsLocked()
 	if err != nil {
 		event.Err = err.Error()
 		fs.appendEventLocked(event)
@@ -855,12 +887,13 @@ func (fs *FS) ReuseForWrite(oldname, newname string, category vfs.DiskWriteCateg
 	event.Handle = fs.nextHandle
 	fs.appendEventLocked(event)
 	return &recFile{
-		fs:     fs,
-		inner:  innerFile,
-		handle: fs.nextHandle,
-		label:  canonNew,
-		isDir:  false,
-		cat:    category,
+		fs:       fs,
+		inner:    innerFile,
+		handle:   fs.nextHandle,
+		label:    canonNew,
+		isDir:    false,
+		writable: true,
+		cat:      category,
 	}, nil
 }
 
@@ -869,7 +902,7 @@ func (fs *FS) MkdirAll(dir string, perm os.FileMode) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
-	canon, err := canonical(dir)
+	canon, err := canonicalNonRoot(dir)
 	if err != nil {
 		return err
 	}
@@ -891,7 +924,7 @@ func (fs *FS) Lock(name string) (io.Closer, error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
-	canon, err := canonical(name)
+	canon, err := canonicalNonRoot(name)
 	if err != nil {
 		return nil, err
 	}

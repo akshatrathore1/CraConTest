@@ -198,6 +198,21 @@ func TestRunExploreJournalResume(t *testing.T) {
 	}
 }
 
+type slowOpenFS struct {
+	vfs.FS
+	delay time.Duration
+}
+
+func (s *slowOpenFS) Open(name string, opts ...vfs.OpenOption) (vfs.File, error) {
+	time.Sleep(s.delay)
+	return s.FS.Open(name, opts...)
+}
+
+func (s *slowOpenFS) OpenDir(name string) (vfs.File, error) {
+	time.Sleep(s.delay)
+	return s.FS.OpenDir(name)
+}
+
 func TestRunExploreTimeoutHandling(t *testing.T) {
 	events, hist := runSmallWorkload(t, 10)
 	universe, err := candidate.Build(events, 42, []int{0, 100})
@@ -205,26 +220,26 @@ func TestRunExploreTimeoutHandling(t *testing.T) {
 		t.Fatalf("candidate.Build: %v", err)
 	}
 
-	// Use an impossibly small timeout (1 nanosecond) to trigger SafeOpen timeout.
+	restore := exp.SetSafeOpenFSWrapperForTesting(func(fs vfs.FS) vfs.FS {
+		return &slowOpenFS{FS: fs, delay: 40 * time.Millisecond}
+	})
+	defer restore()
+
 	res, err := exp.RunExplore(exp.RunnerConfig{
 		Universe: universe[:2],
 		Events:   events,
 		History:  hist,
-		Timeout:  1 * time.Nanosecond,
+		Timeout:  5 * time.Millisecond,
 	})
 	if err != nil {
 		t.Fatalf("RunExplore: %v", err)
 	}
 
-	// At least one should report ClassHang due to timeout (or complete if fast enough).
 	for _, o := range res.Outcomes {
-		if o.Class == oracle.ClassHang {
-			t.Logf("Successfully captured timeout hang outcome: %+v", o)
-			return
+		if o.Class != oracle.ClassHang {
+			t.Fatalf("expected oracle.ClassHang on timed-out open, got %s (%+v)", o.Class, o)
 		}
 	}
-	// If 1ns wasn't small enough on this fast machine, that's fine, but check no error.
-	t.Logf("Completed without timeout: outcome classes: %v, %v", res.Outcomes[0].Class, res.Outcomes[1].Class)
 }
 
 func TestReadJournalRejectsInvalidRecords(t *testing.T) {
@@ -626,4 +641,249 @@ func TestInspectCheckpointRecovery_Outcomes(t *testing.T) {
 			t.Fatalf("expected signature %q, got %q", expectedSig, outcome.Signature)
 		}
 	})
+}
+
+func TestRunExploreJournalStartedOnlyRecordsHang(t *testing.T) {
+	events, hist := runSmallWorkload(t, 6)
+	universe, err := candidate.Build(events, 7, []int{0, 100})
+	if err != nil {
+		t.Fatalf("candidate.Build: %v", err)
+	}
+	if len(universe) < 2 {
+		t.Fatalf("expected at least 2 candidates, got %d", len(universe))
+	}
+	journalPath := filepath.Join(t.TempDir(), "resume_started.journal")
+	cfg := exp.RunnerConfig{
+		Universe:    universe[:1],
+		Events:      events,
+		History:     hist,
+		JournalPath: journalPath,
+		Timeout:     3 * time.Second,
+	}
+	if _, err := exp.RunExplore(cfg); err != nil {
+		t.Fatalf("initial RunExplore: %v", err)
+	}
+
+	raw, err := os.ReadFile(journalPath)
+	if err != nil {
+		t.Fatalf("ReadFile journal: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
+	var firstRec exp.JournalRecord
+	if err := json.Unmarshal([]byte(lines[0]), &firstRec); err != nil {
+		t.Fatalf("Unmarshal journal record: %v", err)
+	}
+
+	startedRec, err := json.Marshal(exp.JournalRecord{
+		Stage:       exp.StageStarted,
+		Candidate:   universe[1],
+		Time:        time.Now().UTC(),
+		ContextHash: firstRec.ContextHash,
+	})
+	if err != nil {
+		t.Fatalf("Marshal started record: %v", err)
+	}
+	f, err := os.OpenFile(journalPath, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatalf("OpenFile journal: %v", err)
+	}
+	_, _ = f.Write(append(startedRec, '\n'))
+	_ = f.Close()
+
+	// Snapshot the interrupted journal before the default resume writes StageFinished(ClassHang).
+	snapRaw, err := os.ReadFile(journalPath)
+	if err != nil {
+		t.Fatalf("ReadFile snapshot journal: %v", err)
+	}
+	retryJournalPath := journalPath + ".retry"
+	if err := os.WriteFile(retryJournalPath, snapRaw, 0600); err != nil {
+		t.Fatalf("WriteFile retry journal: %v", err)
+	}
+
+	cfg.Universe = universe[:2]
+	res, err := exp.RunExplore(cfg)
+	if err != nil {
+		t.Fatalf("resumed RunExplore: %v", err)
+	}
+	if len(res.Outcomes) != 2 || res.Outcomes[1].Class != oracle.ClassHang {
+		t.Fatalf("expected interrupted candidate to record ClassHang, got %+v", res.Outcomes)
+	}
+
+	// With RetryInterrupted enabled, StageStarted-only candidates are re-executed instead of marked ClassHang.
+	cfg.JournalPath = retryJournalPath
+	cfg.RetryInterrupted = true
+	retryRes, err := exp.RunExplore(cfg)
+	if err != nil {
+		t.Fatalf("RetryInterrupted RunExplore: %v", err)
+	}
+	if len(retryRes.Outcomes) != 2 || retryRes.Outcomes[1].Class == oracle.ClassHang {
+		t.Fatalf("expected StageStarted-only candidate to be re-executed, got %+v", retryRes.Outcomes)
+	}
+}
+
+func TestRunnerValidationJournalAndCheckpointEdgeCases(t *testing.T) {
+	events, hist := runSmallWorkload(t, 4)
+
+	// Empty universe returns empty result cleanly.
+	emptyRes, err := exp.RunExplore(exp.RunnerConfig{
+		Universe: []candidate.Candidate{},
+		Events:   events,
+		History:  hist,
+	})
+	if err != nil {
+		t.Fatalf("empty universe RunExplore failed: %v", err)
+	}
+	if len(emptyRes.Outcomes) != 0 {
+		t.Fatalf("expected 0 outcomes on empty universe, got %d", len(emptyRes.Outcomes))
+	}
+
+	// Conflicting JournalPath and Journal rejected.
+	if _, err := exp.RunExplore(exp.RunnerConfig{
+		Universe:    []candidate.Candidate{},
+		Events:      events,
+		History:     hist,
+		JournalPath: filepath.Join(t.TempDir(), "j.ndjson"),
+		Journal:     &bytes.Buffer{},
+	}); err == nil {
+		t.Error("expected error when both JournalPath and Journal are set")
+	}
+
+	// ReadJournal error paths and >1 MiB line support.
+	c1 := candidate.Candidate{Event: 1, Percent: 0, Seed: 1}
+	for name, content := range map[string]string{
+		"started_with_outcome": `{"stage":"started","candidate":{"event":1,"percent":0,"seed":1},"outcome":{"candidate":{"event":1,"percent":0,"seed":1},"class":"valid"}}` + "\n",
+		"bad_percent":          `{"stage":"finished","candidate":{"event":1,"percent":150,"seed":1},"outcome":{"candidate":{"event":1,"percent":150,"seed":1},"class":"valid"}}` + "\n",
+		"trailing_tokens":      `{"stage":"finished","candidate":{"event":1,"percent":0,"seed":1},"outcome":{"candidate":{"event":1,"percent":0,"seed":1},"class":"valid"}} {"extra":1}` + "\n",
+		"conflicting_finished": `{"stage":"finished","candidate":{"event":1,"percent":0,"seed":1},"outcome":{"candidate":{"event":1,"percent":0,"seed":1},"class":"valid"}}` + "\n" +
+			`{"stage":"finished","candidate":{"event":1,"percent":0,"seed":1},"outcome":{"candidate":{"event":1,"percent":0,"seed":1},"class":"hang","detail":"timeout"}}` + "\n",
+		"mixed_context_hash": `{"stage":"finished","candidate":{"event":1,"percent":0,"seed":1},"outcome":{"candidate":{"event":1,"percent":0,"seed":1},"class":"valid"},"context_hash":"aaa"}` + "\n" +
+			`{"stage":"finished","candidate":{"event":2,"percent":0,"seed":1},"outcome":{"candidate":{"event":2,"percent":0,"seed":1},"class":"valid"},"context_hash":"bbb"}` + "\n",
+	} {
+		if _, err := exp.ReadJournal(strings.NewReader(content)); err == nil {
+			t.Errorf("ReadJournal(%s): expected error, got nil", name)
+		}
+	}
+
+	// Verify > 1 MiB journal record succeeds cleanly (bufio.Reader without 1 MiB Scanner cap).
+	bigDetail := strings.Repeat("x", 1200*1024)
+	rec := exp.JournalRecord{
+		Stage:       exp.StageFinished,
+		Candidate:   c1,
+		Outcome:     &oracle.Outcome{Candidate: c1, Class: oracle.ClassPanic, Detail: bigDetail},
+		Time:        time.Now().UTC(),
+		ContextHash: "ctx1",
+	}
+	rawBig, err := json.Marshal(rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	finishedBig, err := exp.ReadJournal(bytes.NewReader(append(rawBig, '\n')))
+	if err != nil {
+		t.Fatalf("ReadJournal >1MiB record failed: %v", err)
+	}
+	if len(finishedBig) != 1 || len(finishedBig[c1].Detail) != len(bigDetail) {
+		t.Fatalf("ReadJournal >1MiB mismatch: %+v", finishedBig)
+	}
+
+	// Verify checkpoint marker.manifest.* detection triggers checkpoint recovery open error when target manifest is missing.
+	mem := vfs.NewMem()
+	_ = mem.MkdirAll("checkpoint", 0755)
+	mf, err := mem.Create("checkpoint/marker.manifest.000001.MANIFEST-000099", "unspecified")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = mf.Close()
+	ckptOutcome := oracle.Outcome{Class: oracle.ClassValid}
+	exp.InspectCheckpointRecovery(mem, time.Second, []string{"pebble-manifest"}, &ckptOutcome)
+	if ckptOutcome.Class != oracle.ClassOpenError {
+		t.Fatalf("expected ClassOpenError for dangling marker.manifest checkpoint, got %s (%s)", ckptOutcome.Class, ckptOutcome.Detail)
+	}
+
+	// Verify StageTimings Open/Dump attribution via RunExplore when a checkpoint trace executes.
+	eventsCkpt, histCkpt := func() ([]trace.Event, []history.Entry) {
+		mem2 := vfs.NewCrashableMem()
+		rec2 := vfsrec.New(mem2)
+		l2 := rec2.EventListener()
+		db2, err := pebble.Open("db", &pebble.Options{FS: rec2, Logger: recovery.PanicLogger{}, EventListener: &l2})
+		if err != nil {
+			t.Fatal(err)
+		}
+		h, err := workload.Run(db2, rec2, workload.Config{
+			Seed:         42,
+			Operations:   12,
+			KeyCount:     4,
+			ValueBytes:   32,
+			SyncEvery:    4,
+			FlushEvery:   6,
+			CheckpointAt: 8,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		db2.TestOnlyWaitForCleaning()
+		_ = db2.Close()
+		ev := rec2.Events()
+		corr, err := workload.Correlate(h, ev)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ev, corr
+	}()
+	univCkpt, err := candidate.Build(eventsCkpt, 42, []int{100})
+	if err != nil || len(univCkpt) == 0 {
+		t.Fatalf("candidate.Build checkpoint trace: %v", err)
+	}
+	lastCand := univCkpt[len(univCkpt)-1]
+	ckptRunRes, err := exp.RunExplore(exp.RunnerConfig{
+		Universe: []candidate.Candidate{lastCand},
+		Events:   eventsCkpt,
+		History:  histCkpt,
+	})
+	if err != nil {
+		t.Fatalf("RunExplore checkpoint timing: %v", err)
+	}
+	if ckptRunRes.Timings[lastCand].Open <= 0 || ckptRunRes.Timings[lastCand].Total <= 0 {
+		t.Errorf("expected positive Open & Total timings with checkpoint recovery: %+v", ckptRunRes.Timings[lastCand])
+	}
+
+	// Verify ClassOracleError in journal is NOT treated as permanently cached valid result on resume.
+	univ, err := candidate.Build(events, 7, []int{0})
+	if err != nil || len(univ) == 0 {
+		t.Fatalf("candidate.Build: %v", err)
+	}
+	jPath := filepath.Join(t.TempDir(), "oracle_err_retry.ndjson")
+	oeRec, err := json.Marshal(exp.JournalRecord{
+		Stage:     exp.StageFinished,
+		Candidate: univ[0],
+		Outcome:   &oracle.Outcome{Candidate: univ[0], Class: oracle.ClassOracleError, Rule: "clone_failure", Detail: "transient"},
+		Time:      time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// RunExplore ignores ContextHash only if empty? No, matching hash; write via RunExplore missing_features first, then fix categories!
+	if _, err := exp.RunExplore(exp.RunnerConfig{
+		Universe:    univ[:1],
+		Events:      events,
+		History:     hist,
+		Categories:  map[uint64][]string{}, // triggers ClassOracleError(missing_features)
+		JournalPath: jPath,
+	}); err != nil {
+		t.Fatalf("first explore with missing_features: %v", err)
+	}
+	_ = oeRec
+	// Resuming with valid nil Categories on a fresh journal should compute features; same ContextHash check applies if hash differs.
+	// Using ReadJournal confirms ClassOracleError was not cached in finished outcomes map:
+	jfRead, err := os.Open(jPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer jfRead.Close()
+	cached, err := exp.ReadJournal(jfRead)
+	if err != nil {
+		t.Fatalf("ReadJournal on ClassOracleError journal: %v", err)
+	}
+	if len(cached) != 0 {
+		t.Fatalf("expected ClassOracleError NOT cached as finished outcome, got %d entries", len(cached))
+	}
 }

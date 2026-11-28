@@ -19,7 +19,21 @@ func allStrategies(test *testing.T) []strategy.Strategy {
 	if err != nil {
 		test.Fatal(err)
 	}
-	return []strategy.Strategy{strategy.NewRandom(7), strategy.NewRepresentative(), strategy.NewSyncBoundary(), combined}
+	return []strategy.Strategy{
+		strategy.NewRandom(7),
+		strategy.NewFIFO(),
+		strategy.NewLIFO(),
+		strategy.NewStride(),
+		combined,
+		strategy.NewRepresentative(),
+		strategy.NewSyncBoundary(),
+		strategy.NewRiskHorizon(),
+		strategy.NewR1(7),
+		strategy.NewR2(7),
+		strategy.NewDCG(),
+		strategy.NewDCGFlagOnly(7),
+		strategy.NewDCGPartial(),
+	}
 }
 
 // syntheticView builds a view with hand-chosen features. Strategies read
@@ -38,17 +52,35 @@ func referenceView() (*graph.View, []candidate.Candidate) {
 }
 
 func TestNames(test *testing.T) {
-	want := []string{"random", "representative", "sync-boundary", "combined"}
-	for index, item := range allStrategies(test) {
+	want := []string{
+		"random",
+		"fifo",
+		"lifo",
+		"stride",
+		"combined",
+		"representative",
+		"sync-boundary",
+		"rhg",
+		"r1",
+		"r2",
+		"dcg",
+		"dcg-flag-only",
+		"dcg-pr",
+	}
+	strats := allStrategies(test)
+	if len(strats) != len(want) {
+		test.Fatalf("allStrategies count %d != want %d", len(strats), len(want))
+	}
+	for index, item := range strats {
 		if item.Name() != want[index] {
 			test.Fatalf("name %q, want %q", item.Name(), want[index])
 		}
-		built, err := strategy.ByName(want[index], 7, strategy.DefaultWeights())
+		built, err := strategy.ByName(want[index], 7)
 		if err != nil || built.Name() != want[index] {
 			test.Fatalf("ByName(%q) failed: %v", want[index], err)
 		}
 	}
-	// Extended coverage for all supported strategy codes (L-8)
+	// Extended coverage for all supported strategy codes
 	allCodes := []struct {
 		code     string
 		expected string
@@ -60,6 +92,7 @@ func TestNames(test *testing.T) {
 		{"b4", "combined"},
 		{"b5", "representative"},
 		{"b6", "sync-boundary"},
+		{"c1", "sync-boundary"},
 		{"b7", "rhg"},
 		{"b8", "dcg"},
 		{"r1", "r1"},
@@ -69,7 +102,7 @@ func TestNames(test *testing.T) {
 		{"dcg-flag-only", "dcg-flag-only"},
 	}
 	for _, tc := range allCodes {
-		s, err := strategy.ByName(tc.code, 42, strategy.DefaultWeights())
+		s, err := strategy.ByName(tc.code, 42)
 		if err != nil {
 			test.Fatalf("ByName(%q) failed: %v", tc.code, err)
 		}
@@ -77,7 +110,7 @@ func TestNames(test *testing.T) {
 			test.Fatalf("ByName(%q).Name() = %q, want %q", tc.code, s.Name(), tc.expected)
 		}
 	}
-	if _, err := strategy.ByName("future", 0, strategy.DefaultWeights()); err == nil {
+	if _, err := strategy.ByName("future", 0); err == nil {
 		test.Fatal("unknown strategy accepted")
 	}
 }
@@ -202,9 +235,11 @@ func TestPermutationDeterminismImmutability(test *testing.T) {
 func TestEmptyUniverse(test *testing.T) {
 	view := syntheticView(map[uint64]graph.Features{})
 	for _, item := range allStrategies(test) {
-		ranking := item.Rank(view, nil)
-		if err := strategy.ValidatePermutation(nil, ranking); err != nil || len(ranking) != 0 {
-			test.Fatalf("%s on empty universe: %v %v", item.Name(), ranking, err)
+		for _, v := range []*graph.View{view, nil} {
+			ranking := item.Rank(v, nil)
+			if err := strategy.ValidatePermutation(nil, ranking); err != nil || len(ranking) != 0 {
+				test.Fatalf("%s on empty universe (view=%v): %v %v", item.Name(), v != nil, ranking, err)
+			}
 		}
 	}
 }
@@ -212,9 +247,21 @@ func TestEmptyUniverse(test *testing.T) {
 func TestMissingFeaturesRejected(test *testing.T) {
 	view := syntheticView(map[uint64]graph.Features{0: {}})
 	universe := []candidate.Candidate{{Event: 0}, {Event: 5}}
+	dupView := syntheticView(map[uint64]graph.Features{0: {StateKey: "A"}})
+	dupUniverse := []candidate.Candidate{{Event: 0}, {Event: 0}}
+
 	for _, item := range allStrategies(test)[1:] {
+		if got := item.Rank(view, universe); got != nil {
+			test.Fatalf("%s did not return nil on missing features: got %+v", item.Name(), got)
+		}
 		if err := strategy.ValidatePermutation(universe, item.Rank(view, universe)); err == nil {
 			test.Fatalf("%s ranked a candidate without features", item.Name())
+		}
+		if got := item.Rank(nil, universe); got != nil {
+			test.Fatalf("%s did not return nil on nil view with non-empty universe: got %+v", item.Name(), got)
+		}
+		if err := strategy.ValidatePermutation(dupUniverse, item.Rank(dupView, dupUniverse)); err == nil {
+			test.Fatalf("%s accepted duplicate universe", item.Name())
 		}
 	}
 }
@@ -421,12 +468,41 @@ func TestB3StrideInterleavedOrder(t *testing.T) {
 		}
 	}
 
-	// Test explicit stride parameter
-	stratCustom := strategy.NewStride(3)
-	view, universe := randomInstance(42, 10)
-	rankedCustom := stratCustom.Rank(view, universe)
-	if err := strategy.ValidatePermutation(universe, rankedCustom); err != nil {
-		t.Fatalf("B3 custom stride ValidatePermutation failed: %v", err)
+	// Exact strided index order verification on 10 single-policy candidates (0..9).
+	cuts10 := make(map[uint64]graph.Features, 10)
+	univ10 := make([]candidate.Candidate, 0, 10)
+	for ev := uint64(0); ev < 10; ev++ {
+		cuts10[ev] = graph.Features{}
+		univ10 = append(univ10, candidate.Candidate{Event: 9 - ev}) // unsorted input
+	}
+	view10 := syntheticView(cuts10)
+
+	// Default stride: ceil(sqrt(10)) = 4 -> [0, 4, 8, 1, 5, 9, 2, 6, 3, 7]
+	rankedDef := strat.Rank(view10, univ10)
+	gotDef := make([]uint64, len(rankedDef))
+	for i, c := range rankedDef {
+		gotDef[i] = c.Event
+	}
+	wantDef := []uint64{0, 4, 8, 1, 5, 9, 2, 6, 3, 7}
+	if !reflect.DeepEqual(gotDef, wantDef) {
+		t.Fatalf("default stride order = %v, want %v", gotDef, wantDef)
+	}
+
+	// Explicit stride 3 -> [0, 3, 6, 9, 1, 4, 7, 2, 5, 8]
+	rankedCustom := strategy.NewStride(3).Rank(view10, univ10)
+	gotCustom := make([]uint64, len(rankedCustom))
+	for i, c := range rankedCustom {
+		gotCustom[i] = c.Event
+	}
+	wantCustom := []uint64{0, 3, 6, 9, 1, 4, 7, 2, 5, 8}
+	if !reflect.DeepEqual(gotCustom, wantCustom) {
+		t.Fatalf("stride(3) order = %v, want %v", gotCustom, wantCustom)
+	}
+
+	// Oversized stride must clamp to n without spinning.
+	rankedHuge := strategy.NewStride(math.MaxInt).Rank(view10, univ10[:5])
+	if err := strategy.ValidatePermutation(univ10[:5], rankedHuge); err != nil {
+		t.Fatalf("huge stride ValidatePermutation failed: %v", err)
 	}
 }
 
@@ -452,14 +528,27 @@ func TestByNameAllBaselinesAndAliases(t *testing.T) {
 		"b6":                    "sync-boundary",
 		"sync-boundary":         "sync-boundary",
 		"sync_boundary":         "sync-boundary",
+		"c1":                    "sync-boundary",
 		"b7":                    "rhg",
 		"rhg":                   "rhg",
 		"risk_horizon":          "rhg",
 		"risk-horizon":          "rhg",
+		"b8":                    "dcg",
+		"dcg":                   "dcg",
+		"durability_contract":   "dcg",
+		"durability-contract":   "dcg",
+		"dcg-flag-only":         "dcg-flag-only",
+		"dcg_flag_only":         "dcg-flag-only",
+		"dcg-flagonly":          "dcg-flag-only",
+		"dcg-pr":                "dcg-pr",
+		"dcg_partial":           "dcg-pr",
+		"dcg-partial":           "dcg-pr",
+		"r1":                    "r1",
+		"r2":                    "r2",
 	}
 
 	for alias, expectedName := range testCases {
-		strat, err := strategy.ByName(alias, 42, strategy.DefaultWeights())
+		strat, err := strategy.ByName(alias, 42)
 		if err != nil {
 			t.Fatalf("ByName(%q) returned error: %v", alias, err)
 		}
@@ -633,7 +722,7 @@ func TestR2SelectsBoundaryRepresentatives(t *testing.T) {
 func TestR1AndR2ByNameAliases(t *testing.T) {
 	r1Aliases := []string{"r1", "r1-random", "r1_random", "r1_zero_retention_first", "r0_retention_first_random"}
 	for _, alias := range r1Aliases {
-		strat, err := strategy.ByName(alias, 7, strategy.DefaultWeights())
+		strat, err := strategy.ByName(alias, 7)
 		if err != nil {
 			t.Fatalf("ByName(%q) returned error: %v", alias, err)
 		}
@@ -644,7 +733,7 @@ func TestR1AndR2ByNameAliases(t *testing.T) {
 
 	r2Aliases := []string{"r2", "r2-representative", "r2_representative", "r2_state_representative", "state_representative_r1"}
 	for _, alias := range r2Aliases {
-		strat, err := strategy.ByName(alias, 7, strategy.DefaultWeights())
+		strat, err := strategy.ByName(alias, 7)
 		if err != nil {
 			t.Fatalf("ByName(%q) returned error: %v", alias, err)
 		}
@@ -674,7 +763,7 @@ func TestR1AndR2MissingFeatures(t *testing.T) {
 func TestDCGByNameAliases(t *testing.T) {
 	aliases := []string{"dcg", "b8", "durability_contract", "durability-contract"}
 	for _, alias := range aliases {
-		strat, err := strategy.ByName(alias, 0, strategy.DefaultWeights())
+		strat, err := strategy.ByName(alias, 0)
 		if err != nil {
 			t.Fatalf("ByName(%q) returned error: %v", alias, err)
 		}
@@ -792,7 +881,7 @@ func TestDCGMissingFeatures(t *testing.T) {
 func TestDCGFlagOnlyByNameAliases(t *testing.T) {
 	aliases := []string{"dcg-flag-only", "dcg_flag_only", "dcg-flagonly"}
 	for _, alias := range aliases {
-		strat, err := strategy.ByName(alias, 42, strategy.DefaultWeights())
+		strat, err := strategy.ByName(alias, 42)
 		if err != nil {
 			t.Fatalf("ByName(%q) returned error: %v", alias, err)
 		}
@@ -957,11 +1046,9 @@ func TestDCGFlagOnlyPermutationBijectivityAndDeterminism(t *testing.T) {
 		t.Fatal("Rank should return nil on missing features")
 	}
 
-	// Nil view should return canonical universe
-	canon := append([]candidate.Candidate(nil), universe...)
-	candidate.Sort(canon)
-	if got := strat.Rank(nil, universe); !reflect.DeepEqual(got, canon) {
-		t.Fatal("Rank on nil view should return canonical universe")
+	// Nil view with non-empty universe must return nil (missing-features contract)
+	if got := strat.Rank(nil, universe); got != nil {
+		t.Fatalf("Rank on nil view with non-empty universe should return nil, got %+v", got)
 	}
 
 	// Empty universe should return empty slice
@@ -1069,7 +1156,7 @@ func TestDCGTier3OrderingViolatingBeforeClean(t *testing.T) {
 }
 
 func TestDCGPartialByNameAndRanking(t *testing.T) {
-	stratObj, err := strategy.ByName("dcg-pr", 0, strategy.DefaultWeights())
+	stratObj, err := strategy.ByName("dcg-pr", 0)
 	if err != nil {
 		t.Fatalf("ByName(\"dcg-pr\") failed: %v", err)
 	}
@@ -1147,5 +1234,284 @@ func TestDCGPartialByNameAndRanking(t *testing.T) {
 	if rankingTier[1].Percent != 50 {
 		t.Fatalf("expected intermediate rep (Percent 50) before 0%% non-rep at index 1, got %+v (full: %+v)",
 			rankingTier[1], rankingTier)
+	}
+}
+
+func TestStrategyByNameZeroWeightsPartialSanitizeAndSingleCandidate(t *testing.T) {
+	strat, err := strategy.ByName("combined", 1, strategy.Weights{})
+	if err != nil {
+		t.Fatalf("ByName(combined, zero weights) failed: %v", err)
+	}
+	// Verify zero weights truly execute all-zero ablation (preserving canonical order),
+	// whereas ByName("combined", 1) uses DefaultWeights {1,1,1,1} (ranking Event 2 first).
+	view := syntheticView(map[uint64]graph.Features{
+		1: {Desc: 0, Semantic: 0, StateKey: "A"},
+		2: {Desc: 10, Semantic: 1, StateKey: "B"},
+	})
+	univ := []candidate.Candidate{{Event: 1}, {Event: 2}}
+	order := strat.Rank(view, univ)
+	if err := strategy.ValidatePermutation(univ, order); err != nil {
+		t.Fatalf("ValidatePermutation failed: %v", err)
+	}
+	if order[0].Event != 1 {
+		t.Fatalf("ByName(combined, Weights{}) did not apply zero ablation: got Event %d first, want 1", order[0].Event)
+	}
+	defStrat, err := strategy.ByName("combined", 1)
+	if err != nil {
+		t.Fatalf("ByName(combined) failed: %v", err)
+	}
+	if defOrder := defStrat.Rank(view, univ); defOrder[0].Event != 2 {
+		t.Fatalf("ByName(combined) did not use DefaultWeights: got Event %d first, want 2", defOrder[0].Event)
+	}
+
+	partial := strategy.NewDCGPartial(strategy.DCGWeights{WALWeight: -5, ManifestWeight: math.NaN(), RenameWeight: -1})
+	partialOrder := partial.Rank(view, univ)
+	if err := strategy.ValidatePermutation(univ, partialOrder); err != nil {
+		t.Fatalf("NewDCGPartial sanitized ranking invalid: %v", err)
+	}
+
+	single := []candidate.Candidate{{Event: 1}}
+	singleOrder := strat.Rank(view, single)
+	if err := strategy.ValidatePermutation(single, singleOrder); err != nil {
+		t.Fatalf("single-candidate Rank failed: %v", err)
+	}
+}
+
+func TestByNameWeightValidationAndFidelity(t *testing.T) {
+	// Custom valid weights for dcg and dcg-pr (Delta == 0).
+	for _, name := range []string{"dcg", "dcg-pr"} {
+		s, err := strategy.ByName(name, 0, strategy.Weights{Alpha: 10, Beta: 20, Gamma: 30})
+		if err != nil {
+			t.Fatalf("ByName(%q, custom weights) failed: %v", name, err)
+		}
+		if s.Name() != name {
+			t.Fatalf("ByName(%q).Name() = %q", name, s.Name())
+		}
+		// Non-zero Delta must fail instead of being silently dropped.
+		if _, err := strategy.ByName(name, 0, strategy.DefaultWeights()); err == nil {
+			t.Fatalf("ByName(%q, DefaultWeights with Delta=1) should fail", name)
+		}
+	}
+
+	// Negative / NaN / Inf weights must return explicit errors across all weighted strategies.
+	badWeights := []strategy.Weights{
+		{Alpha: -1},
+		{Beta: math.NaN()},
+		{Gamma: math.Inf(1)},
+		{Delta: -0.5},
+	}
+	for _, name := range []string{"combined", "rhg", "dcg", "dcg-pr"} {
+		for _, bw := range badWeights {
+			if _, err := strategy.ByName(name, 0, bw); err == nil {
+				t.Fatalf("ByName(%q, %+v) should fail", name, bw)
+			}
+		}
+	}
+
+	// Deterministic error messages on multiple invalid weights.
+	_, err1 := strategy.NewCombined(strategy.Weights{Alpha: -1, Delta: math.NaN()})
+	_, err2 := strategy.NewCombined(strategy.Weights{Alpha: -1, Delta: math.NaN()})
+	if err1 == nil || err2 == nil || err1.Error() != err2.Error() {
+		t.Fatalf("non-deterministic combined weight validation error: %v vs %v", err1, err2)
+	}
+
+	// Passing more than one Weights override must fail.
+	if _, err := strategy.ByName("combined", 0, strategy.DefaultWeights(), strategy.DefaultWeights()); err == nil {
+		t.Fatal("ByName with 2 Weights arguments should fail")
+	}
+}
+
+func TestR1AndR2PartialRetentionAndNaNSafety(t *testing.T) {
+	view := syntheticView(map[uint64]graph.Features{
+		1: {StateKey: "A", BeforeBoundary: true, BarrierProximity: math.NaN()},
+		2: {StateKey: "A", BeforeBoundary: true, BarrierProximity: 0.5},
+		3: {StateKey: "B", BeforeBoundary: false, BarrierProximity: 0.1},
+	})
+	univ := []candidate.Candidate{
+		{Event: 1, Percent: 100, Seed: 1},
+		{Event: 2, Percent: 50, Seed: 2},
+		{Event: 3, Percent: 25, Seed: 3},
+		{Event: 1, Percent: 0, Seed: 4},
+		{Event: 2, Percent: 0, Seed: 5},
+		{Event: 3, Percent: 0, Seed: 6},
+	}
+
+	for _, strat := range []strategy.Strategy{strategy.NewR1(42), strategy.NewR2(42)} {
+		ranked := strat.Rank(view, univ)
+		if err := strategy.ValidatePermutation(univ, ranked); err != nil {
+			t.Fatalf("%s ValidatePermutation failed: %v", strat.Name(), err)
+		}
+		// Positions 0..2: 0%; positions 3..4: partial (25/50); position 5: 100%.
+		for i := 0; i < 3; i++ {
+			if ranked[i].Percent != 0 {
+				t.Fatalf("%s pos %d: got percent %d, want 0", strat.Name(), i, ranked[i].Percent)
+			}
+		}
+		for i := 3; i < 5; i++ {
+			if ranked[i].Percent <= 0 || ranked[i].Percent >= 100 {
+				t.Fatalf("%s pos %d: got percent %d, want 0 < p < 100", strat.Name(), i, ranked[i].Percent)
+			}
+		}
+		if ranked[5].Percent != 100 {
+			t.Fatalf("%s pos 5: got percent %d, want 100", strat.Name(), ranked[5].Percent)
+		}
+	}
+
+	// Verify R2 selects finite BarrierProximity (Event 2) over NaN (Event 1) regardless of input order.
+	r2 := strategy.NewR2(7)
+	uOnlyZero := []candidate.Candidate{
+		{Event: 1, Percent: 0, Seed: 1},
+		{Event: 2, Percent: 0, Seed: 2},
+	}
+	rankedR2 := r2.Rank(view, uOnlyZero)
+	if rankedR2[0].Event != 2 {
+		t.Fatalf("R2 should select finite BarrierProximity Event 2 over NaN Event 1, got %+v", rankedR2)
+	}
+}
+
+func TestDCGContractTierLevelsCategoryInterleavingAndNaN(t *testing.T) {
+	// Build a trace exercising:
+	// - Clean Tier 2 boundary cutoffs (Manifest, Dir, WAL, unclassified tier)
+	// - Level 3: AckSyncMissing
+	// - Level 2: UnsyncedDirectoryRename (with RenameWeight == 0 ablation)
+	// - Level 1: Dangling SST in MANIFEST
+	events := []trace.Event{
+		{ID: 1, Kind: trace.KindOpenDir, File: "db", Handle: 1, Dir: true},
+		{ID: 2, Kind: trace.KindCreate, File: "db/000001.log", Cat: "pebble-wal", Handle: 2},
+		{ID: 3, Kind: trace.KindSync, File: "db", Handle: 1, Dir: true}, // Clean TierDir at 3
+		// Op 1: WAL write acked without sync -> Level 3 (AckSyncMissing) at cutoff 6
+		{ID: 4, Kind: trace.KindOpBegin, Op: 1, OpKind: "set"},
+		{ID: 5, Kind: trace.KindWrite, File: "db/000001.log", Cat: "pebble-wal", Handle: 2, Data: []byte("abc"), Len: 3},
+		{ID: 6, Kind: trace.KindOpEnd, Op: 1, OpKind: "set"},
+		{ID: 7, Kind: trace.KindSync, File: "db/000001.log", Cat: "pebble-wal", Handle: 2}, // Clean TierWAL at 7
+		// Clean MANIFEST write+sync -> Clean TierManifest at 9, Clean TierData/unclassified at 10
+		{ID: 8, Kind: trace.KindCreate, File: "db/MANIFEST-000001", Cat: "pebble-manifest", Handle: 3},
+		{ID: 9, Kind: trace.KindSync, File: "db", Handle: 1, Dir: true},                               // sync dir entry for MANIFEST
+		{ID: 10, Kind: trace.KindSync, File: "db/MANIFEST-000001", Cat: "pebble-manifest", Handle: 3}, // Clean TierManifest at 10
+		{ID: 11, Kind: trace.KindSync, File: "db", Handle: 1, Dir: true},                              // Clean unclassified at 11
+		{ID: 12, Kind: trace.KindSync, File: "db", Handle: 1, Dir: true},                              // Clean non-boundary at 12
+		// Pending rename without dir sync (Level 2) crossed by OpBegin at event 15
+		{ID: 13, Kind: trace.KindCreate, File: "db/tmp.txt", Handle: 4},
+		{ID: 14, Kind: trace.KindRename, File: "db/tmp.txt", File2: "db/CURRENT.tmp"},
+		{ID: 15, Kind: trace.KindOpBegin, Op: 2, OpKind: "set"}, // Level 2 at cutoff 15
+		{ID: 16, Kind: trace.KindOpEnd, Op: 2, OpKind: "set"},
+		{ID: 17, Kind: trace.KindSync, File: "db", Handle: 1, Dir: true}, // clears Level 2
+		// Dangling SSTable committed in MANIFEST (Level 1) at cutoff 22
+		{ID: 18, Kind: trace.KindEngineEvent, Note: "FlushBegin"},
+		{ID: 19, Kind: trace.KindCreate, File: "db/000010.sst", Cat: "pebble-memtable-flush", Handle: 5},
+		{ID: 20, Kind: trace.KindWrite, File: "db/000010.sst", Cat: "pebble-memtable-flush", Handle: 5, Data: []byte("sst"), Len: 3},
+		{ID: 21, Kind: trace.KindWrite, File: "db/MANIFEST-000001", Cat: "pebble-manifest", Handle: 3, Data: []byte("man"), Len: 3},
+		{ID: 22, Kind: trace.KindSync, File: "db/MANIFEST-000001", Cat: "pebble-manifest", Handle: 3}, // Level 1 at cutoff 22
+	}
+
+	view := &graph.View{
+		Events: events,
+		Cuts: map[uint64]graph.Features{
+			// Tier 1 violating candidates (Level 3 at 6, Level 2 at 15, Level 1 at 22)
+			6:  {StateKey: "V3", BarrierProximity: 1.0},
+			15: {StateKey: "V2", BarrierProximity: 0.2},
+			22: {StateKey: "V1", BarrierProximity: 0.1},
+			// Tier 2 clean boundary candidates across semantic tiers + unclassified tier
+			3:  {StateKey: "C_DIR", BeforeBoundary: true, SemanticTier: graph.TierDir, BarrierProximity: 1.0},
+			7:  {StateKey: "C_WAL", BeforeBoundary: true, SemanticTier: graph.TierWAL, BarrierProximity: 1.0},
+			10: {StateKey: "C_MAN", BeforeBoundary: true, SemanticTier: graph.TierManifest, BarrierProximity: 1.0},
+			11: {StateKey: "C_UNCLASS", BeforeBoundary: true, SemanticTier: 99, BarrierProximity: 1.0},
+			12: {StateKey: "C_NONBOUND", BeforeBoundary: false, SemanticTier: graph.TierData, BarrierProximity: math.NaN(), RiskScore: math.NaN()},
+		},
+	}
+
+	univ := []candidate.Candidate{
+		{Event: 6, Percent: 0, Seed: 1},
+		{Event: 15, Percent: 0, Seed: 2},
+		{Event: 22, Percent: 0, Seed: 3},
+		{Event: 3, Percent: 0, Seed: 4},
+		{Event: 7, Percent: 0, Seed: 5},
+		{Event: 10, Percent: 0, Seed: 6},
+		{Event: 11, Percent: 0, Seed: 7},
+		{Event: 12, Percent: 0, Seed: 8},
+	}
+
+	// RenameWeight == 0 ablation must STILL keep Event 15 (UnsyncedDirectoryRename) in Tier 1!
+	strat := strategy.NewDCG(strategy.DCGWeights{WALWeight: 30, ManifestWeight: 40, RenameWeight: 0})
+	ranked := strat.Rank(view, univ)
+	if err := strategy.ValidatePermutation(univ, ranked); err != nil {
+		t.Fatalf("ValidatePermutation failed: %v", err)
+	}
+
+	gotEvents := make([]uint64, len(ranked))
+	for i, c := range ranked {
+		gotEvents[i] = c.Event
+	}
+	// Expected:
+	// Tier 1 (Level 1 -> Level 2 -> Level 3): 22, 15, 6
+	// Tier 2 boundary: unclassified tier (11) drained first, then categoryOrder (Manifest=10, Dir=3, WAL=7)
+	// Tier 2 non-boundary: 12
+	wantEvents := []uint64{22, 15, 6, 11, 10, 3, 7, 12}
+	if !reflect.DeepEqual(gotEvents, wantEvents) {
+		t.Fatalf("DCG Tier1/Tier2 order = %v, want %v", gotEvents, wantEvents)
+	}
+
+	// Also verify DCG-FlagOnly keeps Event 15 in Tier 1 and places 50% ahead of 100%.
+	univMid := append([]candidate.Candidate(nil), univ...)
+	univMid = append(univMid, candidate.Candidate{Event: 12, Percent: 100, Seed: 9}, candidate.Candidate{Event: 6, Percent: 50, Seed: 10})
+	flagRanked := strategy.NewDCGFlagOnly(99).Rank(view, univMid)
+	if err := strategy.ValidatePermutation(univMid, flagRanked); err != nil {
+		t.Fatalf("DCG-FlagOnly ValidatePermutation failed: %v", err)
+	}
+	if flagRanked[len(flagRanked)-2].Percent != 50 || flagRanked[len(flagRanked)-1].Percent != 100 {
+		t.Fatalf("DCG-FlagOnly did not separate 50%% before 100%%: tail=%+v", flagRanked[len(flagRanked)-2:])
+	}
+}
+
+func TestDCGPartialMultiMidEmptyU0AndNaNSafety(t *testing.T) {
+	// Events where cutoffs have distinct UnsyncedDirEntryCount and contract violations.
+	events := []trace.Event{
+		{ID: 1, Kind: trace.KindCreate, File: "db/000001.log", Cat: "pebble-wal", Handle: 1},
+		{ID: 2, Kind: trace.KindOpBegin, Op: 1, OpKind: "set"},
+		{ID: 3, Kind: trace.KindWrite, File: "db/000001.log", Cat: "pebble-wal", Handle: 1, Data: []byte("abc"), Len: 3},
+		{ID: 4, Kind: trace.KindOpEnd, Op: 1, OpKind: "set"}, // UnsyncedDirEntryCount=1, AckSyncMissing=true
+		{ID: 5, Kind: trace.KindCreate, File: "db/000002.sst", Handle: 2},
+		{ID: 6, Kind: trace.KindCreate, File: "db/000003.sst", Handle: 3}, // UnsyncedDirEntryCount=3
+		{ID: 7, Kind: trace.KindCreate, File: "db/000004.sst", Handle: 4},
+		{ID: 8, Kind: trace.KindCreate, File: "db/000005.sst", Handle: 5}, // UnsyncedDirEntryCount=5
+		{ID: 9, Kind: trace.KindSync, File: "db/000001.log", Cat: "pebble-wal", Handle: 1},
+		{ID: 10, Kind: trace.KindOpenDir, File: "db", Handle: 6, Dir: true},
+		{ID: 11, Kind: trace.KindSync, File: "db", Handle: 6, Dir: true}, // Clean, UnsyncedDirEntryCount=0
+	}
+
+	view := &graph.View{
+		Events: events,
+		Cuts: map[uint64]graph.Features{
+			4:  {StateKey: "MID_VIOL", BarrierProximity: 0.2, RiskScore: math.NaN()},
+			6:  {StateKey: "MID_HIGH", BarrierProximity: 0.9, RiskScore: 10},
+			8:  {StateKey: "MID_HIGH", BarrierProximity: 0.5, RiskScore: 5},
+			11: {StateKey: "MID_CLEAN", BarrierProximity: 1.0, RiskScore: 10},
+		},
+	}
+
+	// Empty u0, multiple intermediate percentages (25%, 50%), same group preferring higher UnsyncedDirEntryCount (8 over 6),
+	// and midRepsOther ranking violating (Event 4) before clean (Event 11).
+	univ := []candidate.Candidate{
+		{Event: 11, Percent: 100, Seed: 1},
+		{Event: 11, Percent: 25, Seed: 2},
+		{Event: 4, Percent: 50, Seed: 3},
+		{Event: 6, Percent: 50, Seed: 4},
+		{Event: 8, Percent: 50, Seed: 5},
+	}
+	pr := strategy.NewDCGPartial()
+	ranked := pr.Rank(view, univ)
+	if err := strategy.ValidatePermutation(univ, ranked); err != nil {
+		t.Fatalf("dcg-pr empty u0 ValidatePermutation failed: %v", err)
+	}
+	// Expected:
+	// 0: Event 8 (50%, UnsyncedDirEntryCount=5 > Event 6's 3 in MID_HIGH)
+	// 1: Event 4 (50%, midRepsOther Tier 1 violating before Event 11's clean Tier 2!)
+	// 2: Event 11 (25%, midRepsOther Tier 2 clean)
+	// 3: Event 6 (50%, midNonRep)
+	// 4: Event 11 (100%, u100)
+	want := []uint64{8, 4, 11, 6, 11}
+	got := []uint64{ranked[0].Event, ranked[1].Event, ranked[2].Event, ranked[3].Event, ranked[4].Event}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("dcg-pr empty u0 order = %v, want %v (full=%+v)", got, want, ranked)
 	}
 }

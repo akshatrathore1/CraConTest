@@ -1,20 +1,23 @@
 package replay
 
 import (
+	"bytes"
 	"math/rand/v2"
 
 	"github.com/akshatrathore1/CraConTest/internal/trace"
 	"github.com/cockroachdb/pebble/v2/vfs"
 )
 
-// DeterministicPartialCloneForTesting exposes deterministicPartialClone for external tests.
+// DeterministicPartialCloneForTesting exposes deterministicPartialCloneWithLinks for external tests.
 func DeterministicPartialCloneForTesting(
 	base0, full100 vfs.FS,
 	percent int,
 	rng *rand.Rand,
 	fileSyncedBytes map[string][]byte,
 ) (vfs.FS, error) {
-	return deterministicPartialClone(base0, full100, percent, rng, fileSyncedBytes)
+	return deterministicPartialCloneWithLinks(base0, full100, percent, rng, func(p string) []byte {
+		return fileSyncedBytes[p]
+	}, nil, nil)
 }
 
 // MemFSForTesting returns the underlying *vfs.MemFS for testing.
@@ -22,9 +25,15 @@ func (s *State) MemFSForTesting() *vfs.MemFS {
 	return s.memFS
 }
 
-// FileSyncedBytesForTesting returns the fileSyncedBytes map for testing.
+// FileSyncedBytesForTesting returns a copy of fileSyncedBytes by path for testing.
 func (s *State) FileSyncedBytesForTesting() map[string][]byte {
-	return s.syncedBytesByPath()
+	result := make(map[string][]byte, len(s.filePaths))
+	for name, snapshot := range s.filePaths {
+		if snapshot != nil {
+			result[name] = bytes.Clone(snapshot.bytes)
+		}
+	}
+	return result
 }
 
 // WrapHandleForTesting wraps an open file handle in s.handles for testing.

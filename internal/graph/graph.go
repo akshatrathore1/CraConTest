@@ -58,7 +58,7 @@ type Features struct {
 	// Reverse Risk Horizon:
 	// DirtyBytes is the total unpersisted dirty byte volume across all resources.
 	DirtyBytes uint64
-	// UncommittedSyncOps is the count of uncommitted synchronous operations.
+	// UncommittedSyncOps is the count of acknowledged mutating client operations since the last WAL barrier.
 	UncommittedSyncOps uint64
 	// RiskScore is the composite uncommitted risk exposure at this cutoff.
 	RiskScore float64
@@ -83,6 +83,7 @@ type View struct {
 
 	successors map[uint64][]uint64
 	vertices   map[uint64]bool
+	vertexOp   map[uint64]uint64
 
 	contractOnce sync.Once
 	contractFeat map[uint64]ContractFeatures
@@ -103,10 +104,23 @@ func (view *View) WriteDOT(w io.Writer) error {
 		return errors.New("graph: nil view")
 	}
 
-	fmt.Fprintln(w, "digraph G {")
-	fmt.Fprintln(w, "  rankdir=LR;")
-	fmt.Fprintln(w, "  node [shape=box, fontname=\"sans-serif\", fontsize=10];")
-	fmt.Fprintln(w, "  edge [fontname=\"sans-serif\", fontsize=9];")
+	writeLine := func(format string, args ...any) error {
+		_, err := fmt.Fprintf(w, format, args...)
+		return err
+	}
+
+	if err := writeLine("digraph G {\n"); err != nil {
+		return err
+	}
+	if err := writeLine("  rankdir=LR;\n"); err != nil {
+		return err
+	}
+	if err := writeLine("  node [shape=box, fontname=\"sans-serif\", fontsize=10];\n"); err != nil {
+		return err
+	}
+	if err := writeLine("  edge [fontname=\"sans-serif\", fontsize=9];\n"); err != nil {
+		return err
+	}
 
 	vIDs := make([]uint64, 0, len(view.vertices))
 	for id := range view.vertices {
@@ -115,22 +129,29 @@ func (view *View) WriteDOT(w io.Writer) error {
 	sort.Slice(vIDs, func(i, j int) bool { return vIDs[i] < vIDs[j] })
 
 	for _, id := range vIDs {
-		var kind, file string
-		var op uint64
+		var kind, file, file2 string
+		op := view.vertexOp[id]
 		if id > 0 && int(id) <= len(view.Events) {
 			ev := view.Events[id-1]
 			kind = string(ev.Kind)
 			file = ev.File
-			op = ev.Op
+			file2 = ev.File2
+			if op == 0 {
+				op = ev.Op
+			}
 		}
 		label := fmt.Sprintf("%d: %s", id, kind)
-		if file != "" {
-			label += fmt.Sprintf("\\n%s", file)
+		if file != "" && file2 != "" {
+			label += fmt.Sprintf("\n%s -> %s", file, file2)
+		} else if file != "" {
+			label += fmt.Sprintf("\n%s", file)
 		}
 		if op > 0 {
-			label += fmt.Sprintf("\\nop=%d", op)
+			label += fmt.Sprintf("\nop=%d", op)
 		}
-		fmt.Fprintf(w, "  n%d [label=%q];\n", id, label)
+		if err := writeLine("  n%d [label=%q];\n", id, label); err != nil {
+			return err
+		}
 	}
 
 	for _, id := range vIDs {
@@ -138,22 +159,24 @@ func (view *View) WriteDOT(w io.Writer) error {
 		sortedSuccs := append([]uint64(nil), succs...)
 		sort.Slice(sortedSuccs, func(i, j int) bool { return sortedSuccs[i] < sortedSuccs[j] })
 		for _, s := range sortedSuccs {
-			fmt.Fprintf(w, "  n%d -> n%d;\n", id, s)
+			if err := writeLine("  n%d -> n%d;\n", id, s); err != nil {
+				return err
+			}
 		}
 	}
 
-	fmt.Fprintln(w, "}")
-	return nil
+	return writeLine("}\n")
 }
 
 type interval struct{ start, end int64 }
 
 type resource struct {
-	id         uint64
-	directory  bool
-	aliases    map[string]bool
-	dirty      []interval
-	categories map[string]bool
+	id          uint64
+	directory   bool
+	openHandles int
+	aliases     map[string]bool
+	dirty       []interval
+	categories  map[string]bool
 }
 
 type pendingEntry struct {
@@ -166,12 +189,13 @@ type pendingEntry struct {
 }
 
 type builder struct {
-	resources map[uint64]*resource
-	nextID    uint64
-	names     map[string]uint64
-	handles   map[uint64]uint64
-	pending   []pendingEntry
-	unknown   []uint64
+	resources      map[uint64]*resource
+	dirtyResources map[uint64]bool
+	nextID         uint64
+	names          map[string]uint64
+	handles        map[uint64]uint64
+	pending        []pendingEntry
+	unknown        []uint64
 
 	lastOn     map[uint64]uint64
 	deferred   map[uint64][]uint64
@@ -179,10 +203,13 @@ type builder struct {
 	vertexRes  map[uint64]uint64
 	vertexKind map[uint64]string
 	vertexCats map[uint64]bool
+	vertexOp   map[uint64]uint64
 	firstNamed map[uint64]uint64
 	order      []uint64
 
 	activeKind string
+	activeOp   uint64
+	stateDirty bool
 }
 
 // Build validates the trace and returns its graph view.
@@ -197,47 +224,101 @@ func Build(input []trace.Event) (*View, error) {
 		categories     []string
 		opKind         string
 		anchor         uint64
+		anchorTier     int
+		anchorWeight   float64
+		barrierTier    int
+		barrierWeight  float64
 		dirtyBytes     uint64
 		uncommittedOps uint64
 		riskScore      float64
 	}
 	parts := make([]partial, len(events)+1)
-	emptyKey, emptyCats, err := b.stateKey()
+	prevKey, prevCats, err := b.stateKey()
 	if err != nil {
 		return nil, err
 	}
-	parts[0] = partial{stateKey: emptyKey, categories: emptyCats, opKind: Background}
+	parts[0] = partial{stateKey: prevKey, categories: prevCats, opKind: Background}
 	var anchor uint64
-	// uncommittedMutatingOps counts mutating client operations since the last barrier
-	// event, tracking exposure of uncommitted mutating operations prior to persistence.
+	var anchorTier int
+	var anchorWeight float64
+	var prevDirtyBytes uint64
+	var prevDirtyRisk, prevPendingRisk, prevRiskScore float64
+	// uncommittedMutatingOps counts acknowledged mutating client operations since
+	// the last WAL durability barrier.
 	var uncommittedMutatingOps uint64
 	for _, event := range events {
+		if event.IsBarrier() || (event.Kind == trace.KindRename && event.Err == "") {
+			var br *resource
+			if event.Kind == trace.KindRename {
+				if id, ok := b.names[event.File]; ok {
+					br = b.resources[id]
+				}
+			} else if id, ok := b.handles[event.Handle]; ok {
+				br = b.resources[id]
+			}
+			if br != nil {
+				bt, bw := ResourceTier(br.categories, br.aliases, br.directory)
+				parts[event.ID-1].barrierTier = bt
+				parts[event.ID-1].barrierWeight = bw
+			}
+		}
+
+		prevOps := uncommittedMutatingOps
 		if event.Kind == trace.KindOpEnd && trace.MutatingOperation(event.OpKind) && event.Err == "" {
 			uncommittedMutatingOps++
 		}
-		if event.IsBarrier() {
-			uncommittedMutatingOps = 0
-		}
+		b.stateDirty = false
 		opKind, err := b.apply(event)
 		if err != nil {
 			return nil, err
 		}
+		if event.IsBarrier() && !event.Dir {
+			if resID := b.vertexRes[event.ID]; resID != 0 {
+				if r := b.resources[resID]; r != nil && isWALResource(r) {
+					uncommittedMutatingOps = 0
+				}
+			}
+		}
 		if b.isVertex(event) {
 			anchor = event.ID
 		}
-		key, categories, err := b.stateKey()
-		if err != nil {
-			return nil, err
+		if anchor != 0 {
+			anchorTier, anchorWeight = TierData, 0.0
+			if resID := b.vertexRes[anchor]; resID != 0 {
+				if r := b.resources[resID]; r != nil {
+					anchorTier, anchorWeight = ResourceTier(r.categories, r.aliases, r.directory)
+				}
+			}
 		}
-		dirtyBytes, riskScore := computeRiskHorizon(b.resources, b.pending, uncommittedMutatingOps)
+		var cats []string
+		if b.stateDirty {
+			prevKey, prevCats, err = b.stateKey()
+			if err != nil {
+				return nil, err
+			}
+			prevDirtyBytes, prevDirtyRisk, prevPendingRisk = computeRiskHorizonParts(b.resources, b.dirtyResources, b.pending)
+			prevRiskScore = prevDirtyRisk + prevPendingRisk + 4.0*float64(uncommittedMutatingOps)
+			cats = prevCats
+		} else {
+			if len(prevCats) > 0 {
+				cats = append([]string(nil), prevCats...)
+			} else {
+				cats = []string{}
+			}
+			if uncommittedMutatingOps != prevOps {
+				prevRiskScore = prevDirtyRisk + prevPendingRisk + 4.0*float64(uncommittedMutatingOps)
+			}
+		}
 		parts[event.ID] = partial{
-			stateKey:       key,
-			categories:     categories,
+			stateKey:       prevKey,
+			categories:     cats,
 			opKind:         opKind,
 			anchor:         anchor,
-			dirtyBytes:     dirtyBytes,
+			anchorTier:     anchorTier,
+			anchorWeight:   anchorWeight,
+			dirtyBytes:     prevDirtyBytes,
 			uncommittedOps: uncommittedMutatingOps,
-			riskScore:      riskScore,
+			riskScore:      prevRiskScore,
 		}
 	}
 
@@ -248,6 +329,7 @@ func Build(input []trace.Event) (*View, error) {
 		Cuts:       make(map[uint64]Features, len(events)+1),
 		successors: make(map[uint64][]uint64, len(b.successors)),
 		vertices:   make(map[uint64]bool, len(b.order)),
+		vertexOp:   b.vertexOp,
 	}
 	for _, vertex := range b.order {
 		view.vertices[vertex] = true
@@ -258,16 +340,20 @@ func Build(input []trace.Event) (*View, error) {
 		sort.Slice(list, func(left, right int) bool { return list[left] < list[right] })
 		view.successors[vertex] = list
 	}
+	bIdx := 0
 	for cut := uint64(0); cut <= uint64(len(events)); cut++ {
 		part := parts[cut]
-		prox, nextBarrier := computeBarrierProximity(cut, barriers)
-		var anchorRes *resource
-		if part.anchor != 0 {
-			if resID := b.vertexRes[part.anchor]; resID != 0 {
-				anchorRes = b.resources[resID]
-			}
+		for bIdx < len(barriers) && barriers[bIdx] <= cut {
+			bIdx++
 		}
-		tier, semWeight := CutoffTier(events, cut, part.anchor, nextBarrier, anchorRes)
+		var prox float64
+		var nextBarrier uint64
+		if bIdx < len(barriers) {
+			nextBarrier = barriers[bIdx]
+			delta := (nextBarrier - 1) - cut
+			prox = 1.0 / (1.0 + float64(delta))
+		}
+		tier, semWeight := cutoffTierFromCausal(events, cut, part.anchor, nextBarrier, part.anchorTier, part.anchorWeight, part.barrierTier, part.barrierWeight)
 		features := Features{
 			StateKey:           part.stateKey,
 			OpKind:             part.opKind,
@@ -298,16 +384,18 @@ func Build(input []trace.Event) (*View, error) {
 
 func newBuilder() *builder {
 	return &builder{
-		resources:  make(map[uint64]*resource),
-		names:      make(map[string]uint64),
-		handles:    make(map[uint64]uint64),
-		lastOn:     make(map[uint64]uint64),
-		deferred:   make(map[uint64][]uint64),
-		successors: make(map[uint64]map[uint64]bool),
-		vertexRes:  make(map[uint64]uint64),
-		vertexKind: make(map[uint64]string),
-		vertexCats: make(map[uint64]bool),
-		firstNamed: make(map[uint64]uint64),
+		resources:      make(map[uint64]*resource),
+		dirtyResources: make(map[uint64]bool),
+		names:          make(map[string]uint64),
+		handles:        make(map[uint64]uint64),
+		lastOn:         make(map[uint64]uint64),
+		deferred:       make(map[uint64][]uint64),
+		successors:     make(map[uint64]map[uint64]bool),
+		vertexRes:      make(map[uint64]uint64),
+		vertexKind:     make(map[uint64]string),
+		vertexCats:     make(map[uint64]bool),
+		vertexOp:       make(map[uint64]uint64),
+		firstNamed:     make(map[uint64]uint64),
 	}
 }
 
@@ -344,6 +432,10 @@ func (b *builder) ensureDir(name string) uint64 {
 func (b *builder) setName(name string, id uint64) {
 	if old, ok := b.names[name]; ok && old != id {
 		delete(b.resources[old].aliases, name)
+		b.maybeClearDeadResource(old)
+		b.stateDirty = true
+	} else if !ok {
+		b.stateDirty = true
 	}
 	b.names[name] = id
 	b.resources[id].aliases[name] = true
@@ -353,12 +445,46 @@ func (b *builder) dropName(name string) {
 	if old, ok := b.names[name]; ok {
 		delete(b.resources[old].aliases, name)
 		delete(b.names, name)
+		b.maybeClearDeadResource(old)
+		b.stateDirty = true
+	}
+}
+
+func (b *builder) maybeClearDeadResource(id uint64) {
+	r := b.resources[id]
+	if r != nil && len(r.aliases) == 0 && r.openHandles == 0 && len(r.dirty) > 0 {
+		r.dirty = nil
+		delete(b.dirtyResources, id)
+		b.stateDirty = true
+	}
+}
+
+func (b *builder) bindHandle(handle, id uint64) {
+	if handle == 0 || id == 0 {
+		return
+	}
+	if r := b.resources[id]; r != nil {
+		r.openHandles++
+	}
+	b.handles[handle] = id
+}
+
+func (b *builder) releaseHandle(handle uint64) {
+	id, ok := b.handles[handle]
+	if !ok {
+		return
+	}
+	delete(b.handles, handle)
+	if r := b.resources[id]; r != nil && r.openHandles > 0 {
+		r.openHandles--
+		b.maybeClearDeadResource(id)
 	}
 }
 
 func (b *builder) addPending(event uint64, name, kind string, id uint64) {
 	dir := parent(name)
 	b.pending = append(b.pending, pendingEntry{event: event, dir: dir, dirID: b.ensureDir(dir), path: name, kind: kind, resource: id})
+	b.stateDirty = true
 }
 
 func (b *builder) lookup(event trace.Event, name string) (uint64, error) {
@@ -401,6 +527,9 @@ func (b *builder) touch(vertex uint64, ids ...uint64) {
 func (b *builder) markVertex(event trace.Event, primary uint64, others ...uint64) {
 	b.order = append(b.order, event.ID)
 	b.vertexRes[event.ID] = primary
+	if b.activeOp > 0 {
+		b.vertexOp[event.ID] = b.activeOp
+	}
 	if b.activeKind != "" {
 		b.vertexKind[event.ID] = b.activeKind
 	} else {
@@ -414,6 +543,7 @@ func (b *builder) markVertex(event trace.Event, primary uint64, others ...uint64
 
 func (b *builder) failedNamespace(event trace.Event) {
 	b.unknown = append(b.unknown, event.ID)
+	b.stateDirty = true
 	// Order a failed call after earlier events on the parents the trace
 	// actually knows; never invent a directory a failed call names.
 	var parents []uint64
@@ -433,7 +563,11 @@ func (b *builder) failedNamespace(event trace.Event) {
 
 func (b *builder) addCategory(id uint64, category string) {
 	if category != "" {
-		b.resources[id].categories[category] = true
+		r := b.resources[id]
+		if !r.categories[category] {
+			r.categories[category] = true
+			b.stateDirty = true
+		}
 	}
 }
 
@@ -464,11 +598,16 @@ func (b *builder) renameNames(from, to string) {
 	sort.Slice(moves, func(left, right int) bool { return moves[left].oldName < moves[right].oldName })
 	ids := make([]uint64, len(moves))
 	for index, item := range moves {
-		ids[index] = b.names[item.oldName]
-		b.dropName(item.oldName)
+		id := b.names[item.oldName]
+		ids[index] = id
+		delete(b.resources[id].aliases, item.oldName)
+		delete(b.names, item.oldName)
 	}
 	for index, item := range moves {
 		b.setName(item.newName, ids[index])
+	}
+	if len(moves) > 0 {
+		b.stateDirty = true
 	}
 }
 
@@ -477,9 +616,11 @@ func (b *builder) apply(event trace.Event) (string, error) {
 	opKind := ""
 	switch event.Kind {
 	case trace.KindOpBegin:
+		b.activeOp = event.Op
 		b.activeKind = event.OpKind
 	case trace.KindOpEnd:
 		opKind = event.OpKind
+		b.activeOp = 0
 		b.activeKind = ""
 	case trace.KindEngineEvent:
 		b.engineEvent(event)
@@ -490,7 +631,7 @@ func (b *builder) apply(event trace.Event) (string, error) {
 		}
 		id := b.create(event, event.File)
 		b.addCategory(id, event.Cat)
-		b.handles[event.Handle] = id
+		b.bindHandle(event.Handle, id)
 		b.markVertex(event, id, b.ensureDir(parent(event.File)))
 	case trace.KindOpenReadWrite:
 		if event.Err != "" {
@@ -509,7 +650,7 @@ func (b *builder) apply(event trace.Event) (string, error) {
 			}
 		}
 		b.addCategory(id, event.Cat)
-		b.handles[event.Handle] = id
+		b.bindHandle(event.Handle, id)
 		b.markVertex(event, id, others...)
 	case trace.KindReuseForWrite:
 		if event.Err != "" {
@@ -520,11 +661,16 @@ func (b *builder) apply(event trace.Event) (string, error) {
 		if err != nil {
 			return "", err
 		}
+		if r := b.resources[id]; r != nil && len(r.dirty) > 0 {
+			r.dirty = nil
+			delete(b.dirtyResources, id)
+			b.stateDirty = true
+		}
 		b.renameNames(event.File, event.File2)
 		b.addPending(event.ID, event.File, "rename_from", id)
 		b.addPending(event.ID, event.File2, "rename_to", id)
 		b.addCategory(id, event.Cat)
-		b.handles[event.Handle] = id
+		b.bindHandle(event.Handle, id)
 		b.markVertex(event, id, b.ensureDir(parent(event.File)), b.ensureDir(parent(event.File2)))
 	case trace.KindOpen, trace.KindOpenDir:
 		if event.Err != "" {
@@ -539,7 +685,7 @@ func (b *builder) apply(event trace.Event) (string, error) {
 				return "", err
 			}
 		}
-		b.handles[event.Handle] = id
+		b.bindHandle(event.Handle, id)
 	case trace.KindLink:
 		if event.Err != "" {
 			b.failedNamespace(event)
@@ -586,21 +732,47 @@ func (b *builder) apply(event trace.Event) (string, error) {
 		isRoot := event.File == "" || event.File == "."
 		prefix := strings.TrimSuffix(event.File, "/") + "/"
 		for name := range b.names {
-			if isRoot || name == event.File || strings.HasPrefix(name, prefix) {
+			if (isRoot && name != "") || (!isRoot && (name == event.File || strings.HasPrefix(name, prefix))) {
 				removed = append(removed, name)
 			}
 		}
 		sort.Strings(removed)
-		parentDir := ""
-		if !isRoot {
-			parentDir = parent(event.File)
+		type removalItem struct {
+			name  string
+			id    uint64
+			dirID uint64
 		}
-		touched := []uint64{b.ensureDir(parentDir)}
+		items := make([]removalItem, 0, len(removed))
 		for _, name := range removed {
-			id := b.names[name]
-			b.dropName(name)
-			b.addPending(event.ID, name, "remove", id)
-			touched = append(touched, id, b.ensureDir(parent(name)))
+			items = append(items, removalItem{
+				name:  name,
+				id:    b.names[name],
+				dirID: b.ensureDir(parent(name)),
+			})
+		}
+		var parentID uint64
+		if isRoot {
+			parentID = b.ensureDir("")
+		} else if len(items) > 0 {
+			parentID = b.ensureDir(parent(event.File))
+		} else if id, ok := b.names[parent(event.File)]; ok {
+			parentID = id
+		} else {
+			parentID = b.ensureDir("")
+		}
+		touched := []uint64{parentID}
+		for _, item := range items {
+			b.dropName(item.name)
+			b.pending = append(b.pending, pendingEntry{
+				event:    event.ID,
+				dir:      parent(item.name),
+				dirID:    item.dirID,
+				path:     item.name,
+				kind:     "remove",
+				resource: item.id,
+			})
+			b.stateDirty = true
+			touched = append(touched, item.id, item.dirID)
 		}
 		b.markVertex(event, touched[0], touched[1:]...)
 	case trace.KindMkdirAll:
@@ -639,6 +811,10 @@ func (b *builder) apply(event trace.Event) (string, error) {
 			break
 		}
 		r.dirty = addInterval(r.dirty, interval{event.Off, event.Off + int64(event.Len)})
+		if len(r.dirty) > 0 {
+			b.dirtyResources[id] = true
+			b.stateDirty = true
+		}
 		b.markVertex(event, id)
 	case trace.KindSync, trace.KindSyncData, trace.KindSyncTo:
 		if event.Err != "" {
@@ -664,6 +840,9 @@ func (b *builder) apply(event trace.Event) (string, error) {
 					count++
 				}
 			}
+			if count != len(b.pending) {
+				b.stateDirty = true
+			}
 			if count == 0 {
 				b.pending = nil
 			} else {
@@ -676,11 +855,33 @@ func (b *builder) apply(event trace.Event) (string, error) {
 				b.pending = kept
 			}
 		} else {
-			r.dirty = nil
+			if len(r.dirty) > 0 {
+				r.dirty = nil
+				delete(b.dirtyResources, id)
+				b.stateDirty = true
+			}
 		}
 		b.markVertex(event, id)
 	case trace.KindClose, trace.KindUnlock:
-		delete(b.handles, event.Handle)
+		b.releaseHandle(event.Handle)
+	case trace.KindPreallocate:
+		if event.Size <= 0 {
+			break
+		}
+		id, ok := b.handles[event.Handle]
+		if event.Err != "" {
+			b.unknown = append(b.unknown, event.ID)
+			b.stateDirty = true
+			if ok && id != 0 {
+				b.markVertex(event, id)
+			} else {
+				b.markVertex(event, b.ensureDir(""))
+			}
+			break
+		}
+		if ok && id != 0 {
+			b.markVertex(event, id)
+		}
 	case trace.KindRead:
 	default:
 		return "", fmt.Errorf("graph: event %d: unsupported kind %q", event.ID, event.Kind)
@@ -784,9 +985,9 @@ type keyState struct {
 // stateKey returns the hash of the current persistence state and the sorted
 // categories of its dirty and pending resources.
 func (b *builder) stateKey() (string, []string, error) {
-	included := make(map[uint64]bool)
-	for id, r := range b.resources {
-		if len(r.dirty) > 0 {
+	included := make(map[uint64]bool, len(b.dirtyResources)+len(b.pending))
+	for id := range b.dirtyResources {
+		if r := b.resources[id]; r != nil && len(r.dirty) > 0 {
 			included[id] = true
 		}
 	}

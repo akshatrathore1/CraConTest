@@ -14,10 +14,7 @@ graph builder.
    `vfs.File` is intercepted, even read-only methods,
    so the wrapper satisfies the interface and can log every mutation.
 
-3. **Trace order equals filesystem order.** Mutations, opens, sequential
-   reads, closes, locks and annotations use one ordering lock. The lock covers
-   each underlying call, its result, ID allocation and append, not the entire
-   client operation.
+3. **Trace order equals filesystem order.** Mutations, opens, closes, locks and annotations use one ordering lock covering each underlying call, its result, ID allocation and append, not the entire client operation (`recFile.Read` runs `f.inner.Read` unlocked and acquires the ordering lock afterward to record the event).
 
 4. **Write data is copied before recording.** Pebble's `vfs.File.Write()` is
    allowed to modify the passed slice. The wrapper copies the buffer before
@@ -30,13 +27,16 @@ graph builder.
 
 6. **Same-handle sync adjacency and cleaner gating.** In `internal/vfsrec/recorder.go`,
    `appendSyncEventLocked` preserves the logical pairing of write operations and
-   sync barriers by repositioning sync events immediately following their corresponding
-   mutations on the same handle, halting at same-handle events, unlock boundaries,
-   or client operation boundaries (`OpBegin`/`OpEnd`), preventing concurrent
-   background events (such as `Close` or `EngineEvent`) from splitting `Write` and
-   `Sync`/`SyncData` pairs. During ingest workloads, `inIngestSection` serializes
-   obsolete-file cleaner sweeps to prevent asynchronous background cleaner deletions
-   from interleaving with direct L0 table ingests or WAL syncs.
+   sync barriers by scanning backward at most `syncReorderScanWindow = 8` events to
+   reposition `Sync`/`SyncData`/`SyncTo` immediately after its preceding `Write`/`WriteAt`
+   on the same handle, halting on any same-handle event (`e.Handle == event.Handle`),
+   any mutating event (`e.IsMutation() && e.Kind != trace.KindEngineEvent`), or
+   concurrency/client-operation boundaries (`KindLock`, `KindUnlock`, `KindOpBegin`,
+   `KindOpEnd`), preventing concurrent non-mutating background events (such as `Close` on
+   unrelated handles or `EngineEvent`) from splitting `Write` and
+   `Sync`/`SyncData` pairs. During ingest workloads, `inIngestSection` gates
+   non-manifest, non-staging, non-marker `Remove` calls to prevent asynchronous
+   background cleaner deletions from interleaving with direct L0 table ingests.
 
 ## Pebble's VFS Interface (v2.1.7)
 
@@ -78,7 +78,7 @@ inherit it through the handle rather than repeating it on write/sync events.
 | `Sync()` | Yes | `Sync` event |
 | `SyncData()` | Yes | `SyncData` event |
 | `SyncTo(length)` | No* | `SyncTo` event (informational; no durability guarantee) |
-| `Close()` | Yes | `Close` event |
+| `Close()` | No | `Close` event |
 | `Read(p)` | No | Requested size, returned count and input cursor |
 | `ReadAt(p, off)` | No | — |
 | `Stat()` | No | — |
@@ -125,10 +125,12 @@ and relative to the VFS root. An empty directory path names the root.
 
 The recorder rewrites a name only in ways that do not change the file it
 names on the in-memory filesystem used for recording: it drops leading
-separators and collapses repeated ones, both of which that filesystem ignores
-itself. That filesystem does not resolve `.` or `..` and treats a backslash as
-an ordinary byte, so a name containing a `.` or `..` component, a backslash, a
-drive prefix or a trailing separator has no faithful trace spelling. The
+separators, maps the bare name `"."` to root `""` (matching `MemFS` in
+`canonical()` at `internal/vfsrec/recorder.go:509-526`), and collapses repeated
+separators, which that filesystem ignores itself. That filesystem does not resolve
+`.` or `..` components inside multi-segment paths and treats a backslash as
+an ordinary byte, so a name containing a `.` or `..` path segment, a backslash, a
+drive prefix, or a trailing separator has no faithful trace spelling. The
 recorder refuses such a call with `ErrUnrepresentablePath` before it reaches
 the wrapped filesystem, rather than recording it under a different name.
 Engine annotations omit such paths. Pebble builds every name with the
@@ -185,8 +187,8 @@ calls and checks error presence while preserving their side effects.
 The trace carries semantic information from three independent sources:
 
 1. **Operation markers** (`OpBegin`/`OpEnd`): written by the test harness
-   around each client API call (Set, Delete, DeleteRange, Batch, Flush,
-   Compact). They label a time interval, not proven ownership of background
+   around each client API call (Set, Get, Iterate, Delete, DeleteRange, Batch,
+   Flush, Compact, Checkpoint, Ingest, Ratchet). They label a time interval, not proven ownership of background
    writes. Only markers carry `Op` and `OpKind`; filesystem events have Op=0.
 
 2. **DiskWriteCategory** (`Cat` field): supplied by Pebble to `Create`,
@@ -244,11 +246,12 @@ trailing documents. Empty traces contain `"events":[]`, not null.
                     └────────┬─────────┘
                              │ FS/File calls with DiskWriteCategory
                              ▼
-                    ┌──────────────────┐
-                    │  vfsrec          │
-                    │  (recording FS)  │
-                    │  over vfs.NewMem │
-                    └────────┬─────────┘
+                    ┌─────────────────────────┐
+                    │  vfsrec                 │
+                    │  (recording FS)         │
+                    │  over vfs.FS            │
+                    │  (CrashableMem / MemFS) │
+                    └────────┬────────────────┘
                              │ append to trace (under lock)
                              ▼
                     ┌──────────────────┐
@@ -300,10 +303,7 @@ a directed acyclic graph of persistence dependencies:
    observed producer/consumer edges. The initial graph does not infer a
    parsed MANIFEST dependency from a filename alone.
 
-6. **Semantic labels**: each event is labeled with its marker interval (from
-   `OpBegin`/`OpEnd`), its inherited write category, and any
-   associated engine event (from `EngineEvent` annotations). These labels
-   enable semantic-aware ranking strategies.
+6. **Semantic and risk labels**: each cutoff in `view.Cuts[cut]` carries all 14 `graph.Features` fields: reachability and semantic labels (`Desc`, `CrossFile`, `Semantic`, `StateKey`, `OpKind`, `Categories`, `BeforeBoundary`), reverse risk-horizon metrics (`DirtyBytes`, `UncommittedSyncOps`, `RiskScore`), barrier proximity (`BarrierProximity`, `NextBarrier`), and 5-tier discriminative semantics (`SemanticTier`, `SemanticWeight`). These labels enable semantic- and hazard-aware ranking strategies.
 
 ### Persistence-State View
 
@@ -316,9 +316,9 @@ strategies.
 ### Durability-Contract Feature Extraction
 
 In addition to topological reachability and state-equivalence partitioning, CraConTest computes explicit POSIX durability-contract indicators via `ComputeContractFeatures` (`internal/graph/features.go`). Operating in a single causal forward pass over the recorded `trace.Event` stream without inspecting recovery outcomes, this analysis maintains:
-- **Dirty Byte Spans (`dirtySpans` and `dirtyBytes`):** Tracked per file and per open handle across `trace.KindWrite` and `trace.KindWriteAt` events, reset upon successful `File.SyncData()` or `File.Sync()`.
-- **Parent Directory Synchronization (`dirEntrySynced` and `unsyncedDirs`):** Recorded across `Create`, `ReuseForWrite`, `Rename`, `Link`, and `MkdirAll` operations, and cleared only when a matching parent directory path is explicitly synced via `File.Sync()` on an open directory handle (`OpenDir`).
-- **Manifest Version Staging and Commitment (`stagedInManifest` and `committedInManifest`):** SSTable creations mark tables as staged; subsequent manifest writes and syncs transition them to committed, asserting dangling table indicators (`DanglingTableCount`) if unpersisted tables are referenced by a durable manifest.
+- **Dirty Byte Spans (`dirtySpans` and `dirtyBytes`):** Tracked per file (`*trackFileInfo`, shared across open handles) across `trace.KindWrite` and `trace.KindWriteAt` events, reset upon successful `File.SyncData()`, `File.Sync()`, `SyncTo(FullSync=true)`, or WAL flush healing.
+- **Parent Directory Synchronization (`dirEntrySynced` and `unsyncedDirs`):** Recorded across `Create`, `OpenReadWrite(Created=true)`, `ReuseForWrite`, `Rename`, `Link`, and `MkdirAll` operations, and cleared on `Remove`/`RemoveAll` or when a matching parent directory path is explicitly synced via `File.Sync()` on an open directory handle (`OpenDir`).
+- **Manifest Version Staging and Commitment (`stagedInManifest` and `committedInManifest`):** `MANIFEST` writes (`Write`/`WriteAt`) stage dirty/unsynced SSTables; subsequent manifest syncs or `FlushEnd`/`CompactionEnd` events transition them to committed, asserting `DanglingTableCount` if unpersisted tables are referenced by a durable manifest or an uncommitted `MANIFEST` file remains dirty (`manifestDirtyUncommitted`).
 - **Client Write Acknowledgment (`ackOps` and `ackSyncOps`):** Correlating client transaction markers (`trace.KindOpBegin`, `trace.KindOpEnd`) with WAL sync barriers, detecting unpersisted WAL bytes for acknowledged client mutations (`AckSyncMissing`).
 
 ## Evaluation Trace Profile

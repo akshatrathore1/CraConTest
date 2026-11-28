@@ -9,10 +9,10 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
-	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
@@ -22,7 +22,6 @@ import (
 	"github.com/akshatrathore1/CraConTest/internal/faults"
 	"github.com/akshatrathore1/CraConTest/internal/graph"
 	"github.com/akshatrathore1/CraConTest/internal/history"
-	"github.com/akshatrathore1/CraConTest/internal/oracle"
 	"github.com/akshatrathore1/CraConTest/internal/recovery"
 	"github.com/akshatrathore1/CraConTest/internal/strategy"
 	"github.com/akshatrathore1/CraConTest/internal/trace"
@@ -34,26 +33,12 @@ import (
 
 // DefaultPebbleVersion defines the single-source-of-truth fallback Pebble version
 // when dynamic build info is unavailable at runtime.
-const DefaultPebbleVersion = "v2.1.7"
+const DefaultPebbleVersion = exp.DefaultPebbleVersion
 
 // detectPebbleVersion queries runtime build info to determine the active Pebble module version,
 // falling back to DefaultPebbleVersion if build info is not embedded.
 func detectPebbleVersion() string {
-	info, ok := debug.ReadBuildInfo()
-	if !ok {
-		return DefaultPebbleVersion
-	}
-	for _, dep := range info.Deps {
-		if dep.Path == "github.com/cockroachdb/pebble/v2" || dep.Path == "github.com/cockroachdb/pebble" {
-			if dep.Replace != nil && dep.Replace.Version != "" {
-				return dep.Replace.Version
-			}
-			if dep.Version != "" {
-				return dep.Version
-			}
-		}
-	}
-	return DefaultPebbleVersion
+	return exp.DetectPebbleVersion()
 }
 
 // RunMetadata records complete environment and execution parameters for a run directory.
@@ -74,43 +59,95 @@ type RunMetadata struct {
 }
 
 func main() {
-	if len(os.Args) < 2 {
-		printUsage()
-		os.Exit(1)
+	os.Exit(runCLI(os.Args[1:], os.Stdout, os.Stderr))
+}
+
+func runCLI(args []string, stdout, stderr io.Writer) int {
+	if len(args) < 1 {
+		printUsage(stderr)
+		return 1
 	}
 
-	command := os.Args[1]
-	args := os.Args[2:]
+	command := args[0]
+	cmdArgs := args[1:]
 
 	var err error
 	switch command {
 	case "record":
-		err = runRecord(args)
+		err = runRecordWithWriters(cmdArgs, stdout, stderr)
 	case "plan":
-		err = runPlan(args)
+		err = runPlanWithWriters(cmdArgs, stdout, stderr)
 	case "explore":
-		err = runExploreCmd(args)
+		err = runExploreCmdWithWriters(cmdArgs, stdout, stderr)
 	case "evaluate":
-		err = runEvaluate(args)
+		err = runEvaluateWithWriters(cmdArgs, stdout, stderr)
 	case "benchmark":
-		err = runBenchmarkCmd(args)
+		err = runBenchmarkCmdWithWriters(cmdArgs, stdout, stderr)
 	case "help", "-h", "--help":
-		printUsage()
-		return
+		printUsage(stdout)
+		return 0
 	default:
-		fmt.Fprintf(os.Stderr, "cracontest: unknown command %q\n", command)
-		printUsage()
-		os.Exit(1)
+		fmt.Fprintf(stderr, "cracontest: unknown command %q\n", command)
+		printUsage(stderr)
+		return 1
 	}
 
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		os.Exit(1)
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
 	}
+	return 0
 }
 
-func printUsage() {
-	fmt.Fprintf(os.Stderr, `Usage: cracontest <command> [options]
+func writeFileAtomic(targetPath string, writeFn func(*os.File) error) error {
+	dir := filepath.Dir(targetPath)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+	base := filepath.Base(targetPath)
+	tmp, err := os.CreateTemp(dir, "."+base+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if err := writeFn(tmp); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, targetPath); err != nil {
+		return err
+	}
+	cleanup = false
+	return nil
+}
+
+func safeCloseDB(db *pebble.DB) (panicked bool, err error) {
+	if db == nil {
+		return false, nil
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			panicked = true
+			err = fmt.Errorf("%v", r)
+		}
+	}()
+	return false, db.Close()
+}
+
+func printUsage(w io.Writer) {
+	fmt.Fprintf(w, `Usage: cracontest <command> [options]
 
 Commands:
   record    Execute deterministic workload and record VFS trace and mutation ledger
@@ -121,12 +158,214 @@ Commands:
 `)
 }
 
+func parseCSVParts(raw, cmd, label string) ([]string, error) {
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		trimmed := strings.TrimSpace(p)
+		if trimmed == "" {
+			return nil, fmt.Errorf("%s: empty element in %s %q", cmd, label, raw)
+		}
+		out = append(out, trimmed)
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("%s: %s cannot be empty", cmd, label)
+	}
+	return out, nil
+}
+
+func parsePoliciesFlag(raw, cmd string) ([]int, error) {
+	parts, err := parseCSVParts(raw, cmd, "-policies")
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[int]bool, len(parts))
+	policies := make([]int, 0, len(parts))
+	for _, part := range parts {
+		p, err := strconv.Atoi(part)
+		if err != nil {
+			return nil, fmt.Errorf("%s: invalid policy %q: %w", cmd, part, err)
+		}
+		if p < 0 || p > 100 {
+			return nil, fmt.Errorf("%s: invalid policy %q (must be 0..100)", cmd, part)
+		}
+		if seen[p] {
+			return nil, fmt.Errorf("%s: duplicate retention policy %d", cmd, p)
+		}
+		seen[p] = true
+		policies = append(policies, p)
+	}
+	return policies, nil
+}
+
+func parseBudgetsFlag(raw string) ([]int, error) {
+	parts, err := parseCSVParts(raw, "evaluate", "-budgets")
+	if err != nil {
+		return nil, err
+	}
+	budgets := make([]int, 0, len(parts))
+	for i, part := range parts {
+		val, err := strconv.Atoi(part)
+		if err != nil {
+			return nil, fmt.Errorf("evaluate: invalid budget %q: %w", part, err)
+		}
+		if val < 0 {
+			return nil, fmt.Errorf("evaluate: negative budget %d", val)
+		}
+		if i > 0 && val <= budgets[i-1] {
+			return nil, fmt.Errorf("evaluate: budgets must be strictly increasing and unique: %d <= %d", val, budgets[i-1])
+		}
+		budgets = append(budgets, val)
+	}
+	return budgets, nil
+}
+
+func parseSeedsFlag(raw string) ([]uint64, error) {
+	parts, err := parseCSVParts(raw, "benchmark", "-seeds")
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[uint64]bool, len(parts))
+	seeds := make([]uint64, 0, len(parts))
+	for _, part := range parts {
+		s, err := strconv.ParseUint(part, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("benchmark: invalid seed %q: %w", part, err)
+		}
+		if seen[s] {
+			return nil, fmt.Errorf("benchmark: duplicate seed %d", s)
+		}
+		seen[s] = true
+		seeds = append(seeds, s)
+	}
+	return seeds, nil
+}
+
+func parseFaultsFlag(raw string) ([]string, error) {
+	parts, err := parseCSVParts(raw, "benchmark", "-faults")
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]string, len(parts))
+	for _, fid := range parts {
+		norm, err := faults.NormalizeID(fid)
+		if err != nil {
+			return nil, fmt.Errorf("benchmark: invalid fault %q: %w", fid, err)
+		}
+		canon := norm
+		if strings.ContainsRune(fid, '_') {
+			canon = fid
+		}
+		if prev, dup := seen[canon]; dup {
+			return nil, fmt.Errorf("benchmark: duplicate fault %q (conflicts with %q)", fid, prev)
+		}
+		seen[canon] = fid
+	}
+	return parts, nil
+}
+
+func decodeStrictJSONObject(data []byte, dst any) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return errors.New("expected JSON object")
+	}
+	dec := json.NewDecoder(bytes.NewReader(trimmed))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		return err
+	}
+	var trailing any
+	if err := dec.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err != nil {
+			return fmt.Errorf("trailing content: %w", err)
+		}
+		return errors.New("unexpected trailing JSON token")
+	}
+	return nil
+}
+
+func parseSpecStrict(specPath string, cfg *workload.Config) (hasKeyCount, hasValueBytes bool, err error) {
+	data, err := os.ReadFile(filepath.Clean(specPath))
+	if err != nil {
+		return false, false, fmt.Errorf("read spec: %w", err)
+	}
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return false, false, errors.New("parse spec: expected JSON object")
+	}
+	var rawMap map[string]json.RawMessage
+	decMap := json.NewDecoder(bytes.NewReader(trimmed))
+	if err := decMap.Decode(&rawMap); err != nil {
+		return false, false, fmt.Errorf("parse spec: %w", err)
+	}
+	var trailingMap any
+	if err := decMap.Decode(&trailingMap); !errors.Is(err, io.EOF) {
+		return false, false, errors.New("parse spec: unexpected trailing JSON token")
+	}
+	if _, ok := rawMap["key_count"]; ok {
+		hasKeyCount = true
+	}
+	if _, ok := rawMap["value_bytes"]; ok {
+		hasValueBytes = true
+	}
+	if err := decodeStrictJSONObject(trimmed, cfg); err != nil {
+		return false, false, fmt.Errorf("parse spec: %w", err)
+	}
+	return hasKeyCount, hasValueBytes, nil
+}
+
+type workloadFlagPtrs struct {
+	ops        *int
+	keyCount   *int
+	valueBytes *int
+	syncEvery  *int
+	flushEvery *int
+	compactAt  *int
+}
+
+func registerWorkloadFlags(fs *flag.FlagSet, defaults workload.Config) workloadFlagPtrs {
+	return workloadFlagPtrs{
+		ops:        fs.Int("ops", defaults.Operations, "operations per workload run"),
+		keyCount:   fs.Int("key-count", defaults.KeyCount, "distinct key count"),
+		valueBytes: fs.Int("value-bytes", defaults.ValueBytes, "payload value size in bytes"),
+		syncEvery:  fs.Int("sync-every", defaults.SyncEvery, "client barrier interval in operations (0 = disabled)"),
+		flushEvery: fs.Int("flush-every", defaults.FlushEvery, "memtable flush interval in operations (0 = disabled)"),
+		compactAt:  fs.Int("compact-at", defaults.CompactAt, "manual compaction trigger operation (0 = auto/disabled)"),
+	}
+}
+
+func applyWorkloadFlags(visited map[string]bool, wf workloadFlagPtrs, cfg *workload.Config) {
+	if visited["ops"] {
+		cfg.Operations = *wf.ops
+	}
+	if visited["key-count"] {
+		cfg.KeyCount = *wf.keyCount
+	}
+	if visited["value-bytes"] {
+		cfg.ValueBytes = *wf.valueBytes
+	}
+	if visited["sync-every"] {
+		cfg.SyncEvery = *wf.syncEvery
+	}
+	if visited["flush-every"] {
+		cfg.FlushEvery = *wf.flushEvery
+	}
+	if visited["compact-at"] {
+		cfg.CompactAt = *wf.compactAt
+	}
+}
+
 // ----------------------------------------------------------------------
 // record
 // ----------------------------------------------------------------------
 
 func runRecord(args []string) error {
-	fs := flag.NewFlagSet("record", flag.ExitOnError)
+	return runRecordWithWriters(args, os.Stdout, os.Stderr)
+}
+
+func runRecordWithWriters(args []string, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("record", flag.ContinueOnError)
+	fs.SetOutput(stderr)
 	specPath := fs.String("spec", "", "path to workload config JSON (e.g. experiments/configs/smoke.json)")
 	outDir := fs.String("out", "", "output run directory")
 	runDir := fs.String("run", "", "output run directory (alias for -out)")
@@ -139,27 +378,33 @@ func runRecord(args []string) error {
 	seedFlag := fs.Uint64("seed", 0, "workload and fault seed (overrides spec seed)")
 	walDropKFlag := fs.Int("wal-drop-k", 0, "drop strictly the k-th WAL sync for MUT-5")
 	dirDropKFlag := fs.Int("dir-drop-k", 0, "drop strictly the k-th directory sync for MUT-9")
+	wf := registerWorkloadFlags(fs, workload.DefaultConfig())
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-
-	var policies []int
-	for _, part := range strings.Split(*policiesFlag, ",") {
-		part = strings.TrimSpace(part)
-		if part == "" {
-			continue
-		}
-		p, err := strconv.Atoi(part)
-		if err != nil {
-			return fmt.Errorf("record: invalid policy %q: %w", part, err)
-		}
-		if p < 0 || p > 100 {
-			return fmt.Errorf("record: invalid policy %q (must be 0..100)", part)
-		}
-		policies = append(policies, p)
+	if fs.NArg() > 0 {
+		return fmt.Errorf("record: unexpected positional arguments: %v", fs.Args())
 	}
-	if len(policies) == 0 {
-		return errors.New("record: at least one retention policy required")
+
+	visited := make(map[string]bool)
+	fs.Visit(func(f *flag.Flag) {
+		visited[f.Name] = true
+	})
+
+	if *outDir != "" && *runDir != "" {
+		return errors.New("record: specify either -out or -run, not both")
+	}
+
+	policies, err := parsePoliciesFlag(*policiesFlag, "record")
+	if err != nil {
+		return err
+	}
+
+	if visited["wal-drop-k"] && *walDropKFlag <= 0 {
+		return fmt.Errorf("record: -wal-drop-k must be > 0, got %d", *walDropKFlag)
+	}
+	if visited["dir-drop-k"] && *dirDropKFlag <= 0 {
+		return fmt.Errorf("record: -dir-drop-k must be > 0, got %d", *dirDropKFlag)
 	}
 
 	targetDir := *outDir
@@ -172,36 +417,56 @@ func runRecord(args []string) error {
 	targetDir = filepath.Clean(targetDir)
 
 	cfg := workload.DefaultConfig()
+	var specHasKeyCount, specHasValueBytes bool
 	if *specPath != "" {
 		*specPath = filepath.Clean(*specPath)
-		data, err := os.ReadFile(*specPath)
+		specHasKeyCount, specHasValueBytes, err = parseSpecStrict(*specPath, &cfg)
 		if err != nil {
-			return fmt.Errorf("read spec: %w", err)
+			return err
 		}
-		dec := json.NewDecoder(bytes.NewReader(data))
-		dec.DisallowUnknownFields()
-		if err := dec.Decode(&cfg); err != nil {
-			return fmt.Errorf("parse spec: %w", err)
-		}
-	}
-	if *ingestEveryFlag > 0 {
-		cfg.IngestEvery = *ingestEveryFlag
-	}
-	if *ratchetAtFlag > 0 {
-		cfg.RatchetAt = *ratchetAtFlag
-	}
-	if *barrierIngestFlag {
-		cfg.BarrierIngest = true
-	}
-	if *presetFlag != "" {
-		cfg.Preset = *presetFlag
 	}
 
-	fs.Visit(func(f *flag.Flag) {
-		if f.Name == "seed" {
-			cfg.Seed = *seedFlag
+	applyWorkloadFlags(visited, wf, &cfg)
+	if visited["seed"] {
+		cfg.Seed = *seedFlag
+	}
+	if visited["ingest-every"] {
+		cfg.IngestEvery = *ingestEveryFlag
+	}
+	if visited["ratchet-at"] {
+		cfg.RatchetAt = *ratchetAtFlag
+	}
+	if visited["barrier-ingest"] {
+		cfg.BarrierIngest = *barrierIngestFlag
+	}
+	if visited["preset"] {
+		cfg.Preset = *presetFlag
+	}
+	if cfg.Preset != "" {
+		if !visited["key-count"] && !specHasKeyCount {
+			cfg.KeyCount = 0
 		}
-	})
+		if !visited["value-bytes"] && !specHasValueBytes {
+			cfg.ValueBytes = 0
+		}
+	}
+
+	dbDir, err := exp.NormalizeDBDir(cfg.Dir)
+	if err != nil {
+		return fmt.Errorf("record: invalid db dir: %w", err)
+	}
+	cfg.Dir = dbDir
+
+	normFault, err := faults.NormalizeID(*faultID)
+	if err != nil {
+		return fmt.Errorf("init fault %q: %w", *faultID, err)
+	}
+	if normFault == faults.MUT8 && cfg.CompactAt == 0 {
+		cfg.CompactAt = 80
+	}
+	if normFault == faults.MUT8 && cfg.CompactAt > cfg.Operations {
+		return fmt.Errorf("record: MUT-8 compact_at (%d) exceeds operations (%d); fault would not trigger", cfg.CompactAt, cfg.Operations)
+	}
 
 	if err := workload.Validate(cfg); err != nil {
 		return fmt.Errorf("validate config: %w", err)
@@ -215,10 +480,10 @@ func runRecord(args []string) error {
 	rec := vfsrec.New(mem)
 	fCfg := faults.DefaultConfig(*faultID)
 	fCfg.Seed = cfg.Seed
-	if *walDropKFlag > 0 {
+	if visited["wal-drop-k"] {
 		fCfg.WALDropK = *walDropKFlag
 	}
-	if *dirDropKFlag > 0 {
+	if visited["dir-drop-k"] {
 		fCfg.DirDropK = *dirDropKFlag
 	}
 	faultFS, err := faults.NewWithConfig(fCfg, rec)
@@ -227,10 +492,6 @@ func runRecord(args []string) error {
 	}
 	cfg.FS = faultFS
 
-	if *faultID == faults.MUT8 {
-		cfg.CompactAt = 80
-	}
-
 	listener := rec.EventListener()
 	opts := &pebble.Options{
 		FS:                          faultFS,
@@ -238,6 +499,7 @@ func runRecord(args []string) error {
 		MemTableSize:                64 * 1024,
 		EventListener:               &listener,
 		DisableAutomaticCompactions: true,
+		DisableTableStats:           true,
 		L0CompactionThreshold:       1000,
 		L0StopWritesThreshold:       1000,
 	}
@@ -248,18 +510,22 @@ func runRecord(args []string) error {
 		opts.FormatMajorVersion = pebble.FormatMinSupported
 	}
 
-	db, err := pebble.Open("db", opts)
+	db, err := pebble.Open(dbDir, opts)
 	if err != nil {
 		return fmt.Errorf("open pebble: %w", err)
 	}
 
 	rawHist, err := workload.Run(db, rec, cfg)
 	if err != nil {
-		_ = db.Close()
+		_, _ = safeCloseDB(db)
 		return fmt.Errorf("run workload: %w", err)
 	}
-	if err := db.Close(); err != nil {
-		return fmt.Errorf("close pebble: %w", err)
+	db.TestOnlyWaitForCleaning()
+	if panicked, closeErr := safeCloseDB(db); panicked || closeErr != nil {
+		if panicked {
+			return fmt.Errorf("close pebble panic: %w", closeErr)
+		}
+		return fmt.Errorf("close pebble: %w", closeErr)
 	}
 
 	traceEvents := rec.Events()
@@ -291,48 +557,26 @@ func runRecord(args []string) error {
 		GitCommit:     exp.CurrentGitCommit(),
 	}
 
-	// Write run.json
-	metaFile, err := os.Create(filepath.Join(targetDir, "run.json"))
-	if err != nil {
-		return fmt.Errorf("create run.json: %w", err)
+	// Write run.json, trace.json, history.json atomically
+	if err := writeFileAtomic(filepath.Join(targetDir, "run.json"), func(f *os.File) error {
+		enc := json.NewEncoder(f)
+		enc.SetIndent("", "  ")
+		return enc.Encode(meta)
+	}); err != nil {
+		return fmt.Errorf("write run.json: %w", err)
 	}
-	enc := json.NewEncoder(metaFile)
-	enc.SetIndent("", "  ")
-	if err := enc.Encode(meta); err != nil {
-		_ = metaFile.Close()
-		return fmt.Errorf("encode run.json: %w", err)
+	if err := writeFileAtomic(filepath.Join(targetDir, "trace.json"), func(f *os.File) error {
+		return trace.Encode(f, traceEvents)
+	}); err != nil {
+		return fmt.Errorf("write trace.json: %w", err)
 	}
-	if err := metaFile.Close(); err != nil {
-		return fmt.Errorf("close run.json: %w", err)
-	}
-
-	// Write trace.json
-	traceFile, err := os.Create(filepath.Join(targetDir, "trace.json"))
-	if err != nil {
-		return fmt.Errorf("create trace.json: %w", err)
-	}
-	if err := trace.Encode(traceFile, traceEvents); err != nil {
-		_ = traceFile.Close()
-		return fmt.Errorf("encode trace.json: %w", err)
-	}
-	if err := traceFile.Close(); err != nil {
-		return fmt.Errorf("close trace.json: %w", err)
+	if err := writeFileAtomic(filepath.Join(targetDir, "history.json"), func(f *os.File) error {
+		return history.Encode(f, correlated)
+	}); err != nil {
+		return fmt.Errorf("write history.json: %w", err)
 	}
 
-	// Write history.json
-	histFile, err := os.Create(filepath.Join(targetDir, "history.json"))
-	if err != nil {
-		return fmt.Errorf("create history.json: %w", err)
-	}
-	if err := history.Encode(histFile, correlated); err != nil {
-		_ = histFile.Close()
-		return fmt.Errorf("encode history.json: %w", err)
-	}
-	if err := histFile.Close(); err != nil {
-		return fmt.Errorf("close history.json: %w", err)
-	}
-
-	fmt.Printf("Recorded run %s (fault %s): %d events, %d history entries -> %s\n",
+	fmt.Fprintf(stdout, "Recorded run %s (fault %s): %d events, %d history entries -> %s\n",
 		meta.RunID, meta.FaultID, len(traceEvents), len(correlated), targetDir)
 	return nil
 }
@@ -342,11 +586,19 @@ func runRecord(args []string) error {
 // ----------------------------------------------------------------------
 
 func runPlan(args []string) error {
-	fs := flag.NewFlagSet("plan", flag.ExitOnError)
+	return runPlanWithWriters(args, os.Stdout, os.Stderr)
+}
+
+func runPlanWithWriters(args []string, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("plan", flag.ContinueOnError)
+	fs.SetOutput(stderr)
 	runDir := fs.String("run", "", "path to run directory")
 	rankingSeed := fs.Uint64("seed", 42, "ranking seed for randomized strategies")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("plan: unexpected positional arguments: %v", fs.Args())
 	}
 	if *runDir == "" {
 		return errors.New("plan: must specify -run directory")
@@ -358,26 +610,15 @@ func runPlan(args []string) error {
 		return err
 	}
 
-	policies := meta.Policies
-	if len(policies) == 0 {
-		policies = []int{0, 100}
-	}
-
-	universe, err := candidate.Build(traceEvents, meta.BaseSeed, policies)
+	universe, err := candidate.Build(traceEvents, meta.BaseSeed, meta.Policies)
 	if err != nil {
 		return fmt.Errorf("build universe: %w", err)
 	}
 
-	univFile, err := os.Create(filepath.Join(*runDir, "universe.json"))
-	if err != nil {
-		return fmt.Errorf("create universe.json: %w", err)
-	}
-	if err := candidate.Encode(univFile, universe); err != nil {
-		_ = univFile.Close()
-		return fmt.Errorf("encode universe.json: %w", err)
-	}
-	if err := univFile.Close(); err != nil {
-		return fmt.Errorf("close universe.json: %w", err)
+	if err := writeFileAtomic(filepath.Join(*runDir, "universe.json"), func(f *os.File) error {
+		return candidate.Encode(f, universe)
+	}); err != nil {
+		return fmt.Errorf("write universe.json: %w", err)
 	}
 
 	view, err := graph.Build(traceEvents)
@@ -424,20 +665,14 @@ func runPlan(args []string) error {
 		}
 
 		fname := fmt.Sprintf("ranking_%s.json", s.code)
-		rFile, err := os.Create(filepath.Join(*runDir, fname))
-		if err != nil {
-			return fmt.Errorf("create %s: %w", fname, err)
-		}
-		if err := exp.EncodeRanking(rFile, doc); err != nil {
-			_ = rFile.Close()
-			return fmt.Errorf("encode %s: %w", fname, err)
-		}
-		if err := rFile.Close(); err != nil {
-			return fmt.Errorf("close %s: %w", fname, err)
+		if err := writeFileAtomic(filepath.Join(*runDir, fname), func(f *os.File) error {
+			return exp.EncodeRanking(f, doc)
+		}); err != nil {
+			return fmt.Errorf("write %s: %w", fname, err)
 		}
 	}
 
-	fmt.Printf("Planned %d universe candidates with %d strategies -> %s\n",
+	fmt.Fprintf(stdout, "Planned %d universe candidates with %d strategies -> %s\n",
 		len(universe), len(strategies), *runDir)
 	return nil
 }
@@ -447,30 +682,48 @@ func runPlan(args []string) error {
 // ----------------------------------------------------------------------
 
 func runExploreCmd(args []string) error {
-	fs := flag.NewFlagSet("explore", flag.ExitOnError)
+	return runExploreCmdWithWriters(args, os.Stdout, os.Stderr)
+}
+
+func runExploreCmdWithWriters(args []string, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("explore", flag.ContinueOnError)
+	fs.SetOutput(stderr)
 	runDir := fs.String("run", "", "path to run directory")
 	timeout := fs.Duration("timeout", 5*time.Second, "per-candidate SafeOpen timeout")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("explore: unexpected positional arguments: %v", fs.Args())
+	}
 	if *runDir == "" {
 		return errors.New("explore: must specify -run directory")
 	}
+	if *timeout <= 0 {
+		return fmt.Errorf("explore: -timeout must be > 0, got %v", *timeout)
+	}
 	*runDir = filepath.Clean(*runDir)
 
-	_, traceEvents, histEntries, err := loadRunData(*runDir, true)
+	meta, traceEvents, histEntries, err := loadRunData(*runDir, true)
 	if err != nil {
 		return err
+	}
+
+	dbDir, err := exp.NormalizeDBDir(meta.Workload.Dir)
+	if err != nil {
+		return fmt.Errorf("explore: invalid workload dir in run.json: %w", err)
 	}
 
 	uFile, err := os.Open(filepath.Join(*runDir, "universe.json"))
 	if err != nil {
 		return fmt.Errorf("open universe.json: %w", err)
 	}
-	defer uFile.Close()
-	universe, err := candidate.Decode(uFile)
-	if err != nil {
-		return fmt.Errorf("decode universe.json: %w", err)
+	universe, decErr := candidate.Decode(uFile)
+	if cerr := uFile.Close(); cerr != nil && decErr == nil {
+		return fmt.Errorf("close universe.json: %w", cerr)
+	}
+	if decErr != nil {
+		return fmt.Errorf("decode universe.json: %w", decErr)
 	}
 
 	journalPath := filepath.Join(*runDir, "journal.ndjson")
@@ -478,7 +731,7 @@ func runExploreCmd(args []string) error {
 		Universe:    universe,
 		Events:      traceEvents,
 		History:     histEntries,
-		Dir:         "db",
+		Dir:         dbDir,
 		Timeout:     *timeout,
 		JournalPath: journalPath,
 	})
@@ -486,20 +739,14 @@ func runExploreCmd(args []string) error {
 		return fmt.Errorf("run explore: %w", err)
 	}
 
-	// Write outcomes.json
-	outFile, err := os.Create(filepath.Join(*runDir, "outcomes.json"))
-	if err != nil {
-		return fmt.Errorf("create outcomes.json: %w", err)
-	}
-	if err := exp.EncodeOutcomes(outFile, universe, res.Outcomes); err != nil {
-		_ = outFile.Close()
-		return fmt.Errorf("encode outcomes.json: %w", err)
-	}
-	if err := outFile.Close(); err != nil {
-		return fmt.Errorf("close outcomes.json: %w", err)
+	// Write outcomes.json atomically so errors do not truncate prior outputs.
+	if err := writeFileAtomic(filepath.Join(*runDir, "outcomes.json"), func(f *os.File) error {
+		return exp.EncodeOutcomes(f, universe, res.Outcomes)
+	}); err != nil {
+		return fmt.Errorf("write outcomes.json: %w", err)
 	}
 
-	fmt.Printf("Explored %d candidates in %v: valid=%d, viol=%d, open_err=%d, panic=%d, hang=%d, oracle_err=%d\n",
+	fmt.Fprintf(stdout, "Explored %d candidates in %v: valid=%d, viol=%d, open_err=%d, panic=%d, hang=%d, oracle_err=%d\n",
 		res.Summary.TotalCandidates, res.Summary.TotalTime,
 		res.Summary.Valid, res.Summary.Violations, res.Summary.OpenErrors,
 		res.Summary.Panics, res.Summary.Hangs, res.Summary.OracleErrors)
@@ -511,7 +758,12 @@ func runExploreCmd(args []string) error {
 // ----------------------------------------------------------------------
 
 func runEvaluate(args []string) error {
-	fs := flag.NewFlagSet("evaluate", flag.ExitOnError)
+	return runEvaluateWithWriters(args, os.Stdout, os.Stderr)
+}
+
+func runEvaluateWithWriters(args []string, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("evaluate", flag.ContinueOnError)
+	fs.SetOutput(stderr)
 	runDir := fs.String("run", "", "path to run directory")
 	budgetsFlag := fs.String("budgets", "", "comma-separated budgets (e.g. 0,1,5,10,25,50,100)")
 	discoveryOut := fs.String("discovery", "", "optional path for the discovery-curve CSV (B0 averaged over fixed seeds)")
@@ -519,6 +771,14 @@ func runEvaluate(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("evaluate: unexpected positional arguments: %v", fs.Args())
+	}
+	visited := make(map[string]bool)
+	fs.Visit(func(f *flag.Flag) {
+		visited[f.Name] = true
+	})
+
 	if *runDir == "" {
 		return errors.New("evaluate: must specify -run directory")
 	}
@@ -533,15 +793,26 @@ func runEvaluate(args []string) error {
 		return errors.New("evaluate: -discovery and -plot must be given together")
 	}
 
+	var customBudgets []int
+	if visited["budgets"] {
+		var err error
+		customBudgets, err = parseBudgetsFlag(*budgetsFlag)
+		if err != nil {
+			return err
+		}
+	}
+
 	// Load universe.
 	uFile, err := os.Open(filepath.Join(*runDir, "universe.json"))
 	if err != nil {
 		return fmt.Errorf("open universe.json: %w", err)
 	}
-	defer uFile.Close()
-	universe, err := candidate.Decode(uFile)
-	if err != nil {
-		return fmt.Errorf("decode universe.json: %w", err)
+	universe, decErr := candidate.Decode(uFile)
+	if cerr := uFile.Close(); cerr != nil && decErr == nil {
+		return fmt.Errorf("close universe.json: %w", cerr)
+	}
+	if decErr != nil {
+		return fmt.Errorf("decode universe.json: %w", decErr)
 	}
 
 	// Load outcomes.
@@ -549,23 +820,19 @@ func runEvaluate(args []string) error {
 	if err != nil {
 		return fmt.Errorf("open outcomes.json: %w", err)
 	}
-	defer oFile.Close()
-	outcomes, err := exp.DecodeOutcomes(oFile)
-	if err != nil {
-		return fmt.Errorf("decode outcomes.json: %w", err)
+	outcomes, decErr := exp.DecodeOutcomes(oFile)
+	if cerr := oFile.Close(); cerr != nil && decErr == nil {
+		return fmt.Errorf("close outcomes.json: %w", cerr)
+	}
+	if decErr != nil {
+		return fmt.Errorf("decode outcomes.json: %w", decErr)
 	}
 	outcomes = exp.NormalizeTable(outcomes)
 
 	// Determine budgets.
 	var budgets []int
-	if *budgetsFlag != "" {
-		for _, part := range strings.Split(*budgetsFlag, ",") {
-			val, err := strconv.Atoi(strings.TrimSpace(part))
-			if err != nil {
-				return fmt.Errorf("invalid budget %q: %w", part, err)
-			}
-			budgets = append(budgets, val)
-		}
+	if visited["budgets"] {
+		budgets = customBudgets
 	} else {
 		// Default budget sequence up to universe size.
 		steps := []int{0, 1, 5, 10, 25, 50, 100, 250, 500, 1000, 2000, len(universe)}
@@ -578,31 +845,33 @@ func runEvaluate(args []string) error {
 		}
 	}
 
-	// Find ranking files.
-	matches, err := filepath.Glob(filepath.Join(*runDir, "ranking_*.json"))
-	if err != nil || len(matches) == 0 {
+	// Find ranking files without glob metacharacter issues.
+	dirEntries, err := os.ReadDir(*runDir)
+	if err != nil {
+		return fmt.Errorf("read run directory %s: %w", *runDir, err)
+	}
+	var matches []string
+	for _, entry := range dirEntries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if strings.HasPrefix(name, "ranking_") && strings.HasSuffix(name, ".json") {
+			matches = append(matches, filepath.Join(*runDir, name))
+		}
+	}
+	if len(matches) == 0 {
 		return fmt.Errorf("no ranking_*.json files found in %s", *runDir)
 	}
 
-	csvFile, err := os.Create(filepath.Join(*runDir, "curves.csv"))
-	if err != nil {
-		return fmt.Errorf("create curves.csv: %w", err)
+	type evaluatedRankingDoc struct {
+		doc       exp.RankingDocument
+		points    []exp.Point
+		positions exp.Positions
 	}
-	defer csvFile.Close()
-
-	w := csv.NewWriter(csvFile)
-	defer w.Flush()
-
-	if err := w.Write([]string{"strategy", "budget", "tested", "failures", "distinct_bugs"}); err != nil {
-		return err
-	}
-
-	fmt.Println("Strategy evaluation curves:")
-	fmt.Printf("%-18s %-8s %-8s %-10s %-14s\n", "Strategy", "Budget", "Tested", "Failures", "DistinctBugs")
-	fmt.Println(strings.Repeat("-", 62))
-
+	evaluatedDocs := make([]evaluatedRankingDoc, 0, len(matches))
 	for _, rPath := range matches {
-		rDoc, err := func() (doc exp.RankingDocument, err error) {
+		doc, err := func() (doc exp.RankingDocument, err error) {
 			rFile, err := os.Open(rPath)
 			if err != nil {
 				return doc, fmt.Errorf("open %s: %w", rPath, err)
@@ -619,46 +888,105 @@ func runEvaluate(args []string) error {
 			return fmt.Errorf("decode %s: %w", rPath, err)
 		}
 
-		points, err := exp.Evaluate(universe, rDoc.Candidates, outcomes, budgets)
+		points, err := exp.Evaluate(universe, doc.Candidates, outcomes, budgets)
 		if err != nil {
-			return fmt.Errorf("evaluate %s: %w", rDoc.Strategy, err)
+			return fmt.Errorf("evaluate %s: %w", doc.Strategy, err)
 		}
 
-		for _, p := range points {
-			record := []string{
-				rDoc.Strategy,
-				strconv.Itoa(p.Budget),
-				strconv.Itoa(p.Tested),
-				strconv.Itoa(p.Failures),
-				strconv.Itoa(p.DistinctBugs),
+		pos, err := exp.DiscoveryPositions(universe, doc.Candidates, outcomes)
+		if err != nil {
+			return fmt.Errorf("positions %s: %w", doc.Strategy, err)
+		}
+
+		evaluatedDocs = append(evaluatedDocs, evaluatedRankingDoc{
+			doc:       doc,
+			points:    points,
+			positions: pos,
+		})
+	}
+
+	randPos, err := exp.RandomPositions(universe, outcomes, exp.RandomSeeds())
+	if err != nil {
+		return fmt.Errorf("random positions: %w", err)
+	}
+
+	curvesPath := filepath.Join(*runDir, "curves.csv")
+	if err := writeFileAtomic(curvesPath, func(f *os.File) error {
+		w := csv.NewWriter(f)
+		w.UseCRLF = false
+		if err := w.Write([]string{"strategy", "budget", "tested", "failures", "distinct_bugs"}); err != nil {
+			return err
+		}
+		for _, item := range evaluatedDocs {
+			for _, p := range item.points {
+				record := []string{
+					item.doc.Strategy,
+					strconv.Itoa(p.Budget),
+					strconv.Itoa(p.Tested),
+					strconv.Itoa(p.Failures),
+					strconv.Itoa(p.DistinctBugs),
+				}
+				if err := w.Write(record); err != nil {
+					return err
+				}
 			}
-			if err := w.Write(record); err != nil {
+		}
+		w.Flush()
+		return w.Error()
+	}); err != nil {
+		return fmt.Errorf("write curves.csv: %w", err)
+	}
+
+	fmt.Fprintln(stdout, "Strategy evaluation curves:")
+	fmt.Fprintf(stdout, "%-18s %-8s %-8s %-10s %-14s\n", "Strategy", "Budget", "Tested", "Failures", "DistinctBugs")
+	fmt.Fprintln(stdout, strings.Repeat("-", 62))
+	for _, item := range evaluatedDocs {
+		for _, p := range item.points {
+			fmt.Fprintf(stdout, "%-18s %-8d %-8d %-10d %-14d\n",
+				item.doc.Strategy, p.Budget, p.Tested, p.Failures, p.DistinctBugs)
+		}
+	}
+	fmt.Fprintf(stdout, "\nSaved discovery curves to %s\n", curvesPath)
+
+	positionsPath := filepath.Join(*runDir, "positions.csv")
+	if err := writeFileAtomic(positionsPath, func(f *os.File) error {
+		w := csv.NewWriter(f)
+		w.UseCRLF = false
+		if err := w.Write([]string{"strategy", "first_failure", "first_failure_p10", "first_failure_p90",
+			"all_kinds", "all_kinds_p10", "all_kinds_p90", "failure_kinds"}); err != nil {
+			return err
+		}
+		itoa := strconv.Itoa
+		for _, item := range evaluatedDocs {
+			p := item.positions
+			if err := w.Write([]string{item.doc.Strategy, itoa(p.FirstFailure), itoa(p.FirstFailure), itoa(p.FirstFailure),
+				itoa(p.AllKinds), itoa(p.AllKinds), itoa(p.AllKinds), itoa(p.Kinds)}); err != nil {
 				return err
 			}
-			fmt.Printf("%-18s %-8d %-8d %-10d %-14d\n",
-				rDoc.Strategy, p.Budget, p.Tested, p.Failures, p.DistinctBugs)
 		}
+		if err := w.Write([]string{fmt.Sprintf("random_x%d", randPos.Seeds), itoa(randPos.FirstMedian), itoa(randPos.FirstP10), itoa(randPos.FirstP90),
+			itoa(randPos.AllKindsMedian), itoa(randPos.AllKindsP10), itoa(randPos.AllKindsP90), itoa(randPos.Kinds)}); err != nil {
+			return err
+		}
+		w.Flush()
+		return w.Error()
+	}); err != nil {
+		return fmt.Errorf("write positions.csv: %w", err)
 	}
-
-	w.Flush()
-	if err := w.Error(); err != nil {
-		return fmt.Errorf("flush curves.csv: %w", err)
-	}
-	if err := csvFile.Close(); err != nil {
-		return fmt.Errorf("close curves.csv: %w", err)
-	}
-
-	fmt.Printf("\nSaved discovery curves to %s\n", filepath.Join(*runDir, "curves.csv"))
-
-	if err := writePositions(*runDir, universe, outcomes, matches); err != nil {
-		return err
-	}
+	fmt.Fprintf(stdout, "Saved discovery positions to %s\n", positionsPath)
 
 	if *discoveryOut != "" {
-		if _, err := exp.GenerateG4Artifacts(*runDir, *discoveryOut, *plotOut); err != nil {
-			return fmt.Errorf("generate discovery artifacts: %w", err)
+		if visited["budgets"] {
+			if _, err := exp.GenerateG4ArtifactsWithBudgets(*runDir, *discoveryOut, *plotOut, budgets); err != nil {
+				return fmt.Errorf("generate discovery artifacts: %w", err)
+			}
+		} else {
+			if _, err := exp.GenerateG4Artifacts(*runDir, *discoveryOut, *plotOut); err != nil {
+				return fmt.Errorf("generate discovery artifacts: %w", err)
+			}
 		}
-		fmt.Printf("Saved discovery CSV to %s and plot to %s\n", *discoveryOut, *plotOut)
+		fmt.Fprintf(stderr, "Note: -discovery/-plot generates canonical Gate G4 curves (B0 averaged over fixed seeds plus B4, B5, B6); all evaluated strategies are saved in curves.csv.\n")
+		fmt.Fprintf(stdout, "Saved discovery CSV to %s and plot to %s\n", *discoveryOut, *plotOut)
 	}
 	return nil
 }
@@ -668,26 +996,41 @@ func runEvaluate(args []string) error {
 // ----------------------------------------------------------------------
 
 func loadRunData(dir string, loadHistory bool) (*RunMetadata, []trace.Event, []history.Entry, error) {
-	metaFile, err := os.Open(filepath.Join(dir, "run.json"))
+	metaBytes, err := os.ReadFile(filepath.Join(dir, "run.json"))
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("open run.json: %w", err)
 	}
-	defer metaFile.Close()
-
 	var meta RunMetadata
-	if err := json.NewDecoder(metaFile).Decode(&meta); err != nil {
+	if err := decodeStrictJSONObject(metaBytes, &meta); err != nil {
 		return nil, nil, nil, fmt.Errorf("decode run.json: %w", err)
+	}
+	if meta.SchemaVersion != exp.Version {
+		return nil, nil, nil, fmt.Errorf("decode run.json: unsupported or missing schema_version %d", meta.SchemaVersion)
+	}
+	if len(meta.Policies) == 0 {
+		return nil, nil, nil, errors.New("decode run.json: policies cannot be empty")
+	}
+	seenPolicy := make(map[int]bool, len(meta.Policies))
+	for _, p := range meta.Policies {
+		if p < 0 || p > 100 {
+			return nil, nil, nil, fmt.Errorf("decode run.json: invalid policy %d (must be 0..100)", p)
+		}
+		if seenPolicy[p] {
+			return nil, nil, nil, fmt.Errorf("decode run.json: duplicate policy %d", p)
+		}
+		seenPolicy[p] = true
 	}
 
 	traceFile, err := os.Open(filepath.Join(dir, "trace.json"))
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("open trace.json: %w", err)
 	}
-	defer traceFile.Close()
-
-	events, err := trace.Decode(traceFile)
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf("decode trace.json: %w", err)
+	events, decErr := trace.Decode(traceFile)
+	if cerr := traceFile.Close(); cerr != nil && decErr == nil {
+		return nil, nil, nil, fmt.Errorf("close trace.json: %w", cerr)
+	}
+	if decErr != nil {
+		return nil, nil, nil, fmt.Errorf("decode trace.json: %w", decErr)
 	}
 
 	var hist []history.Entry
@@ -696,82 +1039,16 @@ func loadRunData(dir string, loadHistory bool) (*RunMetadata, []trace.Event, []h
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("open history.json: %w", err)
 		}
-		defer histFile.Close()
-
-		hist, err = history.Decode(histFile)
-		if err != nil {
-			return nil, nil, nil, fmt.Errorf("decode history.json: %w", err)
+		hist, decErr = history.Decode(histFile)
+		if cerr := histFile.Close(); cerr != nil && decErr == nil {
+			return nil, nil, nil, fmt.Errorf("close history.json: %w", cerr)
+		}
+		if decErr != nil {
+			return nil, nil, nil, fmt.Errorf("decode history.json: %w", decErr)
 		}
 	}
 
 	return &meta, events, hist, nil
-}
-
-// writePositions records, for every stored ranking and for random order over
-// fixed seeds, the position of the first failure and the position at which
-// every failure kind has appeared.
-//
-// Format Note: For deterministic strategies (e.g. B1..B6, RHG, DCG), a single ranking
-// is evaluated, so p10 and p90 columns are written identically to the point estimate
-// (first_failure and all_kinds) because the variance across repeated evaluations is zero.
-// In contrast, randomized strategies (e.g. random_x100) report actual empirical p10/p90
-// quantiles computed over multiple random seeds.
-func writePositions(runDir string, universe []candidate.Candidate, outcomes []oracle.Outcome, rankingPaths []string) error {
-	path := filepath.Join(runDir, "positions.csv")
-	file, err := os.Create(path)
-	if err != nil {
-		return fmt.Errorf("create positions.csv: %w", err)
-	}
-	defer file.Close()
-	w := csv.NewWriter(file)
-	if err := w.Write([]string{"strategy", "first_failure", "first_failure_p10", "first_failure_p90",
-		"all_kinds", "all_kinds_p10", "all_kinds_p90", "failure_kinds"}); err != nil {
-		return err
-	}
-	itoa := strconv.Itoa
-	for _, rPath := range rankingPaths {
-		doc, err := func() (doc exp.RankingDocument, err error) {
-			rFile, err := os.Open(rPath)
-			if err != nil {
-				return doc, err
-			}
-			defer func() {
-				if cerr := rFile.Close(); cerr != nil && err == nil {
-					err = fmt.Errorf("close %s: %w", rPath, cerr)
-				}
-			}()
-			doc, err = exp.DecodeRanking(rFile)
-			return doc, err
-		}()
-		if err != nil {
-			return fmt.Errorf("decode %s: %w", rPath, err)
-		}
-		p, err := exp.DiscoveryPositions(universe, doc.Candidates, outcomes)
-		if err != nil {
-			return fmt.Errorf("positions %s: %w", doc.Strategy, err)
-		}
-		if err := w.Write([]string{doc.Strategy, itoa(p.FirstFailure), itoa(p.FirstFailure), itoa(p.FirstFailure),
-			itoa(p.AllKinds), itoa(p.AllKinds), itoa(p.AllKinds), itoa(p.Kinds)}); err != nil {
-			return err
-		}
-	}
-	r, err := exp.RandomPositions(universe, outcomes, exp.RandomSeeds())
-	if err != nil {
-		return fmt.Errorf("random positions: %w", err)
-	}
-	if err := w.Write([]string{fmt.Sprintf("random_x%d", r.Seeds), itoa(r.FirstMedian), itoa(r.FirstP10), itoa(r.FirstP90),
-		itoa(r.AllKindsMedian), itoa(r.AllKindsP10), itoa(r.AllKindsP90), itoa(r.Kinds)}); err != nil {
-		return err
-	}
-	w.Flush()
-	if err := w.Error(); err != nil {
-		return err
-	}
-	if err := file.Close(); err != nil {
-		return fmt.Errorf("close positions.csv: %w", err)
-	}
-	fmt.Printf("Saved discovery positions to %s\n", path)
-	return nil
 }
 
 // ----------------------------------------------------------------------
@@ -779,10 +1056,14 @@ func writePositions(runDir string, universe []candidate.Candidate, outcomes []or
 // ----------------------------------------------------------------------
 
 func runBenchmarkCmd(args []string) error {
-	fs := flag.NewFlagSet("benchmark", flag.ExitOnError)
+	return runBenchmarkCmdWithWriters(args, os.Stdout, os.Stderr)
+}
+
+func runBenchmarkCmdWithWriters(args []string, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("benchmark", flag.ContinueOnError)
+	fs.SetOutput(stderr)
 	seedsFlag := fs.String("seeds", "", "comma-separated workload seeds")
 	faultsFlag := fs.String("faults", "", "comma-separated fault IDs")
-	opsFlag := fs.Int("ops", 120, "operations per workload run")
 	policiesFlag := fs.String("policies", "", "comma-separated retention percentages (default: 0,100)")
 	maxManifestSizeFlag := fs.Int64("max-manifest-size", 0, "optional MaxManifestFileSize in bytes")
 	reportFlag := fs.String("report", "", "path to output empirical markdown report")
@@ -794,70 +1075,87 @@ func runBenchmarkCmd(args []string) error {
 	ratchetAt := fs.Int("ratchet-at", 0, "ratchet format major version at operation N (0 = disabled)")
 	barrierIngestFlag := fs.Bool("barrier-ingest", false, "execute WAL sync barrier prior to db.Ingest")
 	presetFlag := fs.String("preset", "", "workload diversity preset (ycsb-a, ycsb-b, ycsb-f, overwrite-heavy, delete-heavy)")
+	walDropKFlag := fs.Int("wal-drop-k", 0, "drop strictly the k-th WAL sync for MUT-5")
+	dirDropKFlag := fs.Int("dir-drop-k", 0, "drop strictly the k-th directory sync for MUT-9")
+
+	cfg := exp.DefaultMultiSeedBenchmarkConfig()
+	wf := registerWorkloadFlags(fs, cfg.Workload)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("benchmark: unexpected positional arguments: %v", fs.Args())
+	}
 
-	cfg := exp.DefaultMultiSeedBenchmarkConfig()
+	visited := make(map[string]bool)
+	fs.Visit(func(f *flag.Flag) {
+		visited[f.Name] = true
+	})
 
-	cfg.Workload.Operations = *opsFlag
-	cfg.Workload.CheckpointAt = *checkpointAt
-	if *ingestEvery > 0 {
+	applyWorkloadFlags(visited, wf, &cfg.Workload)
+	if visited["checkpoint-at"] {
+		cfg.Workload.CheckpointAt = *checkpointAt
+	}
+	if visited["ingest-every"] {
 		cfg.Workload.IngestEvery = *ingestEvery
 	}
-	if *ratchetAt > 0 {
+	if visited["ratchet-at"] {
 		cfg.Workload.RatchetAt = *ratchetAt
 	}
-	if *barrierIngestFlag {
-		cfg.Workload.BarrierIngest = true
+	if visited["barrier-ingest"] {
+		cfg.Workload.BarrierIngest = *barrierIngestFlag
 	}
-	if *presetFlag != "" {
+	if visited["preset"] {
 		cfg.Workload.Preset = *presetFlag
 	}
-	cfg.TrackMUT0 = *controlFlag
-
-	if *policiesFlag != "" {
-		var policies []int
-		for _, part := range strings.Split(*policiesFlag, ",") {
-			part = strings.TrimSpace(part)
-			if part == "" {
-				continue
-			}
-			p, err := strconv.Atoi(part)
-			if err != nil || p < 0 || p > 100 {
-				return fmt.Errorf("invalid policy %q: must be integer in 0..100", part)
-			}
-			policies = append(policies, p)
+	if visited["control"] {
+		cfg.TrackMUT0 = *controlFlag
+	}
+	if visited["max-manifest-size"] {
+		cfg.Workload.MaxManifestFileSize = *maxManifestSizeFlag
+	}
+	if cfg.Workload.Preset != "" {
+		if !visited["key-count"] {
+			cfg.Workload.KeyCount = 0
 		}
-		if len(policies) == 0 {
-			return errors.New("benchmark: at least one retention policy required when -policies specified")
+		if !visited["value-bytes"] {
+			cfg.Workload.ValueBytes = 0
+		}
+	}
+
+	if visited["wal-drop-k"] {
+		if *walDropKFlag <= 0 {
+			return fmt.Errorf("benchmark: -wal-drop-k must be > 0, got %d", *walDropKFlag)
+		}
+		cfg.WALDropK = *walDropKFlag
+	}
+	if visited["dir-drop-k"] {
+		if *dirDropKFlag <= 0 {
+			return fmt.Errorf("benchmark: -dir-drop-k must be > 0, got %d", *dirDropKFlag)
+		}
+		cfg.DirDropK = *dirDropKFlag
+	}
+
+	if visited["policies"] {
+		policies, err := parsePoliciesFlag(*policiesFlag, "benchmark")
+		if err != nil {
+			return err
 		}
 		cfg.Policies = policies
 	}
 
-	if *maxManifestSizeFlag > 0 {
-		cfg.Workload.MaxManifestFileSize = *maxManifestSizeFlag
-	}
-
-	if *seedsFlag != "" {
-		var seeds []uint64
-		for _, part := range strings.Split(*seedsFlag, ",") {
-			s, err := strconv.ParseUint(strings.TrimSpace(part), 10, 64)
-			if err != nil {
-				return fmt.Errorf("invalid seed %q: %w", part, err)
-			}
-			seeds = append(seeds, s)
+	if visited["seeds"] {
+		seeds, err := parseSeedsFlag(*seedsFlag)
+		if err != nil {
+			return err
 		}
 		cfg.WorkloadSeeds = seeds
 	}
 
-	if *faultsFlag != "" {
-		var fids []string
-		for _, part := range strings.Split(*faultsFlag, ",") {
-			fid := strings.TrimSpace(part)
-			if fid != "" {
-				fids = append(fids, fid)
-			}
+	if visited["faults"] {
+		fids, err := parseFaultsFlag(*faultsFlag)
+		if err != nil {
+			return err
 		}
 		cfg.FaultIDs = fids
 	}
@@ -877,11 +1175,11 @@ func runBenchmarkCmd(args []string) error {
 		targetPerSeedCSV = ""
 	}
 
-	fmt.Printf("Starting Multi-Seed Benchmark across %d seeds and %d faults (%d ops/run)...\n",
+	fmt.Fprintf(stderr, "Starting Multi-Seed Benchmark across %d seeds and %d faults (%d ops/run)...\n",
 		len(cfg.WorkloadSeeds), len(cfg.FaultIDs), cfg.Workload.Operations)
 
 	res, err := exp.RunBenchmark(cfg, func(msg string) {
-		fmt.Println(msg)
+		fmt.Fprintln(stderr, msg)
 	})
 	if err != nil {
 		return fmt.Errorf("run benchmark: %w", err)
@@ -894,7 +1192,7 @@ func runBenchmarkCmd(args []string) error {
 		if err := exp.WriteMultiSeedReportToFile(res, targetReport); err != nil {
 			return fmt.Errorf("write report: %w", err)
 		}
-		fmt.Printf("Generated empirical report -> %s\n", targetReport)
+		fmt.Fprintf(stderr, "Generated empirical report -> %s\n", targetReport)
 	}
 
 	if targetCSV != "" {
@@ -904,7 +1202,7 @@ func runBenchmarkCmd(args []string) error {
 		if err := exp.WriteMultiSeedCSV(res, targetCSV); err != nil {
 			return fmt.Errorf("write csv: %w", err)
 		}
-		fmt.Printf("Generated summary CSV -> %s\n", targetCSV)
+		fmt.Fprintf(stderr, "Generated summary CSV -> %s\n", targetCSV)
 	}
 
 	if targetPerSeedCSV != "" {
@@ -914,13 +1212,13 @@ func runBenchmarkCmd(args []string) error {
 		if err := exp.WriteMultiSeedPerSeedCSV(res, targetPerSeedCSV); err != nil {
 			return fmt.Errorf("write per-seed csv: %w", err)
 		}
-		fmt.Printf("Generated per-seed CSV -> %s\n", targetPerSeedCSV)
+		fmt.Fprintf(stderr, "Generated per-seed CSV -> %s\n", targetPerSeedCSV)
 	}
 
 	if targetReport == "" && targetCSV == "" && targetPerSeedCSV == "" {
-		fmt.Println("\n" + exp.GenerateMultiSeedReportMarkdown(res))
+		fmt.Fprint(stdout, exp.GenerateMultiSeedReportMarkdown(res))
 	}
 
-	fmt.Printf("Benchmark completed successfully in %v.\n", res.TotalDuration)
+	fmt.Fprintf(stderr, "Benchmark completed successfully in %v.\n", res.TotalDuration)
 	return nil
 }

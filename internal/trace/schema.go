@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"path"
 	"sort"
 	"strings"
@@ -166,6 +167,15 @@ func Validate(events []Event) error {
 		if read && int64(event.Len) > event.Size {
 			return fmt.Errorf("event %d: read exceeds requested size", event.ID)
 		}
+		if write && event.Off > math.MaxInt64-int64(event.Len) {
+			return fmt.Errorf("event %d: write range overflows int64", event.ID)
+		}
+		if read && (event.Off > math.MaxInt64-int64(event.Len) || event.Off > math.MaxInt64-event.Size) {
+			return fmt.Errorf("event %d: read range overflows int64", event.ID)
+		}
+		if preallocate && event.Off > math.MaxInt64-event.Size {
+			return fmt.Errorf("event %d: preallocate range overflows int64", event.ID)
+		}
 		if event.Kind != KindLink && event.Kind != KindRename && event.Kind != KindReuseForWrite && event.File2 != "" {
 			return fmt.Errorf("event %d: unexpected second path", event.ID)
 		}
@@ -204,13 +214,19 @@ func Validate(events []Event) error {
 				if event.Handle != 0 || event.Created {
 					return fmt.Errorf("event %d: failed open returned a handle", event.ID)
 				}
-				if event.File == "" || (event.Kind == KindReuseForWrite && event.File2 == "") {
+				if event.Kind != KindOpenDir && event.Dir {
+					return fmt.Errorf("event %d: non-directory kind cannot have dir=true", event.ID)
+				}
+				if event.Kind == KindOpenDir && !event.Dir {
+					return fmt.Errorf("event %d: OpenDir must have dir=true", event.ID)
+				}
+				if (event.Kind != KindOpenDir && event.File == "") || (event.Kind == KindReuseForWrite && event.File2 == "") {
 					return fmt.Errorf("event %d: missing file path for failed open", event.ID)
 				}
 				continue
 			}
 			if event.Handle != lastHandle+1 || (event.Kind == KindOpenDir && !event.Dir) ||
-				((event.Kind == KindCreate || event.Kind == KindLock) && event.Dir) ||
+				(event.Kind != KindOpenDir && event.Dir) ||
 				(!event.Dir && event.File == "") || (event.Kind == KindReuseForWrite && event.File2 == "") {
 				return fmt.Errorf("event %d: invalid new handle", event.ID)
 			}
@@ -254,8 +270,7 @@ func Validate(events []Event) error {
 			if event.Handle != 0 || event.Dir {
 				return fmt.Errorf("event %d: namespace event contains handle fields", event.ID)
 			}
-			if event.Err == "" && (event.File == "" ||
-				((event.Kind == KindLink || event.Kind == KindRename) && event.File2 == "")) {
+			if event.File == "" || ((event.Kind == KindLink || event.Kind == KindRename) && event.File2 == "") {
 				return fmt.Errorf("event %d: missing namespace path", event.ID)
 			}
 		default:

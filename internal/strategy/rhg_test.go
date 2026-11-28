@@ -204,13 +204,42 @@ func TestRHGWeightsValidation(t *testing.T) {
 func TestRHGByNameRegistration(t *testing.T) {
 	aliases := []string{"rhg", "b7", "risk_horizon", "risk-horizon"}
 	for _, name := range aliases {
-		strat, err := strategy.ByName(name, 42, strategy.DefaultWeights())
+		strat, err := strategy.ByName(name, 42)
 		if err != nil {
 			t.Fatalf("ByName(%q) returned error: %v", name, err)
 		}
 		if strat == nil || strat.Name() != "rhg" {
 			t.Fatalf("ByName(%q) = %+v, want strat with Name() == 'rhg'", name, strat)
 		}
+	}
+
+	// Verify ByName without weights preserves DefaultRHGWeights {3,4,2,1},
+	// whereas explicit DefaultWeights() sets {1,1,1,1}.
+	// Candidate 1 has high Risk (normRisk=1.0), 0 Barrier; Candidate 2 has 0 Risk, 0.7 Barrier.
+	// With DefaultRHGWeights (Risk=3, Barrier=4): C1 = 3.0+1 = 4.0 > C2 = 2.8+1 = 3.8 -> C1 first.
+	// With DefaultWeights (Risk=1, Barrier=1): C1 = 1.0+1 = 2.0 > C2 = 0.7+1 = 1.7;
+	// pick Barrier=0.8 so: DefaultRHG: 3*1.0=3.0 vs 4*0.8=3.2 (C2 first!); {1,1,1,1}: 1*1.0=1.0 vs 1*0.8=0.8 (C1 first!).
+	view := syntheticView(map[uint64]graph.Features{
+		1: {StateKey: "A", NextBarrier: 10, RiskScore: 10.0, BarrierProximity: 0.0},
+		2: {StateKey: "B", NextBarrier: 20, RiskScore: 0.0, BarrierProximity: 0.8},
+	})
+	univ := []candidate.Candidate{
+		{Event: 1, Percent: 0, Seed: 1},
+		{Event: 2, Percent: 0, Seed: 2},
+	}
+	defStrat, err := strategy.ByName("rhg", 42)
+	if err != nil {
+		t.Fatalf("ByName(rhg) failed: %v", err)
+	}
+	if got := defStrat.Rank(view, univ); got[0].Event != 2 {
+		t.Fatalf("ByName(rhg) did not use DefaultRHGWeights {3,4,2,1}: got event %d first, want 2", got[0].Event)
+	}
+	customStrat, err := strategy.ByName("rhg", 42, strategy.DefaultWeights())
+	if err != nil {
+		t.Fatalf("ByName(rhg, DefaultWeights) failed: %v", err)
+	}
+	if got := customStrat.Rank(view, univ); got[0].Event != 1 {
+		t.Fatalf("ByName(rhg, DefaultWeights) did not apply explicit {1,1,1,1}: got event %d first, want 1", got[0].Event)
 	}
 }
 
@@ -233,14 +262,18 @@ func TestRHGExplainAudit(t *testing.T) {
 		t.Fatalf("records length %d != universe %d", len(records), len(universe))
 	}
 
+	w := strategy.DefaultRHGWeights()
+	const maxRisk = 10.0 // Event 1 (only 0% representative)
+	const maxSem = 10.0
 	repCount := 0
 	nonRepCount := 0
 	for i, r := range records {
 		if r.Rank != i {
 			t.Errorf("record %d has Rank %d", i, r.Rank)
 		}
-		if r.Score <= 0 {
-			t.Errorf("record %d has invalid Score %f, want > 0", i, r.Score)
+		wantScore := w.Risk*(r.RiskScore/maxRisk) + w.Barrier*r.BarrierProximity + w.Semantic*(r.SemanticWeight/maxSem) + w.Novelty*r.Novelty
+		if math.Abs(r.Score-wantScore) > 1e-12 {
+			t.Errorf("record %d Score = %v, want exact %v", i, r.Score, wantScore)
 		}
 		if r.IsRepresentative {
 			repCount++
@@ -253,5 +286,173 @@ func TestRHGExplainAudit(t *testing.T) {
 	}
 	if nonRepCount != 1 {
 		t.Errorf("expected 1 non-representative, got %d", nonRepCount)
+	}
+}
+
+func TestRHGNormalizationExcludesTail100AndNonFinite(t *testing.T) {
+	// Event 3 (100% only) has huge RiskScore 10000; it must NOT skew maxRisk for 0% reps.
+	// Event 1 uses legacy Desc=10 (RiskScore=0) while Event 2 has RiskScore=5.
+	// maxRisk over 0% reps must be 10.0 (from Event 1's Desc fallback), not 10000.0 or 1.0!
+	view := syntheticView(map[uint64]graph.Features{
+		1: {StateKey: "A", NextBarrier: 10, Desc: 10, BarrierProximity: 0.2},
+		2: {StateKey: "B", NextBarrier: 20, RiskScore: 5.0, BarrierProximity: 0.4},
+		3: {StateKey: "C", NextBarrier: 30, RiskScore: 10000.0, BarrierProximity: 1.0},
+	})
+	univ := []candidate.Candidate{
+		{Event: 1, Percent: 0, Seed: 1},
+		{Event: 2, Percent: 0, Seed: 2},
+		{Event: 3, Percent: 100, Seed: 3},
+	}
+
+	records, err := strategy.ExplainRHG(view, univ)
+	if err != nil {
+		t.Fatalf("ExplainRHG failed: %v", err)
+	}
+	w := strategy.DefaultRHGWeights()
+	// Event 1: normRisk=1.0 -> 3*1 + 4*0.2 + 1 = 4.8
+	// Event 2: normRisk=0.5 -> 3*0.5 + 4*0.4 + 1 = 4.1
+	if records[0].Candidate.Event != 1 || records[1].Candidate.Event != 2 {
+		t.Fatalf("expected Event 1 then Event 2, got %+v", records)
+	}
+	if math.Abs(records[0].Score-(w.Risk*1.0+w.Barrier*0.2+w.Novelty)) > 1e-12 {
+		t.Fatalf("Event 1 score = %v, want %v", records[0].Score, w.Risk*1.0+w.Barrier*0.2+w.Novelty)
+	}
+	if records[0].RiskScore != 10.0 {
+		t.Fatalf("Event 1 effective RiskScore = %v, want 10.0", records[0].RiskScore)
+	}
+
+	// Non-finite +Inf / NaN RiskScore in 0% pool must not produce NaN for finite candidates
+	// or turn maxRisk to +Inf.
+	viewInf := syntheticView(map[uint64]graph.Features{
+		1: {StateKey: "A", NextBarrier: 10, RiskScore: math.Inf(1), BarrierProximity: 0.5},
+		2: {StateKey: "B", NextBarrier: 20, RiskScore: 4.0, BarrierProximity: 0.5},
+		3: {StateKey: "C", NextBarrier: 30, RiskScore: math.NaN(), BarrierProximity: 0.5},
+	})
+	univInf := []candidate.Candidate{
+		{Event: 1, Percent: 0, Seed: 1},
+		{Event: 2, Percent: 0, Seed: 2},
+		{Event: 3, Percent: 0, Seed: 3},
+	}
+	recInf, err := strategy.ExplainRHG(viewInf, univInf)
+	if err != nil {
+		t.Fatalf("ExplainRHG (+Inf/NaN) failed: %v", err)
+	}
+	// Event 1 (+Inf) ranks first, Event 2 (finite 4.0 -> normRisk=1.0) second, Event 3 (NaN) last.
+	if recInf[0].Candidate.Event != 1 || recInf[1].Candidate.Event != 2 || recInf[2].Candidate.Event != 3 {
+		t.Fatalf("unexpected +Inf/NaN ranking order: %+v", recInf)
+	}
+	if math.IsNaN(recInf[0].Score) || !math.IsInf(recInf[0].Score, 1) {
+		t.Fatalf("Event 1 (+Inf) score = %v, want +Inf (not NaN)", recInf[0].Score)
+	}
+	if math.IsNaN(recInf[1].Score) || math.Abs(recInf[1].Score-(w.Risk*1.0+w.Barrier*0.5+w.Novelty)) > 1e-12 {
+		t.Fatalf("Event 2 finite score corrupted: got %v", recInf[1].Score)
+	}
+}
+
+func TestRHGLegacyFallbackRepSelectionAndNaN(t *testing.T) {
+	// Events 1, 2, 3 share (StateKey: "A", NextBarrier: 10, Percent: 0) and equal BarrierProximity=1.0.
+	// Event 1 has NaN RiskScore; Event 2 has Desc=2 (legacy Risk fallback); Event 3 has Desc=5.
+	// Event 3 must be selected as representative regardless of slice order.
+	view := syntheticView(map[uint64]graph.Features{
+		1: {StateKey: "A", NextBarrier: 10, BarrierProximity: 1.0, RiskScore: math.NaN()},
+		2: {StateKey: "A", NextBarrier: 10, BarrierProximity: 1.0, Desc: 2, Semantic: 1},
+		3: {StateKey: "A", NextBarrier: 10, BarrierProximity: 1.0, Desc: 5, Semantic: 0},
+	})
+	univ := []candidate.Candidate{
+		{Event: 1, Percent: 0, Seed: 1},
+		{Event: 2, Percent: 0, Seed: 2},
+		{Event: 3, Percent: 0, Seed: 3},
+	}
+	records, err := strategy.ExplainRHG(view, univ)
+	if err != nil {
+		t.Fatalf("ExplainRHG failed: %v", err)
+	}
+	if !records[0].IsRepresentative || records[0].Candidate.Event != 3 {
+		t.Fatalf("expected Event 3 (highest Desc fallback) as representative, got %+v", records[0])
+	}
+	if records[0].RiskScore != 5.0 || records[2].SemanticWeight != 2.0 {
+		t.Fatalf("expected effective fallback values recorded in RHGScoreRecord, got rec0=%+v rec2=%+v", records[0], records[2])
+	}
+
+	// Semantic fallback tie-break when bp and risk match (BeforeBoundary=true fallback bp=1.0).
+	viewSem := syntheticView(map[uint64]graph.Features{
+		1: {StateKey: "A", NextBarrier: 10, BeforeBoundary: true, Semantic: 0},
+		2: {StateKey: "A", NextBarrier: 10, BeforeBoundary: true, Semantic: 1},
+	})
+	univSem := []candidate.Candidate{
+		{Event: 1, Percent: 0, Seed: 1},
+		{Event: 2, Percent: 0, Seed: 2},
+	}
+	recSem, err := strategy.ExplainRHG(viewSem, univSem)
+	if err != nil {
+		t.Fatalf("ExplainRHG sem fallback failed: %v", err)
+	}
+	if recSem[0].Candidate.Event != 2 || recSem[0].BarrierProximity != 1.0 || recSem[0].SemanticWeight != 2.0 {
+		t.Fatalf("expected Event 2 with effective bp=1.0, semW=2.0, got %+v", recSem[0])
+	}
+}
+
+func TestRHGPartialRetentionMultiEpochAndDuplicates(t *testing.T) {
+	// Partial retention: 0% must precede 25%, which must precede 50%, which must precede 100%,
+	// even when 100% has an earlier Event ID.
+	// Also test multi-epoch novelty decay: two 0% reps share StateKey "A" across epochs 10 and 20.
+	view := syntheticView(map[uint64]graph.Features{
+		1: {StateKey: "A", NextBarrier: 10, BarrierProximity: 1.0, RiskScore: 10.0},
+		2: {StateKey: "A", NextBarrier: 20, BarrierProximity: 1.0, RiskScore: 10.0},
+	})
+	univ := []candidate.Candidate{
+		{Event: 1, Percent: 100, Seed: 1},
+		{Event: 2, Percent: 50, Seed: 2},
+		{Event: 1, Percent: 25, Seed: 3},
+		{Event: 1, Percent: 0, Seed: 4},
+		{Event: 2, Percent: 0, Seed: 5},
+	}
+	records, err := strategy.ExplainRHG(view, univ)
+	if err != nil {
+		t.Fatalf("ExplainRHG failed: %v", err)
+	}
+	gotOrder := make([]int, len(records))
+	for i, r := range records {
+		gotOrder[i] = r.Candidate.Percent
+	}
+	wantOrder := []int{0, 0, 25, 50, 100}
+	if !reflect.DeepEqual(gotOrder, wantOrder) {
+		t.Fatalf("percent order = %v, want %v", gotOrder, wantOrder)
+	}
+	if records[0].Novelty != 1.0 || records[1].Novelty != 0.0 {
+		t.Fatalf("multi-epoch novelty decay failed: rec0.Novelty=%v, rec1.Novelty=%v", records[0].Novelty, records[1].Novelty)
+	}
+
+	// Duplicate universe must return nil from Rank and error from ExplainRHG.
+	dupUniv := []candidate.Candidate{
+		{Event: 1, Percent: 0, Seed: 1},
+		{Event: 1, Percent: 0, Seed: 1},
+	}
+	if got := strategy.NewRiskHorizon().Rank(view, dupUniv); got != nil {
+		t.Fatalf("expected nil on duplicate universe, got %+v", got)
+	}
+	if _, err := strategy.ExplainRHG(view, dupUniv); err == nil {
+		t.Fatal("expected error from ExplainRHG on duplicate universe")
+	}
+
+	// Multiple NaN scores in scored 0% representative pool must break ties deterministically
+	// via canonical position in scoreHeap.Less regardless of input order.
+	viewMultiNaN := syntheticView(map[uint64]graph.Features{
+		1: {StateKey: "A", NextBarrier: 10, RiskScore: math.NaN(), BarrierProximity: 0.5},
+		2: {StateKey: "B", NextBarrier: 20, RiskScore: math.NaN(), BarrierProximity: 0.5},
+		3: {StateKey: "C", NextBarrier: 30, RiskScore: 5.0, BarrierProximity: 0.5},
+	})
+	fwd := strategy.NewRiskHorizon().Rank(viewMultiNaN, []candidate.Candidate{
+		{Event: 1, Percent: 0, Seed: 1},
+		{Event: 2, Percent: 0, Seed: 2},
+		{Event: 3, Percent: 0, Seed: 3},
+	})
+	rev := strategy.NewRiskHorizon().Rank(viewMultiNaN, []candidate.Candidate{
+		{Event: 3, Percent: 0, Seed: 3},
+		{Event: 2, Percent: 0, Seed: 2},
+		{Event: 1, Percent: 0, Seed: 1},
+	})
+	if fwd[0].Event != 3 || fwd[1].Event != 1 || fwd[2].Event != 2 || !reflect.DeepEqual(fwd, rev) {
+		t.Fatalf("multi-NaN scoreHeap tie-breaking failed: fwd=%+v rev=%+v", fwd, rev)
 	}
 }

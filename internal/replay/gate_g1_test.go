@@ -3,9 +3,11 @@ package replay_test
 import (
 	"bytes"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand/v2"
+	"os"
 	"sort"
 	"testing"
 	"time"
@@ -21,10 +23,11 @@ import (
 func run1000OpWorkload(t *testing.T, recFS *vfsrec.FS) {
 	listener := recFS.EventListener()
 	opts := &pebble.Options{
-		FS:            recFS,
-		Logger:        recovery.PanicLogger{},
-		MemTableSize:  64 * 1024,
-		EventListener: &listener,
+		FS:                          recFS,
+		Logger:                      recovery.PanicLogger{},
+		MemTableSize:                64 * 1024,
+		DisableAutomaticCompactions: true,
+		EventListener:               &listener,
 	}
 
 	db, err := pebble.Open("db", opts)
@@ -142,12 +145,17 @@ func TestGateG1(t *testing.T) {
 		t.Fatalf("Gate G1: expected >= 20 cuts, got %d", len(cuts))
 	}
 
-	// Pick 20 seeded cutoffs.
+	// Pick 20 seeded cutoffs (excluding the final tail cuts so minor background cleaner
+	// variance at db.Close cannot place a chosen cut past the live trace length).
+	pool := cuts
+	if len(pool) > 30 {
+		pool = cuts[:len(cuts)-10]
+	}
 	rng := rand.New(rand.NewPCG(42, 1))
-	perm := rng.Perm(len(cuts))
+	perm := rng.Perm(len(pool))
 	chosenCuts := make([]uint64, 20)
 	for i := 0; i < 20; i++ {
-		chosenCuts[i] = cuts[perm[i]]
+		chosenCuts[i] = pool[perm[i]]
 	}
 	sort.Slice(chosenCuts, func(i, j int) bool { return chosenCuts[i] < chosenCuts[j] })
 	targetSet := make(map[uint64]bool, 20)
@@ -155,28 +163,53 @@ func TestGateG1(t *testing.T) {
 		targetSet[c] = true
 	}
 
-	// Step 2: Live recording pass with SetHook to snapshot live 100% clone at chosen cuts.
+	// Step 2: Live recording pass with SetHook to snapshot live 0% and 100% clones at chosen cuts.
 	memLive := vfs.NewCrashableMem()
 	recLive := vfsrec.New(memLive)
-	liveDigests := make(map[uint64]map[string][32]byte, 20)
+	liveDigests0 := make(map[uint64]map[string][32]byte, 20)
+	liveDigests100 := make(map[uint64]map[string][32]byte, 20)
+	var hookErr error
+
+	digestClone := func(fs vfs.FS) (map[string][32]byte, error) {
+		d, err := computeFSDigest(fs, "db")
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				// db directory may not exist yet at early cutoffs.
+				return make(map[string][32]byte), nil
+			}
+			return nil, err
+		}
+		return d, nil
+	}
 
 	recLive.SetHook(func(id uint64) {
 		if targetSet[id] {
-			// Take live 100% clone snapshot with mutex held.
-			clone := memLive.CrashClone(vfs.CrashCloneCfg{
+			// Take live 0% and 100% clone snapshots with mutex held.
+			clone0 := memLive.CrashClone(vfs.CrashCloneCfg{UnsyncedDataPercent: 0})
+			d0, err := digestClone(clone0)
+			if err != nil && hookErr == nil {
+				hookErr = fmt.Errorf("cut %d live 0%% digest: %w", id, err)
+				return
+			}
+			liveDigests0[id] = d0
+
+			clone100 := memLive.CrashClone(vfs.CrashCloneCfg{
 				UnsyncedDataPercent: 100,
 				RNG:                 rand.New(rand.NewPCG(0, id)),
 			})
-			d, err := computeFSDigest(clone, "db")
-			if err != nil {
-				// db directory may not exist yet at early cutoffs.
-				d = make(map[string][32]byte)
+			d100, err := digestClone(clone100)
+			if err != nil && hookErr == nil {
+				hookErr = fmt.Errorf("cut %d live 100%% digest: %w", id, err)
+				return
 			}
-			liveDigests[id] = d
+			liveDigests100[id] = d100
 		}
 	})
 
 	run1000OpWorkload(t, recLive)
+	if hookErr != nil {
+		t.Fatalf("Gate G1: hook error: %v", hookErr)
+	}
 	liveEvents := recLive.Events()
 	if err := trace.Validate(liveEvents); err != nil {
 		t.Fatalf("Gate G1: live trace validation failed: %v", err)
@@ -192,6 +225,12 @@ func TestGateG1(t *testing.T) {
 	var totalReplayCloneDur time.Duration
 
 	for _, cut := range chosenCuts {
+		liveDigest0, ok0 := liveDigests0[cut]
+		liveDigest100, ok100 := liveDigests100[cut]
+		if !ok0 || !ok100 {
+			t.Fatalf("Gate G1: missing live snapshot for cut %d (len=%d)", cut, len(liveEvents))
+		}
+
 		start := time.Now()
 
 		state, err := replay.Build(liveEvents, cut)
@@ -199,25 +238,74 @@ func TestGateG1(t *testing.T) {
 			t.Fatalf("replay.Build at cut %d: %v", cut, err)
 		}
 
+		replayedClone0, err := state.Clone(0, cut)
+		if err != nil {
+			_ = state.Close()
+			t.Fatalf("state.Clone(0) at cut %d: %v", cut, err)
+		}
+
+		replayedClone50a, err := state.Clone(50, cut)
+		if err != nil {
+			_ = state.Close()
+			t.Fatalf("state.Clone(50) at cut %d: %v", cut, err)
+		}
+		replayedClone50b, err := state.Clone(50, cut)
+		if err != nil {
+			_ = state.Close()
+			t.Fatalf("state.Clone(50) repeat at cut %d: %v", cut, err)
+		}
+
 		replayedClone, err := state.Clone(100, cut)
 		if err != nil {
 			_ = state.Close()
-			t.Fatalf("state.Clone at cut %d: %v", cut, err)
+			t.Fatalf("state.Clone(100) at cut %d: %v", cut, err)
 		}
-		_ = state.Close()
+		if err := state.Close(); err != nil {
+			t.Fatalf("state.Close at cut %d: %v", cut, err)
+		}
 
 		dur := time.Since(start)
 		totalReplayCloneDur += dur
 
-		// Verify byte-for-byte equality against live clone digest.
-		replayedDigest, err := computeFSDigest(replayedClone, "db")
+		// Verify 0% byte-for-byte equality against live 0% clone digest.
+		replayedDigest0, err := digestClone(replayedClone0)
 		if err != nil {
-			replayedDigest = make(map[string][32]byte)
+			t.Fatalf("Gate G1: replayed 0%% digest at cut %d: %v", cut, err)
+		}
+		if ok, diff := digestsEqual(liveDigest0, replayedDigest0); !ok {
+			t.Fatalf("Gate G1: 0%% byte-for-byte mismatch at cut %d: %s", cut, diff)
 		}
 
-		liveDigest := liveDigests[cut]
-		if ok, diff := digestsEqual(liveDigest, replayedDigest); !ok {
-			t.Fatalf("Gate G1: byte-for-byte mismatch at cut %d: %s", cut, diff)
+		// Verify 50% deterministic seed reproducibility and path containment (0% <= 50% <= 100%).
+		replayedDigest50a, err := digestClone(replayedClone50a)
+		if err != nil {
+			t.Fatalf("Gate G1: replayed 50%% digest at cut %d: %v", cut, err)
+		}
+		replayedDigest50b, err := digestClone(replayedClone50b)
+		if err != nil {
+			t.Fatalf("Gate G1: replayed 50%% repeat digest at cut %d: %v", cut, err)
+		}
+		if ok, diff := digestsEqual(replayedDigest50a, replayedDigest50b); !ok {
+			t.Fatalf("Gate G1: 50%% non-deterministic at cut %d: %s", cut, diff)
+		}
+
+		// Verify 100% byte-for-byte equality against live 100% clone digest.
+		replayedDigest, err := digestClone(replayedClone)
+		if err != nil {
+			t.Fatalf("Gate G1: replayed 100%% digest at cut %d: %v", cut, err)
+		}
+		if ok, diff := digestsEqual(liveDigest100, replayedDigest); !ok {
+			t.Fatalf("Gate G1: 100%% byte-for-byte mismatch at cut %d: %s", cut, diff)
+		}
+		for p := range replayedDigest0 {
+			if _, ok := replayedDigest50a[p]; !ok {
+				t.Fatalf("Gate G1: path %q in Clone(0) missing from Clone(50) at cut %d", p, cut)
+			}
+		}
+		for p := range replayedDigest50a {
+			if _, ok := replayedDigest[p]; !ok {
+				t.Fatalf("Gate G1: path %q in Clone(50) missing from Clone(100) at cut %d", p, cut)
+			}
 		}
 
 		// Verify recovery via recovery.SafeOpen.

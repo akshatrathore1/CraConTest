@@ -29,6 +29,12 @@ func TestRealDiskCleanClose(t *testing.T) {
 	if err != nil {
 		t.Fatalf("pebble.Open: %v", err)
 	}
+	closed := false
+	defer func() {
+		if !closed {
+			_ = db.Close()
+		}
+	}()
 
 	for i := 0; i < 200; i++ {
 		if i == 100 {
@@ -43,6 +49,7 @@ func TestRealDiskCleanClose(t *testing.T) {
 		}
 	}
 
+	closed = true
 	if err := db.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
@@ -61,7 +68,12 @@ func TestRealDiskCleanClose(t *testing.T) {
 	if res.DB == nil {
 		t.Fatal("SafeOpen returned nil DB")
 	}
-	defer res.DB.Close()
+	resClosed := false
+	defer func() {
+		if !resClosed {
+			_ = res.DB.Close()
+		}
+	}()
 
 	if err := recovery.CheckIntegrity(res.DB); err != nil {
 		t.Fatalf("CheckIntegrity: %v", err)
@@ -70,6 +82,10 @@ func TestRealDiskCleanClose(t *testing.T) {
 	contents, err := recovery.DumpContents(res.DB)
 	if err != nil {
 		t.Fatalf("DumpContents: %v", err)
+	}
+	resClosed = true
+	if err := res.DB.Close(); err != nil {
+		t.Fatalf("Close recovered DB: %v", err)
 	}
 
 	if len(contents) != 200 {
@@ -89,9 +105,11 @@ func TestRealDiskCleanClose(t *testing.T) {
 	}
 }
 
-// TestRealDiskChildProcessKill verifies crash recovery when a process writing
-// synced keys exits abruptly without calling Close. The parent process recovers
-// the database using SafeOpen and verifies full data integrity.
+// TestRealDiskChildProcessKill verifies recovery after abrupt process termination
+// (os.Exit(3) without calling Close) on a real-disk filesystem after pebble.Sync
+// writes. Because os.Exit flushes nothing at the Pebble layer while leaving OS
+// page-cache behavior intact, kernel-power-loss simulation is handled separately
+// by MemFS crash clones.
 func TestRealDiskChildProcessKill(t *testing.T) {
 	if os.Getenv("CRACONTEST_TEST_CHILD") == "1" {
 		dir := os.Getenv("CRACONTEST_TEST_DIR")
@@ -153,7 +171,12 @@ func TestRealDiskChildProcessKill(t *testing.T) {
 	if res.DB == nil {
 		t.Fatal("SafeOpen returned nil DB")
 	}
-	defer res.DB.Close()
+	resClosed := false
+	defer func() {
+		if !resClosed {
+			_ = res.DB.Close()
+		}
+	}()
 
 	if err := recovery.CheckIntegrity(res.DB); err != nil {
 		t.Fatalf("CheckIntegrity: %v", err)
@@ -162,6 +185,10 @@ func TestRealDiskChildProcessKill(t *testing.T) {
 	contents, err := recovery.DumpContents(res.DB)
 	if err != nil {
 		t.Fatalf("DumpContents: %v", err)
+	}
+	resClosed = true
+	if err := res.DB.Close(); err != nil {
+		t.Fatalf("Close recovered DB: %v", err)
 	}
 
 	if len(contents) != 200 {

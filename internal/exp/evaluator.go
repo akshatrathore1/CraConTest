@@ -4,15 +4,29 @@ package exp
 
 import (
 	"bytes"
+	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/akshatrathore1/CraConTest/internal/candidate"
 	"github.com/akshatrathore1/CraConTest/internal/oracle"
 )
+
+var (
+	tableTokenRe        = regexp.MustCompile(`\b(?:table|sstable|sst)\b|\.sst\b`)
+	numOrHexTokens      = regexp.MustCompile(`0x[0-9a-fA-F]+|[0-9]+`)
+	cleanOpenErrTokenRe = regexp.MustCompile(`^[a-z0-9]+(?:_[a-z0-9]+)*$`)
+)
+
+func isFailureClass(c oracle.Class) bool {
+	return c == oracle.ClassViolation || c == oracle.ClassOpenError || c == oracle.ClassPanic || c == oracle.ClassHang
+}
 
 // Version is the schema version of outcome and ranking documents.
 const Version = 1
@@ -60,7 +74,7 @@ type RankingDocument struct {
 // ValidateTable checks that outcomes forms a valid, complete outcome table for universe:
 // - Outcomes matches universe length and canonical ordering 1:1.
 // - Each outcome has a valid Class.
-// - Violation outcomes have non-empty Rule and valid v1: hex SHA-256 Signature.
+// - Violation outcomes have non-empty Rule and Signature prefixed with v1:.
 // - Valid outcomes have empty Rule and Signature.
 // - oracle_error outcomes are rejected as an unusable run.
 func ValidateTable(universe []candidate.Candidate, outcomes []oracle.Outcome) error {
@@ -123,23 +137,16 @@ func ValidateTable(universe []candidate.Candidate, outcomes []oracle.Outcome) er
 	return nil
 }
 
-// Evaluate computes the discovery curve Points for the given ranking and budgets against outcomes.
-// - Re-execution of candidates and strategy observation of the table are strictly forbidden.
-// - Budgets must be unique, nonnegative, <= len(universe), and strictly increasing.
-// - ranking must be a valid permutation of universe without duplicates or foreign candidates.
-// - Failures counts violations, open_errors, panics, and hangs.
-// - DistinctBugs counts unique nonempty signatures of violation, open_error, panic, and hang outcomes.
-func Evaluate(universe, ranking []candidate.Candidate, outcomes []oracle.Outcome, budgets []int) ([]Point, error) {
+func prepareEvaluation(caller string, universe, ranking []candidate.Candidate, outcomes []oracle.Outcome) (map[candidate.Candidate]oracle.Outcome, error) {
 	outcomes = NormalizeTable(outcomes)
 	if err := ValidateTable(universe, outcomes); err != nil {
-		return nil, fmt.Errorf("evaluate: %w", err)
+		return nil, fmt.Errorf("%s: %w", caller, err)
 	}
 
 	if len(ranking) != len(universe) {
-		return nil, fmt.Errorf("evaluate: ranking length %d != universe length %d", len(ranking), len(universe))
+		return nil, fmt.Errorf("%s: ranking length %d != universe length %d", caller, len(ranking), len(universe))
 	}
 
-	// Validate ranking permutation.
 	universeSet := make(map[candidate.Candidate]bool, len(universe))
 	for _, c := range universe {
 		universeSet[c] = true
@@ -147,12 +154,31 @@ func Evaluate(universe, ranking []candidate.Candidate, outcomes []oracle.Outcome
 	rankingSeen := make(map[candidate.Candidate]bool, len(ranking))
 	for _, c := range ranking {
 		if !universeSet[c] {
-			return nil, fmt.Errorf("evaluate: ranking contains foreign candidate %+v", c)
+			return nil, fmt.Errorf("%s: ranking contains foreign candidate %+v", caller, c)
 		}
 		if rankingSeen[c] {
-			return nil, fmt.Errorf("evaluate: ranking contains duplicate candidate %+v", c)
+			return nil, fmt.Errorf("%s: ranking contains duplicate candidate %+v", caller, c)
 		}
 		rankingSeen[c] = true
+	}
+
+	outcomeMap := make(map[candidate.Candidate]oracle.Outcome, len(outcomes))
+	for _, o := range outcomes {
+		outcomeMap[o.Candidate] = o
+	}
+	return outcomeMap, nil
+}
+
+// Evaluate computes the discovery curve Points for the given ranking and budgets against outcomes.
+// - Re-execution of candidates and strategy observation of the table are strictly forbidden.
+// - Budgets must be unique, nonnegative, <= len(universe), and strictly increasing.
+// - ranking must be a valid permutation of universe without duplicates or foreign candidates.
+// - Failures counts violations, open_errors, panics, and hangs.
+// - DistinctBugs counts unique nonempty signatures of violation, open_error, panic, and hang outcomes.
+func Evaluate(universe, ranking []candidate.Candidate, outcomes []oracle.Outcome, budgets []int) ([]Point, error) {
+	outcomeMap, err := prepareEvaluation("evaluate", universe, ranking, outcomes)
+	if err != nil {
+		return nil, err
 	}
 
 	// Validate budgets.
@@ -168,11 +194,6 @@ func Evaluate(universe, ranking []candidate.Candidate, outcomes []oracle.Outcome
 		}
 	}
 
-	outcomeMap := make(map[candidate.Candidate]oracle.Outcome, len(outcomes))
-	for _, o := range outcomes {
-		outcomeMap[o.Candidate] = o
-	}
-
 	points := make([]Point, 0, len(budgets))
 	failures := 0
 	seenBugs := make(map[string]bool)
@@ -180,35 +201,11 @@ func Evaluate(universe, ranking []candidate.Candidate, outcomes []oracle.Outcome
 	for _, b := range budgets {
 		for _, c := range ranking[prevB:b] {
 			o := outcomeMap[c]
-			switch o.Class {
-			case oracle.ClassViolation:
+			if isFailureClass(o.Class) {
 				failures++
-				if o.Signature != "" && !seenBugs[o.Signature] {
+				if o.Signature != "" {
 					seenBugs[o.Signature] = true
 				}
-			case oracle.ClassOpenError:
-				failures++
-				if o.Signature != "" && !seenBugs[o.Signature] {
-					seenBugs[o.Signature] = true
-				}
-			case oracle.ClassPanic:
-				failures++
-				if o.Signature != "" && !seenBugs[o.Signature] {
-					seenBugs[o.Signature] = true
-				}
-			case oracle.ClassHang:
-				failures++
-				sig := o.Signature
-				if sig == "" && o.Detail != "" {
-					sig = FormatHangSignature(o.Detail)
-				} else if sig == "" {
-					sig = "v1:hang:timeout"
-				}
-				if !seenBugs[sig] {
-					seenBugs[sig] = true
-				}
-			case oracle.ClassValid:
-				// no failure
 			}
 		}
 		prevB = b
@@ -230,18 +227,18 @@ func NormalizeOpenErrorReason(detail string) string {
 	s = strings.TrimPrefix(s, "v1:open_error:")
 	lower := strings.ToLower(s)
 	switch {
-	case strings.Contains(lower, "not exist") || strings.Contains(lower, "no such file"):
+	case strings.Contains(lower, "not exist") || strings.Contains(lower, "no such file") || strings.Contains(lower, "not found"):
 		return "not_exist"
 	case strings.Contains(lower, "checksum"):
 		return "checksum_mismatch"
 	case strings.Contains(lower, "manifest"):
 		return "manifest_corrupt"
+	case tableTokenRe.MatchString(lower):
+		return "table_corrupt"
 	case strings.Contains(lower, "eof"):
 		return "unexpected_eof"
 	case strings.Contains(lower, "nil db"):
 		return "nil_db"
-	case strings.Contains(lower, "table") || strings.Contains(lower, "sst"):
-		return "table_corrupt"
 	case strings.Contains(lower, "timeout") || strings.Contains(lower, "timed out"):
 		return "timeout"
 	case strings.Contains(lower, "corrupt"):
@@ -260,11 +257,11 @@ func NormalizeOpenErrorReason(detail string) string {
 			}
 		}
 		res := strings.Trim(b.String(), "_")
+		if len(res) > 32 {
+			res = strings.TrimRight(res[:32], "_")
+		}
 		if res == "" {
 			return "unknown"
-		}
-		if len(res) > 32 {
-			res = res[:32]
 		}
 		return res
 	}
@@ -273,38 +270,35 @@ func NormalizeOpenErrorReason(detail string) string {
 // FormatOpenErrorSignature constructs a deterministic, normalized signature v1:open_error:<reason>.
 func FormatOpenErrorSignature(reason string) string {
 	if strings.HasPrefix(reason, "v1:open_error:") {
-		return reason
+		suffix := strings.TrimPrefix(reason, "v1:open_error:")
+		if cleanOpenErrTokenRe.MatchString(suffix) && len(suffix) <= 32 {
+			return reason
+		}
+		reason = suffix
 	}
 	norm := NormalizeOpenErrorReason(reason)
-	return fmt.Sprintf("v1:open_error:%s", norm)
+	return "v1:open_error:" + norm
+}
+
+func normalizeReasonSignature(prefix, reason, fallback string) string {
+	s := strings.TrimSpace(reason)
+	s = strings.TrimPrefix(s, prefix)
+	s = strings.TrimSpace(s)
+	norm := numOrHexTokens.ReplaceAllString(s, "N")
+	if norm == "" {
+		norm = fallback
+	}
+	return prefix + norm
 }
 
 // FormatPanicSignature constructs a deterministic, normalized signature v1:panic:<reason>.
 func FormatPanicSignature(reason string) string {
-	if strings.HasPrefix(reason, "v1:panic:") {
-		return reason
-	}
-	s := strings.TrimSpace(reason)
-	s = strings.TrimPrefix(s, "v1:panic:")
-	norm := digitRuns.ReplaceAllString(s, "N")
-	if norm == "" {
-		norm = "unknown"
-	}
-	return fmt.Sprintf("v1:panic:%s", norm)
+	return normalizeReasonSignature("v1:panic:", reason, "unknown")
 }
 
 // FormatHangSignature constructs a deterministic, normalized signature v1:hang:<reason>.
 func FormatHangSignature(reason string) string {
-	if strings.HasPrefix(reason, "v1:hang:") {
-		return reason
-	}
-	s := strings.TrimSpace(reason)
-	s = strings.TrimPrefix(s, "v1:hang:")
-	norm := digitRuns.ReplaceAllString(s, "N")
-	if norm == "" {
-		norm = "timeout"
-	}
-	return fmt.Sprintf("v1:hang:%s", norm)
+	return normalizeReasonSignature("v1:hang:", reason, "timeout")
 }
 
 // NormalizeOutcome ensures that an outcome with ClassOpenError, ClassPanic, or ClassHang has a deterministic,
@@ -318,7 +312,7 @@ func NormalizeOutcome(o oracle.Outcome) oracle.Outcome {
 				reason = "unknown"
 			}
 			o.Signature = FormatOpenErrorSignature(reason)
-		} else if !strings.HasPrefix(o.Signature, "v1:") {
+		} else if !strings.HasPrefix(o.Signature, "v1:") || strings.HasPrefix(o.Signature, "v1:open_error:") {
 			o.Signature = FormatOpenErrorSignature(o.Signature)
 		}
 	case oracle.ClassPanic:
@@ -328,7 +322,7 @@ func NormalizeOutcome(o oracle.Outcome) oracle.Outcome {
 				reason = "unknown"
 			}
 			o.Signature = FormatPanicSignature(reason)
-		} else if !strings.HasPrefix(o.Signature, "v1:") {
+		} else if !strings.HasPrefix(o.Signature, "v1:") || strings.HasPrefix(o.Signature, "v1:panic:") {
 			o.Signature = FormatPanicSignature(o.Signature)
 		}
 	case oracle.ClassHang:
@@ -338,14 +332,14 @@ func NormalizeOutcome(o oracle.Outcome) oracle.Outcome {
 				reason = "timeout"
 			}
 			o.Signature = FormatHangSignature(reason)
-		} else if !strings.HasPrefix(o.Signature, "v1:") {
+		} else if !strings.HasPrefix(o.Signature, "v1:") || strings.HasPrefix(o.Signature, "v1:hang:") {
 			o.Signature = FormatHangSignature(o.Signature)
 		}
 	}
 	return o
 }
 
-// NormalizeTable returns a copy of outcomes with all ClassOpenError/ClassPanic outcomes normalized.
+// NormalizeTable returns a copy of outcomes with all ClassOpenError/ClassPanic/ClassHang outcomes normalized.
 func NormalizeTable(outcomes []oracle.Outcome) []oracle.Outcome {
 	res := make([]oracle.Outcome, len(outcomes))
 	for i, o := range outcomes {
@@ -358,33 +352,9 @@ func NormalizeTable(outcomes []oracle.Outcome) []oracle.Outcome {
 // including FirstFailure (1-based index of first non-valid candidate) and
 // FirstViolation (1-based index of first ClassViolation candidate).
 func TabulateSummary(universe, ranking []candidate.Candidate, outcomes []oracle.Outcome) (Summary, error) {
-	outcomes = NormalizeTable(outcomes)
-	if err := ValidateTable(universe, outcomes); err != nil {
-		return Summary{}, fmt.Errorf("tabulate summary: %w", err)
-	}
-
-	if len(ranking) != len(universe) {
-		return Summary{}, fmt.Errorf("tabulate summary: ranking length %d != universe length %d", len(ranking), len(universe))
-	}
-
-	universeSet := make(map[candidate.Candidate]bool, len(universe))
-	for _, c := range universe {
-		universeSet[c] = true
-	}
-	rankingSeen := make(map[candidate.Candidate]bool, len(ranking))
-	for _, c := range ranking {
-		if !universeSet[c] {
-			return Summary{}, fmt.Errorf("tabulate summary: ranking contains foreign candidate %+v", c)
-		}
-		if rankingSeen[c] {
-			return Summary{}, fmt.Errorf("tabulate summary: ranking contains duplicate candidate %+v", c)
-		}
-		rankingSeen[c] = true
-	}
-
-	outcomeMap := make(map[candidate.Candidate]oracle.Outcome, len(outcomes))
-	for _, o := range outcomes {
-		outcomeMap[o.Candidate] = o
+	outcomeMap, err := prepareEvaluation("tabulate summary", universe, ranking, outcomes)
+	if err != nil {
+		return Summary{}, err
 	}
 
 	var s Summary
@@ -408,9 +378,6 @@ func TabulateSummary(universe, ranking []candidate.Candidate, outcomes []oracle.
 			}
 			s.Failures++
 			s.Violations++
-			if o.Signature != "" && !seenBugs[o.Signature] {
-				seenBugs[o.Signature] = true
-			}
 
 		case oracle.ClassOpenError:
 			if s.FirstFailure == 0 {
@@ -418,13 +385,6 @@ func TabulateSummary(universe, ranking []candidate.Candidate, outcomes []oracle.
 			}
 			s.Failures++
 			s.OpenErrors++
-			sig := o.Signature
-			if sig == "" && o.Detail != "" {
-				sig = FormatOpenErrorSignature(o.Detail)
-			}
-			if sig != "" && !seenBugs[sig] {
-				seenBugs[sig] = true
-			}
 
 		case oracle.ClassPanic:
 			if s.FirstFailure == 0 {
@@ -432,13 +392,6 @@ func TabulateSummary(universe, ranking []candidate.Candidate, outcomes []oracle.
 			}
 			s.Failures++
 			s.Panics++
-			sig := o.Signature
-			if sig == "" && o.Detail != "" {
-				sig = FormatPanicSignature(o.Detail)
-			}
-			if sig != "" && !seenBugs[sig] {
-				seenBugs[sig] = true
-			}
 
 		case oracle.ClassHang:
 			if s.FirstFailure == 0 {
@@ -446,15 +399,10 @@ func TabulateSummary(universe, ranking []candidate.Candidate, outcomes []oracle.
 			}
 			s.Failures++
 			s.Hangs++
-			sig := o.Signature
-			if sig == "" && o.Detail != "" {
-				sig = FormatHangSignature(o.Detail)
-			} else if sig == "" {
-				sig = "v1:hang:timeout"
-			}
-			if !seenBugs[sig] {
-				seenBugs[sig] = true
-			}
+		}
+
+		if isFailureClass(o.Class) && o.Signature != "" {
+			seenBugs[o.Signature] = true
 		}
 	}
 
@@ -610,4 +558,47 @@ func DecodeRanking(reader io.Reader) (RankingDocument, error) {
 	}
 
 	return doc, nil
+}
+
+func writeBytesAtomic(targetPath string, writeFn func(io.Writer) error) error {
+	dir := filepath.Dir(targetPath)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+	base := filepath.Base(targetPath)
+	tmp, err := os.CreateTemp(dir, "."+base+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if err := writeFn(tmp); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, targetPath); err != nil {
+		return err
+	}
+	cleanup = false
+	return nil
+}
+
+func writeCSVAtomic(csvPath string, writeRows func(*csv.Writer) error) error {
+	return writeBytesAtomic(csvPath, func(w io.Writer) error {
+		cw := csv.NewWriter(w)
+		cw.UseCRLF = false
+		if err := writeRows(cw); err != nil {
+			return err
+		}
+		cw.Flush()
+		return cw.Error()
+	})
 }

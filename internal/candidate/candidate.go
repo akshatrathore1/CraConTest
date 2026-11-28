@@ -185,14 +185,22 @@ func Decode(reader io.Reader) ([]Candidate, error) {
 	if len(raw.Candidates) == 0 || bytes.Equal(bytes.TrimSpace(raw.Candidates), []byte("null")) {
 		return nil, errors.New("decode universe: missing or null candidates array")
 	}
-	inner := json.NewDecoder(bytes.NewReader(raw.Candidates))
-	inner.DisallowUnknownFields()
-	var universe []Candidate
-	if err := inner.Decode(&universe); err != nil {
+	var rawElems []json.RawMessage
+	if err := json.NewDecoder(bytes.NewReader(raw.Candidates)).Decode(&rawElems); err != nil {
 		return nil, fmt.Errorf("decode universe: %w", err)
 	}
-	if universe == nil {
-		universe = []Candidate{}
+	universe := make([]Candidate, 0, len(rawElems))
+	for i, elem := range rawElems {
+		if bytes.Equal(bytes.TrimSpace(elem), []byte("null")) {
+			return nil, fmt.Errorf("decode universe: candidate %d is null", i)
+		}
+		elemDec := json.NewDecoder(bytes.NewReader(elem))
+		elemDec.DisallowUnknownFields()
+		var c Candidate
+		if err := elemDec.Decode(&c); err != nil {
+			return nil, fmt.Errorf("decode universe: candidate %d: %w", i, err)
+		}
+		universe = append(universe, c)
 	}
 	var extra any
 	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
@@ -204,10 +212,82 @@ func Decode(reader io.Reader) ([]Candidate, error) {
 	return universe, nil
 }
 
+type span struct {
+	start int64
+	end   int64
+}
+
+func addSpan(list []span, next span) []span {
+	if next.end <= next.start {
+		return list
+	}
+	merged := make([]span, 0, len(list)+1)
+	inserted := false
+	for _, current := range list {
+		switch {
+		case current.end < next.start:
+			merged = append(merged, current)
+		case next.end < current.start:
+			if !inserted {
+				merged = append(merged, next)
+				inserted = true
+			}
+			merged = append(merged, current)
+		default:
+			if current.start < next.start {
+				next.start = current.start
+			}
+			if current.end > next.end {
+				next.end = current.end
+			}
+		}
+	}
+	if !inserted {
+		merged = append(merged, next)
+	}
+	return merged
+}
+
+func mixWriteDigest(prev uint64, off int64, length int, data []byte, writeSeq uint64) uint64 {
+	h := prev
+	if h == 0 {
+		h = 14695981039346656037
+	}
+	const prime = 1099511628211
+	mixU64 := func(v uint64) {
+		for k := 0; k < 8; k++ {
+			h ^= v & 0xff
+			h *= prime
+			v >>= 8
+		}
+	}
+	mixU64(uint64(off))
+	mixU64(uint64(length))
+	mixU64(writeSeq)
+	mixU64(uint64(len(data)))
+	for _, b := range data {
+		h ^= uint64(b)
+		h *= prime
+	}
+	if h == 0 {
+		h = 1
+	}
+	return h
+}
+
 type canonicalFile struct {
-	Path       string `json:"path"`
-	DurableLen int64  `json:"durable_len"`
-	CurrentLen int64  `json:"current_len,omitempty"`
+	Path              string     `json:"path"`
+	IsDir             bool       `json:"is_dir,omitempty"`
+	DurableOnly       bool       `json:"durable_only,omitempty"`
+	Replaced          bool       `json:"replaced,omitempty"`
+	DurableLen        int64      `json:"durable_len,omitempty"`
+	DurableDigest     uint64     `json:"durable_digest,omitempty"`
+	DurableWriteCount uint64     `json:"durable_write_count,omitempty"`
+	DurableSynced     bool       `json:"durable_synced,omitempty"`
+	CurrentLen        int64      `json:"current_len,omitempty"`
+	LiveDigest        uint64     `json:"live_digest,omitempty"`
+	LiveWriteCount    uint64     `json:"live_write_count,omitempty"`
+	DirtySpans        [][2]int64 `json:"dirty_spans,omitempty"`
 }
 
 type canonicalState struct {
@@ -217,29 +297,80 @@ type canonicalState struct {
 }
 
 type fileEntry struct {
-	path       string
-	durableLen int64
-	currentLen int64
-	deleted    bool
-	isDir      bool
-	synced     bool
+	path              string
+	durableLen        int64
+	durableDigest     uint64
+	durableWriteCount uint64
+	currentLen        int64
+	liveDigest        uint64
+	writeCount        uint64
+	dirtySpans        []span
+	deleted           bool
+	isDir             bool
+	synced            bool
+}
+
+type handleEntry struct {
+	path  string
+	isDir bool
+	file  *fileEntry
 }
 
 type pendingDirOp struct {
-	dir  string
-	desc string
+	dir    string
+	op     string
+	target string
+	desc   string
 }
 
 type cutoffState struct {
-	files   map[string]*fileEntry
-	pending []pendingDirOp
+	files       map[string]*fileEntry
+	durable     map[string]*fileEntry
+	createdDirs map[string]bool
+	pending     []pendingDirOp
 }
 
-func cloneFiles(src map[string]*fileEntry) map[string]*fileEntry {
-	dst := make(map[string]*fileEntry, len(src))
+func cloneFilePair(srcFiles, srcDurable map[string]*fileEntry) (map[string]*fileEntry, map[string]*fileEntry) {
+	dstFiles := make(map[string]*fileEntry, len(srcFiles))
+	dstDurable := make(map[string]*fileEntry, len(srcDurable))
+	cloned := make(map[*fileEntry]*fileEntry, len(srcFiles)+len(srcDurable))
+	cloneOne := func(v *fileEntry) *fileEntry {
+		if v == nil {
+			return nil
+		}
+		if cp, ok := cloned[v]; ok {
+			return cp
+		}
+		tmp := *v
+		if len(v.dirtySpans) > 0 {
+			tmp.dirtySpans = append([]span(nil), v.dirtySpans...)
+		}
+		cp := &tmp
+		cloned[v] = cp
+		return cp
+	}
+	for k, v := range srcFiles {
+		if cp := cloneOne(v); cp != nil {
+			dstFiles[k] = cp
+		}
+	}
+	for k, v := range srcDurable {
+		if cp := cloneOne(v); cp != nil {
+			dstDurable[k] = cp
+		}
+	}
+	return dstFiles, dstDurable
+}
+
+func cloneCreatedDirs(src map[string]bool) map[string]bool {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make(map[string]bool, len(src))
 	for k, v := range src {
-		cp := *v
-		dst[k] = &cp
+		if v {
+			dst[k] = true
+		}
 	}
 	return dst
 }
@@ -253,72 +384,186 @@ func clonePending(src []pendingDirOp) []pendingDirOp {
 	return dst
 }
 
+func cleanVFSPath(p string) string {
+	if p == "" || p == "." || p == "/" {
+		return ""
+	}
+	c := path.Clean(p)
+	if c == "." || c == "/" {
+		return ""
+	}
+	return strings.TrimPrefix(c, "/")
+}
+
+func parentDir(p string) string {
+	p = cleanVFSPath(p)
+	if p == "" {
+		return ""
+	}
+	d := path.Dir(p)
+	if d == "." || d == "/" {
+		return ""
+	}
+	return d
+}
+
+func (s *cutoffState) isDurableReachable(name string) bool {
+	if s.durable[name] == nil {
+		return false
+	}
+	for anc := parentDir(name); anc != ""; anc = parentDir(anc) {
+		if d := s.durable[anc]; d != nil {
+			if !d.isDir {
+				return false
+			}
+			continue
+		}
+		if s.files[anc] != nil || s.createdDirs[anc] {
+			return false
+		}
+	}
+	return true
+}
+
+func spansToPairs(spans []span) [][2]int64 {
+	if len(spans) == 0 {
+		return nil
+	}
+	out := make([][2]int64, len(spans))
+	for i, sp := range spans {
+		out[i] = [2]int64{sp.start, sp.end}
+	}
+	return out
+}
+
 func (s *cutoffState) Key(percent int) string {
 	state := canonicalState{
 		Percent: percent,
 		Files:   []canonicalFile{},
 	}
-	if len(s.pending) > 0 {
-		state.Pending = make([]string, 0, len(s.pending))
-		for _, p := range s.pending {
-			state.Pending = append(state.Pending, p.desc)
+
+	if percent == 0 {
+		if len(s.pending) > 0 {
+			state.Pending = make([]string, 0, len(s.pending))
+			for _, p := range s.pending {
+				state.Pending = append(state.Pending, p.desc)
+			}
+			sort.Strings(state.Pending)
 		}
-		sort.Strings(state.Pending)
-	}
-
-	names := make([]string, 0, len(s.files))
-	for name := range s.files {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-
-	isPendingCreate := func(pending []pendingDirOp, p string) bool {
-		for _, op := range pending {
-			if op.desc == "mkdir:"+p ||
-				op.desc == "create:"+p ||
-				op.desc == "link:"+p ||
-				op.desc == "rename_to:"+p ||
-				strings.HasSuffix(op.desc, "->"+p) ||
-				op.desc == "reuse_to:"+p {
-				return true
+		names := make([]string, 0, len(s.durable))
+		for name := range s.durable {
+			if s.isDurableReachable(name) {
+				names = append(names, name)
 			}
 		}
-		return false
-	}
-
-	for _, name := range names {
-		f := s.files[name]
-		if f.deleted {
-			continue
-		}
-		if percent == 0 {
-			// At 0% retention, unsynced directory entries and unsynced files do not survive crash.
-			// A file or directory survives if its directory entry has been durably synced
-			// (not in s.pending), or if the file itself has durable data / was synced.
-			survives := false
-			if f.isDir {
-				survives = !isPendingCreate(s.pending, f.path)
-			} else {
-				if f.durableLen > 0 || f.synced {
-					survives = true
-				} else if !isPendingCreate(s.pending, f.path) {
-					survives = true
-				}
+		sort.Strings(names)
+		for _, name := range names {
+			f := s.durable[name]
+			if f == nil || f.deleted {
+				continue
 			}
-			if survives {
-				state.Files = append(state.Files, canonicalFile{
-					Path:       f.path,
-					DurableLen: f.durableLen,
-				})
-			}
-		} else {
 			state.Files = append(state.Files, canonicalFile{
-				Path:       f.path,
-				DurableLen: f.durableLen,
-				CurrentLen: f.currentLen,
+				Path:              name,
+				IsDir:             f.isDir,
+				DurableLen:        f.durableLen,
+				DurableDigest:     f.durableDigest,
+				DurableWriteCount: f.durableWriteCount,
+				DurableSynced:     f.synced,
 			})
 		}
+	} else if percent == 100 {
+		// Under 100% retention all unsynced data and directory entries survive unconditionally,
+		// so pending directory ops and durable checkpoints do not alter the post-crash filesystem.
+		names := make([]string, 0, len(s.files))
+		for name := range s.files {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			f := s.files[name]
+			if f == nil || f.deleted {
+				continue
+			}
+			state.Files = append(state.Files, canonicalFile{
+				Path:           name,
+				IsDir:          f.isDir,
+				CurrentLen:     f.currentLen,
+				LiveDigest:     f.liveDigest,
+				LiveWriteCount: f.writeCount,
+			})
+		}
+	} else {
+		if len(s.pending) > 0 {
+			state.Pending = make([]string, 0, len(s.pending))
+			for _, p := range s.pending {
+				state.Pending = append(state.Pending, p.desc)
+			}
+			sort.Strings(state.Pending)
+		}
+		nameSet := make(map[string]bool, len(s.files)+len(s.durable))
+		for name, f := range s.files {
+			if f != nil && !f.deleted {
+				nameSet[name] = true
+			}
+		}
+		for name, f := range s.durable {
+			if f != nil && !f.deleted && s.isDurableReachable(name) {
+				nameSet[name] = true
+			}
+		}
+		names := make([]string, 0, len(nameSet))
+		for name := range nameSet {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			lf := s.files[name]
+			var df *fileEntry
+			if s.isDurableReachable(name) {
+				df = s.durable[name]
+			}
+			switch {
+			case lf != nil && !lf.deleted && df != nil && !df.deleted:
+				state.Files = append(state.Files, canonicalFile{
+					Path:              name,
+					IsDir:             lf.isDir,
+					Replaced:          lf != df,
+					DurableLen:        df.durableLen,
+					DurableDigest:     df.durableDigest,
+					DurableWriteCount: df.durableWriteCount,
+					DurableSynced:     df.synced,
+					CurrentLen:        lf.currentLen,
+					LiveDigest:        lf.liveDigest,
+					LiveWriteCount:    lf.writeCount,
+					DirtySpans:        spansToPairs(lf.dirtySpans),
+				})
+			case lf != nil && !lf.deleted:
+				state.Files = append(state.Files, canonicalFile{
+					Path:              name,
+					IsDir:             lf.isDir,
+					DurableLen:        lf.durableLen,
+					DurableDigest:     lf.durableDigest,
+					DurableWriteCount: lf.durableWriteCount,
+					DurableSynced:     lf.synced,
+					CurrentLen:        lf.currentLen,
+					LiveDigest:        lf.liveDigest,
+					LiveWriteCount:    lf.writeCount,
+					DirtySpans:        spansToPairs(lf.dirtySpans),
+				})
+			case df != nil && !df.deleted:
+				state.Files = append(state.Files, canonicalFile{
+					Path:              name,
+					IsDir:             df.isDir,
+					DurableOnly:       true,
+					DurableLen:        df.durableLen,
+					DurableDigest:     df.durableDigest,
+					DurableWriteCount: df.durableWriteCount,
+					DurableSynced:     df.synced,
+				})
+			}
+		}
 	}
+
 	encoded, err := json.Marshal(state)
 	if err != nil {
 		return fmt.Sprintf("fallback:%d:%d", state.Percent, len(state.Files))
@@ -329,7 +574,8 @@ func (s *cutoffState) Key(percent int) string {
 
 type cutoffCacheEntry struct {
 	length int
-	hash   uint64
+	hash1  uint64
+	hash2  uint64
 	states []*cutoffState
 }
 
@@ -338,68 +584,81 @@ var (
 	cutoffCache   = make([]cutoffCacheEntry, 0, 16)
 )
 
-func traceFingerprint(events []trace.Event) uint64 {
-	h := uint64(14695981039346656037)
-	const prime = 1099511628211
-	for i := range events {
-		h ^= uint64(events[i].ID)
-		h *= prime
-		for j := 0; j < len(events[i].Kind); j++ {
-			h ^= uint64(events[i].Kind[j])
-			h *= prime
-		}
-		for j := 0; j < len(events[i].File); j++ {
-			h ^= uint64(events[i].File[j])
-			h *= prime
-		}
-		for j := 0; j < len(events[i].File2); j++ {
-			h ^= uint64(events[i].File2[j])
-			h *= prime
-		}
-		for j := 0; j < len(events[i].Cat); j++ {
-			h ^= uint64(events[i].Cat[j])
-			h *= prime
-		}
-		for j := 0; j < len(events[i].Err); j++ {
-			h ^= uint64(events[i].Err[j])
-			h *= prime
-		}
-		for j := 0; j < len(events[i].Note); j++ {
-			h ^= uint64(events[i].Note[j])
-			h *= prime
-		}
-		for j := 0; j < len(events[i].OpKind); j++ {
-			h ^= uint64(events[i].OpKind[j])
-			h *= prime
-		}
-		h ^= uint64(events[i].Mode)
-		h *= prime
-		h ^= uint64(events[i].Off)
-		h *= prime
-		h ^= uint64(events[i].Len)
-		h *= prime
-		h ^= events[i].Handle
-		h *= prime
-		h ^= events[i].Op
-		h *= prime
-		h ^= events[i].Job
-		h *= prime
-		h ^= uint64(events[i].Size)
-		h *= prime
-		if events[i].Dir {
-			h ^= 1
-			h *= prime
-		}
-		if events[i].FullSync {
-			h ^= 2
-			h *= prime
-		}
-		if events[i].Created {
-			h ^= 4
-			h *= prime
+func traceFingerprint(events []trace.Event) (uint64, uint64) {
+	h1 := uint64(14695981039346656037)
+	h2 := uint64(0x9e3779b97f4a7c15)
+	const prime1 = 1099511628211
+	const prime2 = 0xbf58476d1ce4e5b9
+	mixU64 := func(v uint64) {
+		for k := 0; k < 8; k++ {
+			b := v & 0xff
+			h1 ^= b
+			h1 *= prime1
+			h2 ^= b ^ uint64(k+1)
+			h2 *= prime2
+			v >>= 8
 		}
 	}
-	return h
+	mixStr := func(s string) {
+		mixU64(uint64(len(s)))
+		for j := 0; j < len(s); j++ {
+			b := uint64(s[j])
+			h1 ^= b
+			h1 *= prime1
+			h2 ^= b
+			h2 *= prime2
+		}
+	}
+	mixBytes := func(b []byte) {
+		mixU64(uint64(len(b)))
+		for j := 0; j < len(b); j++ {
+			v := uint64(b[j])
+			h1 ^= v
+			h1 *= prime1
+			h2 ^= v
+			h2 *= prime2
+		}
+	}
+	mixU64(uint64(len(events)))
+	for i := range events {
+		ev := &events[i]
+		mixU64(ev.ID)
+		mixStr(string(ev.Kind))
+		mixStr(ev.File)
+		mixStr(ev.File2)
+		mixStr(ev.Cat)
+		mixStr(ev.Err)
+		mixStr(ev.Note)
+		mixStr(ev.OpKind)
+		mixBytes(ev.Data)
+		mixU64(uint64(len(ev.Inputs)))
+		for _, in := range ev.Inputs {
+			mixStr(in)
+		}
+		mixU64(uint64(len(ev.Outputs)))
+		for _, out := range ev.Outputs {
+			mixStr(out)
+		}
+		mixU64(uint64(ev.Mode))
+		mixU64(uint64(ev.Off))
+		mixU64(uint64(ev.Len))
+		mixU64(ev.Handle)
+		mixU64(ev.Op)
+		mixU64(ev.Job)
+		mixU64(uint64(ev.Size))
+		var flags uint64
+		if ev.Dir {
+			flags |= 1
+		}
+		if ev.FullSync {
+			flags |= 2
+		}
+		if ev.Created {
+			flags |= 4
+		}
+		mixU64(flags)
+	}
+	return h1, h2
 }
 
 // buildCutoffStates returns the persistence states for all cutoffs, using an in-memory
@@ -410,12 +669,12 @@ func buildCutoffStates(events []trace.Event) []*cutoffState {
 	}
 
 	length := len(events)
-	fp := traceFingerprint(events)
+	fp1, fp2 := traceFingerprint(events)
 
 	cutoffCacheMu.Lock()
 	for i, entry := range cutoffCache {
-		if entry.length == length && entry.hash == fp {
-			res := entry.states
+		if entry.length == length && entry.hash1 == fp1 && entry.hash2 == fp2 {
+			res := append([]*cutoffState(nil), entry.states...)
 			if i > 0 {
 				copy(cutoffCache[1:i+1], cutoffCache[0:i])
 				cutoffCache[0] = entry
@@ -431,8 +690,9 @@ func buildCutoffStates(events []trace.Event) []*cutoffState {
 	cutoffCacheMu.Lock()
 	newEntry := cutoffCacheEntry{
 		length: length,
-		hash:   fp,
-		states: states,
+		hash1:  fp1,
+		hash2:  fp2,
+		states: append([]*cutoffState(nil), states...),
 	}
 	if len(cutoffCache) < 16 {
 		cutoffCache = append([]cutoffCacheEntry{newEntry}, cutoffCache...)
@@ -445,22 +705,43 @@ func buildCutoffStates(events []trace.Event) []*cutoffState {
 	return states
 }
 
+func rewritePathPrefix(p, oldP, newP, oldPrefix, newPrefix string) (string, bool) {
+	if p == oldP {
+		return newP, true
+	}
+	if oldP != "" && strings.HasPrefix(p, oldPrefix) {
+		return newPrefix + strings.TrimPrefix(p, oldPrefix), true
+	}
+	return p, false
+}
+
 // buildCutoffStatesUncached performs a single forward pass over events, computing the
-// snapshot of persistence state for every cutoff 0..len(events).
+// snapshot of persistence state for every cutoff 0..maxID.
 func buildCutoffStatesUncached(events []trace.Event) []*cutoffState {
+	const maxGapAllowance = 1 << 20
 	maxID := uint64(len(events))
 	for _, event := range events {
 		if event.ID > maxID {
+			if event.ID-uint64(len(events)) > maxGapAllowance {
+				return nil
+			}
 			maxID = event.ID
 		}
 	}
+	if maxID == ^uint64(0) || maxID-uint64(len(events)) > maxGapAllowance {
+		return nil
+	}
 	states := make([]*cutoffState, maxID+1)
 	files := make(map[string]*fileEntry)
-	handles := make(map[uint64]*fileEntry)
+	durable := make(map[string]*fileEntry)
+	createdDirs := make(map[string]bool)
+	handles := make(map[uint64]*handleEntry)
 	var pending []pendingDirOp
 
+	initFiles, initDurable := cloneFilePair(files, durable)
 	states[0] = &cutoffState{
-		files:   cloneFiles(files),
+		files:   initFiles,
+		durable: initDurable,
 		pending: nil,
 	}
 
@@ -470,102 +751,179 @@ func buildCutoffStatesUncached(events []trace.Event) []*cutoffState {
 			if event.Err != "" {
 				break
 			}
-			files[event.File] = &fileEntry{path: event.File, isDir: true}
-			d := path.Clean(path.Dir(event.File))
-			pending = append(pending, pendingDirOp{dir: d, desc: "mkdir:" + event.File})
+			clean := cleanVFSPath(event.File)
+			if clean != "" {
+				parts := strings.Split(clean, "/")
+				for idx := range parts {
+					sub := strings.Join(parts[:idx+1], "/")
+					if sub == "" || sub == "." {
+						continue
+					}
+					if _, exists := files[sub]; !exists {
+						files[sub] = &fileEntry{path: sub, isDir: true}
+						createdDirs[sub] = true
+						d := parentDir(sub)
+						pending = append(pending, pendingDirOp{dir: d, op: "mkdir", target: sub, desc: "mkdir:" + sub})
+					}
+				}
+			}
 		case trace.KindCreate:
 			if event.Err != "" {
 				break
 			}
-			f := &fileEntry{path: event.File}
-			files[event.File] = f
-			handles[event.Handle] = f
-			d := path.Clean(path.Dir(event.File))
-			pending = append(pending, pendingDirOp{dir: d, desc: "create:" + event.File})
+			p := cleanVFSPath(event.File)
+			f := &fileEntry{path: p}
+			files[p] = f
+			handles[event.Handle] = &handleEntry{path: p, file: f}
+			d := parentDir(p)
+			pending = append(pending, pendingDirOp{dir: d, op: "create", target: p, desc: "create:" + p})
 		case trace.KindReuseForWrite:
 			if event.Err != "" {
 				break
 			}
-			f := files[event.File]
-			if f != nil {
-				delete(files, event.File)
-				f.path = event.File2
-				f.currentLen = 0
-				f.durableLen = 0
-				f.synced = false
-				f.isDir = false
-				files[event.File2] = f
-			} else {
-				f = &fileEntry{path: event.File2}
-				files[event.File2] = f
-			}
-			handles[event.Handle] = f
-			dOld := path.Clean(path.Dir(event.File))
-			dNew := path.Clean(path.Dir(event.File2))
+			oldP := cleanVFSPath(event.File)
+			newP := cleanVFSPath(event.File2)
+			delete(files, oldP)
+			f := &fileEntry{path: newP}
+			files[newP] = f
+			handles[event.Handle] = &handleEntry{path: newP, file: f}
+			dOld := parentDir(oldP)
+			dNew := parentDir(newP)
 			if dOld == dNew {
-				pending = append(pending, pendingDirOp{dir: dOld, desc: "reuse:" + event.File + "->" + event.File2})
+				pending = append(pending, pendingDirOp{dir: dOld, op: "reuse", target: newP, desc: "reuse:" + oldP + "->" + newP})
 			} else {
-				pending = append(pending, pendingDirOp{dir: dOld, desc: "reuse_from:" + event.File})
-				pending = append(pending, pendingDirOp{dir: dNew, desc: "reuse_to:" + event.File2})
+				pending = append(pending, pendingDirOp{dir: dOld, op: "reuse_from", target: oldP, desc: "reuse_from:" + oldP})
+				pending = append(pending, pendingDirOp{dir: dNew, op: "reuse_to", target: newP, desc: "reuse_to:" + newP})
 			}
 		case trace.KindOpen, trace.KindOpenReadWrite, trace.KindOpenDir:
 			if event.Err != "" {
 				break
 			}
-			f := files[event.File]
-			if f == nil {
-				f = &fileEntry{path: event.File}
-				files[event.File] = f
+			p := cleanVFSPath(event.File)
+			isDir := event.Dir || event.Kind == trace.KindOpenDir
+			if event.Kind == trace.KindOpenReadWrite && event.Created {
+				f := &fileEntry{path: p, isDir: isDir}
+				files[p] = f
+				if isDir && p != "" {
+					createdDirs[p] = true
+				}
+				handles[event.Handle] = &handleEntry{path: p, isDir: isDir, file: f}
+				d := parentDir(p)
+				pending = append(pending, pendingDirOp{dir: d, op: "create", target: p, desc: "create:" + p})
+			} else {
+				// Read-only Open / OpenDir / existing OpenReadWrite must not mutate namespace state.
+				handles[event.Handle] = &handleEntry{path: p, isDir: isDir, file: files[p]}
 			}
-			handles[event.Handle] = f
 		case trace.KindWrite, trace.KindWriteAt:
 			if event.Err != "" {
 				break
 			}
-			f := handles[event.Handle]
-			if f != nil && event.Len > 0 {
-				end := event.Off + int64(event.Len)
-				if end > f.currentLen {
-					f.currentLen = end
+			h := handles[event.Handle]
+			if h != nil && event.Len > 0 {
+				if h.file == nil && h.path != "" {
+					f := files[h.path]
+					if f == nil {
+						f = &fileEntry{path: h.path}
+						files[h.path] = f
+					}
+					h.file = f
+				}
+				if h.file != nil {
+					f := h.file
+					end := event.Off + int64(event.Len)
+					if end > f.currentLen {
+						f.currentLen = end
+					}
+					f.dirtySpans = addSpan(f.dirtySpans, span{start: event.Off, end: end})
+					f.writeCount++
+					f.liveDigest = mixWriteDigest(f.liveDigest, event.Off, event.Len, event.Data, f.writeCount)
 				}
 			}
 		case trace.KindPreallocate:
-			if event.Err != "" {
-				break
-			}
-			f := handles[event.Handle]
-			if f != nil && event.Size > 0 {
-				end := event.Off + event.Size
-				if end > f.currentLen {
-					f.currentLen = end
-				}
-			}
+			// MemFS Preallocate is a no-op that does not modify durable or current length.
 		case trace.KindSync, trace.KindSyncData, trace.KindSyncTo:
 			if event.Err != "" {
 				break
 			}
 			if event.IsBarrier() {
-				f := handles[event.Handle]
-				if f != nil {
+				h := handles[event.Handle]
+				if h != nil && h.file != nil && !h.isDir {
+					f := h.file
 					f.synced = true
 					f.durableLen = f.currentLen
+					f.durableDigest = f.liveDigest
+					f.durableWriteCount = f.writeCount
+					f.dirtySpans = nil
 				}
-				if event.Dir {
-					syncDir := event.File
-					if syncDir == "" {
-						if h := handles[event.Handle]; h != nil {
-							syncDir = h.path
+				if event.Dir || (h != nil && h.isDir) {
+					syncDir := cleanVFSPath(event.File)
+					if event.File == "" && h != nil {
+						syncDir = h.path
+					}
+					kept := make([]pendingDirOp, 0, len(pending))
+					for _, p := range pending {
+						if p.dir != syncDir {
+							kept = append(kept, p)
 						}
 					}
-					if syncDir != "" {
-						syncDir = path.Clean(syncDir)
-						kept := make([]pendingDirOp, 0, len(pending))
-						for _, p := range pending {
-							if p.dir != syncDir {
-								kept = append(kept, p)
+					pending = kept
+
+					// Preserve synced descendants if a durable directory was renamed into syncDir.
+					movedSubtrees := make(map[string]map[string]*fileEntry)
+					for lp, lf := range files {
+						if parentDir(lp) != syncDir || lf == nil || !lf.isDir {
+							continue
+						}
+						if durable[lp] == lf {
+							continue
+						}
+						for oldDP, oldDF := range durable {
+							if oldDF == lf && oldDP != lp {
+								oldPrefix := oldDP + "/"
+								subMap := make(map[string]*fileEntry)
+								for subP, subF := range durable {
+									if strings.HasPrefix(subP, oldPrefix) {
+										subMap[strings.TrimPrefix(subP, oldPrefix)] = subF
+									}
+								}
+								movedSubtrees[lp] = subMap
+								break
 							}
 						}
-						pending = kept
+					}
+
+					// Prune stale durable direct children of syncDir (and subtrees of removed/replaced dirs).
+					var staleDirs []string
+					var staleFiles []string
+					for dp, df := range durable {
+						if parentDir(dp) == syncDir && files[dp] != df {
+							staleFiles = append(staleFiles, dp)
+							if df != nil && df.isDir {
+								staleDirs = append(staleDirs, dp)
+							}
+						}
+					}
+					for _, dp := range staleFiles {
+						delete(durable, dp)
+					}
+					for _, d := range staleDirs {
+						prefix := d + "/"
+						for sub := range durable {
+							if strings.HasPrefix(sub, prefix) {
+								delete(durable, sub)
+							}
+						}
+					}
+					// Persist all current live direct children of syncDir into durable.
+					for lp, lf := range files {
+						if parentDir(lp) == syncDir && lf != nil && !lf.deleted {
+							durable[lp] = lf
+							if subMap, ok := movedSubtrees[lp]; ok {
+								for rel, subF := range subMap {
+									durable[lp+"/"+rel] = subF
+								}
+							}
+						}
 					}
 				}
 			}
@@ -575,76 +933,128 @@ func buildCutoffStatesUncached(events []trace.Event) []*cutoffState {
 			if event.Err != "" {
 				break
 			}
-			f := files[event.File]
-			if f != nil {
-				delete(files, event.File)
-				f.path = event.File2
-				files[event.File2] = f
+			oldP := cleanVFSPath(event.File)
+			newP := cleanVFSPath(event.File2)
+			if f := files[oldP]; f != nil {
+				delete(files, oldP)
+				f.path = newP
+				files[newP] = f
 			}
-			dOld := path.Clean(path.Dir(event.File))
-			dNew := path.Clean(path.Dir(event.File2))
+			oldPrefix := oldP + "/"
+			newPrefix := newP + "/"
+			type childMove struct {
+				oldPath string
+				newPath string
+				entry   *fileEntry
+			}
+			var moved []childMove
+			for childPath, cf := range files {
+				if oldP != "" && strings.HasPrefix(childPath, oldPrefix) {
+					moved = append(moved, childMove{
+						oldPath: childPath,
+						newPath: newPrefix + strings.TrimPrefix(childPath, oldPrefix),
+						entry:   cf,
+					})
+				}
+			}
+			for _, m := range moved {
+				delete(files, m.oldPath)
+				m.entry.path = m.newPath
+				files[m.newPath] = m.entry
+			}
+			var movedDirs []string
+			for d := range createdDirs {
+				if d == oldP || (oldP != "" && strings.HasPrefix(d, oldPrefix)) {
+					movedDirs = append(movedDirs, d)
+				}
+			}
+			for _, d := range movedDirs {
+				delete(createdDirs, d)
+				if nd, ok := rewritePathPrefix(d, oldP, newP, oldPrefix, newPrefix); ok {
+					createdDirs[nd] = true
+				}
+			}
+			for _, h := range handles {
+				if np, ok := rewritePathPrefix(h.path, oldP, newP, oldPrefix, newPrefix); ok {
+					h.path = np
+				}
+			}
+			for idx := range pending {
+				if nd, ok := rewritePathPrefix(pending[idx].dir, oldP, newP, oldPrefix, newPrefix); ok {
+					pending[idx].dir = nd
+				}
+				if nt, ok := rewritePathPrefix(pending[idx].target, oldP, newP, oldPrefix, newPrefix); ok {
+					pending[idx].target = nt
+					if pending[idx].op != "" && pending[idx].op != "rename" && pending[idx].op != "reuse" {
+						pending[idx].desc = pending[idx].op + ":" + nt
+					}
+				}
+			}
+			dOld := parentDir(oldP)
+			dNew := parentDir(newP)
 			if dOld == dNew {
-				pending = append(pending, pendingDirOp{dir: dOld, desc: "rename:" + event.File + "->" + event.File2})
+				pending = append(pending, pendingDirOp{dir: dOld, op: "rename", target: newP, desc: "rename:" + oldP + "->" + newP})
 			} else {
-				pending = append(pending, pendingDirOp{dir: dOld, desc: "rename_from:" + event.File})
-				pending = append(pending, pendingDirOp{dir: dNew, desc: "rename_to:" + event.File2})
+				pending = append(pending, pendingDirOp{dir: dOld, op: "rename_from", target: oldP, desc: "rename_from:" + oldP})
+				pending = append(pending, pendingDirOp{dir: dNew, op: "rename_to", target: newP, desc: "rename_to:" + newP})
 			}
 		case trace.KindRemove, trace.KindRemoveAll:
 			if event.Err != "" {
 				break
 			}
-			f := files[event.File]
-			if f != nil {
-				f.deleted = true
-				delete(files, event.File)
+			p := cleanVFSPath(event.File)
+			if p != "" {
+				delete(files, p)
 			}
+			isRoot := false
 			// For RemoveAll, also delete all child paths (subtree pruning).
 			if event.Kind == trace.KindRemoveAll {
-				isRoot := event.File == "" || event.File == "."
-				prefix := strings.TrimSuffix(event.File, "/") + "/"
+				isRoot = p == ""
+				prefix := p + "/"
 				for childPath := range files {
-					if isRoot || strings.HasPrefix(childPath, prefix) {
-						cf := files[childPath]
-						if cf != nil {
-							cf.deleted = true
-						}
+					if isRoot || childPath == p || strings.HasPrefix(childPath, prefix) {
 						delete(files, childPath)
 					}
 				}
+				for d := range createdDirs {
+					if isRoot || d == p || strings.HasPrefix(d, prefix) {
+						delete(createdDirs, d)
+					}
+				}
 				kept := make([]pendingDirOp, 0, len(pending))
-				for _, p := range pending {
-					if !isRoot && p.dir != event.File && !strings.HasPrefix(p.dir, prefix) {
-						kept = append(kept, p)
+				for _, po := range pending {
+					if !isRoot && po.dir != p && !strings.HasPrefix(po.dir, prefix) {
+						kept = append(kept, po)
 					}
 				}
 				pending = kept
 			}
-			d := path.Clean(path.Dir(event.File))
-			pending = append(pending, pendingDirOp{dir: d, desc: "remove:" + event.File})
+			if !isRoot && p != "" {
+				d := parentDir(p)
+				pending = append(pending, pendingDirOp{dir: d, op: "remove", target: p, desc: "remove:" + p})
+			}
 		case trace.KindLink:
 			if event.Err != "" {
 				break
 			}
-			// Mirror the link in the files map: the destination path shares the
-			// same size as the source, matching replay.go's filePaths alias logic.
-			src := files[event.File]
-			if src != nil {
-				dst := &fileEntry{
-					path:       event.File2,
-					currentLen: src.currentLen,
-					durableLen: src.durableLen,
-					isDir:      src.isDir,
-					synced:     src.synced,
-				}
-				files[event.File2] = dst
+			srcP := cleanVFSPath(event.File)
+			dstP := cleanVFSPath(event.File2)
+			// Share inode state across hard-linked aliases.
+			if src := files[srcP]; src != nil {
+				files[dstP] = src
+			} else if src := durable[srcP]; src != nil {
+				files[dstP] = src
 			}
-			d := path.Clean(path.Dir(event.File2))
-			pending = append(pending, pendingDirOp{dir: d, desc: "link:" + event.File2})
+			d := parentDir(dstP)
+			pending = append(pending, pendingDirOp{dir: d, op: "link", target: dstP, desc: "link:" + dstP})
 		}
 
+		snapFiles, snapDurable := cloneFilePair(files, durable)
 		cs := &cutoffState{
-			files:   cloneFiles(files),
-			pending: clonePending(pending),
+			files:       snapFiles,
+			durable:     snapDurable,
+			createdDirs: cloneCreatedDirs(createdDirs),
+			pending:     clonePending(pending),
 		}
 		if event.ID > 0 {
 			if event.ID <= maxID {
@@ -664,12 +1074,15 @@ func buildCutoffStatesUncached(events []trace.Event) []*cutoffState {
 	return states
 }
 
-// StateHash returns the canonical persistence state key for a cutoff in a trace
-// under a given retention policy.
+// StateHash returns a retention-policy-aware canonical persistence state key
+// for cutoff in events under percent. Note: pipeline ranking strategies use
+// graph.View.Cuts[cut].StateKey (percent-agnostic DAG equivalence); StateHash
+// provides standalone cutoff-state hashing including synthetic and gap-ID traces.
+// Returns "" if the trace cannot be indexed or cut is out of range.
 func StateHash(events []trace.Event, cut uint64, percent int) string {
 	states := buildCutoffStates(events)
-	if cut >= uint64(len(states)) {
-		cut = uint64(len(states) - 1)
+	if len(states) == 0 || cut >= uint64(len(states)) {
+		return ""
 	}
 	return states[cut].Key(percent)
 }
@@ -677,6 +1090,22 @@ func StateHash(events []trace.Event, cut uint64, percent int) string {
 type collapseKey struct {
 	event   uint64
 	percent int
+	seed    uint64
+}
+
+func seedForEquivalence(c Candidate) uint64 {
+	if c.Percent > 0 && c.Percent < 100 {
+		return c.Seed
+	}
+	return 0
+}
+
+func candidateEquivalenceKey(s *cutoffState, c Candidate) string {
+	key := s.Key(c.Percent)
+	if c.Percent > 0 && c.Percent < 100 {
+		return fmt.Sprintf("%s:seed=%d", key, c.Seed)
+	}
+	return key
 }
 
 func collapseWithoutTrace(candidates []Candidate) []Candidate {
@@ -685,7 +1114,7 @@ func collapseWithoutTrace(candidates []Candidate) []Candidate {
 	seen := make(map[collapseKey]bool, len(ordered))
 	result := make([]Candidate, 0, len(ordered))
 	for _, c := range ordered {
-		k := collapseKey{event: c.Event, percent: c.Percent}
+		k := collapseKey{event: c.Event, percent: c.Percent, seed: seedForEquivalence(c)}
 		if seen[k] {
 			continue
 		}
@@ -695,16 +1124,46 @@ func collapseWithoutTrace(candidates []Candidate) []Candidate {
 	return result
 }
 
-func isCutoffMutation(events []trace.Event, cut uint64) bool {
-	if cut == 0 || cut > uint64(len(events)) {
+func findEventByID(events []trace.Event, id uint64) (trace.Event, bool) {
+	if id == 0 || len(events) == 0 {
+		return trace.Event{}, false
+	}
+	if int(id) <= len(events) && events[id-1].ID == id {
+		return events[id-1], true
+	}
+	idx := sort.Search(len(events), func(i int) bool {
+		return events[i].ID >= id
+	})
+	if idx < len(events) && events[idx].ID == id {
+		return events[idx], true
+	}
+	for i := range events {
+		if events[i].ID == id {
+			return events[i], true
+		}
+	}
+	return trace.Event{}, false
+}
+
+func beforeBoundaryByID(events []trace.Event, cut uint64) bool {
+	next, ok := findEventByID(events, cut+1)
+	if !ok {
 		return false
 	}
-	return events[cut-1].IsMutation()
+	return next.IsBarrier() || (next.Kind == trace.KindRename && next.Err == "")
+}
+
+func isCutoffMutation(events []trace.Event, cut uint64) bool {
+	ev, ok := findEventByID(events, cut)
+	if !ok {
+		return false
+	}
+	return ev.IsMutation()
 }
 
 func isBetterCandidateRepresentative(events []trace.Event, a, b Candidate) bool {
-	bbA := trace.BeforeBoundary(events, a.Event)
-	bbB := trace.BeforeBoundary(events, b.Event)
+	bbA := beforeBoundaryByID(events, a.Event)
+	bbB := beforeBoundaryByID(events, b.Event)
 	if bbA != bbB {
 		return bbA // boundary cutoffs preferred
 	}
@@ -719,10 +1178,12 @@ func isBetterCandidateRepresentative(events []trace.Event, a, b Candidate) bool 
 }
 
 // CollapseEquivalenceStates groups candidates by canonical persistence state
-// (using StateHash) and returns one representative candidate per distinct state.
+// (using StateHash, preserving distinct seeds for partial 1..99% retention)
+// and returns one representative candidate per distinct state.
 // Redundant OpEnd markers and redundant intermediate cutoffs are collapsed.
-// Representatives prioritize cutoffs where trace.BeforeBoundary is true,
-// followed by canonical order. The returned slice is sorted canonically.
+// Representatives prioritize cutoffs immediately before sync/rename boundaries,
+// followed by canonical order. Out-of-range cutoffs remain distinct rather than
+// clamping to the final trace cutoff. The returned slice is sorted canonically.
 func CollapseEquivalenceStates(candidates []Candidate, events ...[]trace.Event) []Candidate {
 	var evs []trace.Event
 	if len(events) > 0 && len(events[0]) > 0 {
@@ -735,6 +1196,9 @@ func CollapseEquivalenceStates(candidates []Candidate, events ...[]trace.Event) 
 
 	states := buildCutoffStates(evs)
 	numStates := uint64(len(states))
+	if numStates == 0 {
+		return collapseWithoutTrace(candidates)
+	}
 
 	type classEntry struct {
 		key        string
@@ -744,11 +1208,12 @@ func CollapseEquivalenceStates(candidates []Candidate, events ...[]trace.Event) 
 	var classes []classEntry
 
 	for _, c := range candidates {
-		cut := c.Event
-		if cut >= numStates {
-			cut = numStates - 1
+		var key string
+		if c.Event >= numStates {
+			key = fmt.Sprintf("oob:cut=%d:p=%d:seed=%d", c.Event, c.Percent, c.Seed)
+		} else {
+			key = candidateEquivalenceKey(states[c.Event], c)
 		}
-		key := states[cut].Key(c.Percent)
 		idx, found := classMap[key]
 		if !found {
 			idx = len(classes)
@@ -779,31 +1244,45 @@ func CollapseEquivalenceStatesWithTrace(events []trace.Event, candidates []Candi
 	return CollapseEquivalenceStates(candidates, events)
 }
 
-// EquivalenceClasses groups candidates into equivalence classes by their canonical StateHash.
+// EquivalenceClasses groups candidates into equivalence classes by their canonical StateHash
+// (preserving distinct seeds for partial 1..99% retention and keeping out-of-range cutoffs distinct).
 func EquivalenceClasses(candidates []Candidate, events ...[]trace.Event) map[string][]Candidate {
 	var evs []trace.Event
 	if len(events) > 0 && len(events[0]) > 0 {
 		evs = events[0]
 	}
 
-	if len(evs) == 0 {
+	fallbackClasses := func() map[string][]Candidate {
 		m := make(map[string][]Candidate)
 		for _, c := range candidates {
-			key := fmt.Sprintf("cut_%d_p_%d", c.Event, c.Percent)
+			var key string
+			if c.Percent > 0 && c.Percent < 100 {
+				key = fmt.Sprintf("cut_%d_p_%d_s_%d", c.Event, c.Percent, c.Seed)
+			} else {
+				key = fmt.Sprintf("cut_%d_p_%d", c.Event, c.Percent)
+			}
 			m[key] = append(m[key], c)
 		}
 		return m
 	}
 
+	if len(evs) == 0 {
+		return fallbackClasses()
+	}
+
 	states := buildCutoffStates(evs)
 	numStates := uint64(len(states))
+	if numStates == 0 {
+		return fallbackClasses()
+	}
 	result := make(map[string][]Candidate)
 	for _, c := range candidates {
-		cut := c.Event
-		if cut >= numStates {
-			cut = numStates - 1
+		var key string
+		if c.Event >= numStates {
+			key = fmt.Sprintf("oob:cut=%d:p=%d:seed=%d", c.Event, c.Percent, c.Seed)
+		} else {
+			key = candidateEquivalenceKey(states[c.Event], c)
 		}
-		key := states[cut].Key(c.Percent)
 		result[key] = append(result[key], c)
 	}
 	return result

@@ -307,6 +307,8 @@ func NewWithConfig(cfg Config, inner vfs.FS) (vfs.FS, error) {
 
 // ID returns the active canonical fault identifier.
 func (fs *FS) ID() string {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
 	return fs.cfg.ID
 }
 
@@ -520,8 +522,7 @@ func (fs *FS) onFileCreate(name string, category vfs.DiskWriteCategory) {
 func isMetadataPointer(base, full string) bool {
 	return strings.HasPrefix(base, "CURRENT") ||
 		strings.HasPrefix(base, "OPTIONS") ||
-		strings.Contains(full, "marker.manifest") ||
-		strings.Contains(full, "CURRENT")
+		strings.HasPrefix(base, "marker.manifest.")
 }
 
 func (fs *FS) shouldDropSync(f *file, op string) bool {
@@ -680,7 +681,8 @@ func (fs *FS) shouldDropSync(f *file, op string) bool {
 // At this exact instant, the unsynced directory entry flushed to syncedChildren in "db" is the
 // "db/MANIFEST-xxxxxx" entry, ensuring the manifest file is durable before the marker pointing to it is created.
 func (fs *FS) maybeSyncParentDir(path string) {
-	if fs.cfg.ID == Barrier5825 && strings.Contains(path, "marker.manifest") {
+	id := fs.ID()
+	if id == Barrier5825 && strings.Contains(path, "marker.manifest") {
 		parentDir := fs.inner.PathDir(path)
 		if parentDir == "" {
 			parentDir = "."
@@ -690,8 +692,9 @@ func (fs *FS) maybeSyncParentDir(path string) {
 			_ = df.Close()
 		}
 	}
-	if fs.cfg.ID == BarrierCkpt {
-		if strings.Contains(path, "marker.manifest") || strings.HasSuffix(path, "CURRENT") {
+	if id == BarrierCkpt {
+		base := fs.inner.PathBase(path)
+		if strings.HasPrefix(base, "marker.manifest.") || strings.Contains(path, "marker.manifest") || base == "CURRENT" || strings.HasPrefix(base, "CURRENT.") {
 			parentDir := fs.inner.PathDir(path)
 			if parentDir == "" {
 				parentDir = "."
@@ -768,6 +771,14 @@ func (fs *FS) OpenReadWrite(name string, category vfs.DiskWriteCategory, opts ..
 		return nil, err
 	}
 	fs.onFileCreate(name, category)
+	fs.mu.Lock()
+	if fs.cfg.ID == MUT7 {
+		baseName := fs.inner.PathBase(name)
+		if isMetadataPointer(baseName, name) {
+			fs.pendingDirSyncDrop = true
+		}
+	}
+	fs.mu.Unlock()
 	return &file{
 		fs:       fs,
 		inner:    f,
@@ -899,44 +910,44 @@ func (f *file) ReadAt(p []byte, off int64) (int, error) {
 	return f.inner.ReadAt(p, off)
 }
 
+func (fs *FS) shouldDropWALWrite(n int) bool {
+	if fs == nil || n <= 0 {
+		return false
+	}
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	if fs.cfg.ID != MUTX6 {
+		return false
+	}
+	fs.xN[xIdxX6]++
+	k := fs.cfg.XK
+	if k <= 0 {
+		k = 2 // default: drop the 2nd WAL write
+	}
+	if fs.xN[xIdxX6] == k && !fs.xDropped {
+		fs.xDropped = true
+		fs.xDropCount++
+		return true
+	}
+	return false
+}
+
 func (f *file) Write(p []byte) (int, error) {
-	if f.fs != nil && f.fs.cfg.ID == MUTX6 && string(f.category) == "pebble-wal" {
-		f.fs.mu.Lock()
-		f.fs.xN[xIdxX6]++
-		k := f.fs.cfg.XK
-		if k <= 0 {
-			k = 2 // default: drop the 2nd WAL write
+	if string(f.category) == "pebble-wal" && f.fs.shouldDropWALWrite(len(p)) {
+		if w := findWALWriteNotifier(f.fs.inner); w != nil {
+			w.NotifyDroppedWALWrite()
 		}
-		drop := f.fs.xN[xIdxX6] == k && !f.fs.xDropped
-		if drop {
-			f.fs.xDropped = true
-		}
-		f.fs.mu.Unlock()
-		if drop {
-			if w := findWALWriteNotifier(f.fs.inner); w != nil {
-				w.NotifyDroppedWALWrite()
-			}
-			return len(p), nil // acknowledged but never applied
-		}
+		return len(p), nil // acknowledged but never applied
 	}
 	return f.inner.Write(p)
 }
 
 func (f *file) WriteAt(p []byte, off int64) (int, error) {
-	if f.fs != nil && f.fs.cfg.ID == MUTX6 && string(f.category) == "pebble-wal" {
-		f.fs.mu.Lock()
-		f.fs.xCall++
-		drop := f.fs.xCall == f.fs.xN[xIdxX6]
-		if drop {
-			f.fs.xDropCount++
+	if string(f.category) == "pebble-wal" && f.fs.shouldDropWALWrite(len(p)) {
+		if w := findWALWriteNotifier(f.fs.inner); w != nil {
+			w.NotifyDroppedWALWrite()
 		}
-		f.fs.mu.Unlock()
-		if drop {
-			if w := findWALWriteNotifier(f.fs.inner); w != nil {
-				w.NotifyDroppedWALWrite()
-			}
-			return len(p), nil // acknowledged but never applied
-		}
+		return len(p), nil // acknowledged but never applied
 	}
 	return f.inner.WriteAt(p, off)
 }

@@ -529,6 +529,31 @@ func TestOracleEdgeCases(t *testing.T) {
 			t.Fatalf("expected prefix violation for missing first range_delete, got %s / %s (detail: %s)",
 				resHole.Class, resHole.Rule, resHole.Detail)
 		}
+		expectedHoleSig := oracle.FormatSignature("prefix", "range_delete", []string{"pebble-manifest"})
+		if resHole.Signature != expectedHoleSig {
+			t.Fatalf("expected range_delete prefix signature %q, got %q", expectedHoleSig, resHole.Signature)
+		}
+
+		// With distinct op1 kind ("ingest" range/single or "set" on k1), verify Op 1 attribution:
+		op1Ingest := testEntry(1, 1, 2, true, "ingest", setMut("k1", "new1"))
+		eventsDistinct := []trace.Event{
+			{ID: 1, Kind: trace.KindOpBegin, Op: 1, OpKind: "ingest"},
+			{ID: 2, Kind: trace.KindOpEnd, Op: 1, OpKind: "ingest"},
+			{ID: 3, Kind: trace.KindOpBegin, Op: 2, OpKind: "range_delete"},
+			{ID: 4, Kind: trace.KindOpEnd, Op: 2, OpKind: "range_delete"},
+		}
+		resDistinct := oracle.Check(oracle.Context{
+			Candidate:  candidate.Candidate{Event: 4, Percent: 100, Seed: 1},
+			History:    []history.Entry{op1Ingest, op2},
+			Events:     eventsDistinct,
+			Categories: []string{"pebble-manifest"},
+			Initial:    initial,
+			Recovered:  oracle.State{"k0": "v0", "k1": "v1", "k2": "v2"},
+		})
+		expectedDistinctSig := oracle.FormatSignature("prefix", "ingest", []string{"pebble-manifest"})
+		if resDistinct.Class != oracle.ClassViolation || resDistinct.Rule != "prefix" || resDistinct.Signature != expectedDistinctSig {
+			t.Fatalf("expected prefix/ingest signature %q, got %+v", expectedDistinctSig, resDistinct)
+		}
 	})
 
 	t.Run("KeyResurrectionAfterDeleteAndSet", func(t *testing.T) {
@@ -620,6 +645,28 @@ func TestOracleEdgeCases(t *testing.T) {
 		if resInter.Class != oracle.ClassValid {
 			t.Fatalf("expected valid for intermediate cutoff in long chain, got: %s (detail: %s)",
 				resInter.Class, resInter.Detail)
+		}
+
+		// Long same-key mutation chain prefix violation with lost penultimate ingest op:
+		const chainLen = 200
+		chainEntries := make([]history.Entry, chainLen+2)
+		for i := 0; i < chainLen; i++ {
+			opID := uint64(i + 1)
+			chainEntries[i] = testEntry(opID, opID*2-1, opID*2, false, "set", setMut("hot_key", fmt.Sprintf("v-%d", i)))
+		}
+		ingestOpID := uint64(chainLen + 1)
+		chainEntries[chainLen] = testEntry(ingestOpID, ingestOpID*2-1, ingestOpID*2, false, "ingest", setMut("missing_key", "lost"))
+		finalOpID := uint64(chainLen + 2)
+		chainEntries[chainLen+1] = testEntry(finalOpID, finalOpID*2-1, finalOpID*2, false, "set", setMut("hot_key", "v-final"))
+
+		resChainHole := oracle.Check(oracle.Context{
+			Candidate: candidate.Candidate{Event: finalOpID * 2, Percent: 100, Seed: 1},
+			History:   chainEntries,
+			Recovered: oracle.State{"hot_key": "v-final"},
+		})
+		expectedChainSig := oracle.FormatSignature("prefix", "ingest", nil)
+		if resChainHole.Class != oracle.ClassViolation || resChainHole.Rule != "prefix" || resChainHole.Signature != expectedChainSig {
+			t.Fatalf("expected prefix/ingest for long chain hole, got %+v", resChainHole)
 		}
 	})
 
@@ -753,6 +800,240 @@ func TestOracleEdgeCases(t *testing.T) {
 		res := oracle.Check(ctx)
 		if res.Class != oracle.ClassValid {
 			t.Fatalf("expected valid, got: %s (detail: %s)", res.Class, res.Detail)
+		}
+	})
+}
+
+func TestOracleValidationErrorPaths(t *testing.T) {
+	validEvents := []trace.Event{
+		{ID: 1, Kind: trace.KindOpBegin, Op: 1, OpKind: "set"},
+		{ID: 2, Kind: trace.KindOpEnd, Op: 1, OpKind: "set"},
+	}
+	validEntry := testEntry(1, 1, 2, true, "set", setMut("a", "1"))
+
+	for _, pct := range []int{-1, 101} {
+		out := oracle.Check(oracle.Context{
+			Candidate: candidate.Candidate{Event: 2, Percent: pct, Seed: 1},
+			History:   []history.Entry{validEntry},
+			Events:    validEvents,
+			Recovered: oracle.State{"a": "1"},
+		})
+		if out.Class != oracle.ClassOracleError || out.Rule != "invalid_candidate" {
+			t.Fatalf("percent=%d: got %s/%s, want oracle_error/invalid_candidate", pct, out.Class, out.Rule)
+		}
+	}
+
+	outOverEv := oracle.Check(oracle.Context{
+		Candidate: candidate.Candidate{Event: 3, Percent: 100, Seed: 1},
+		History:   []history.Entry{validEntry},
+		Events:    validEvents,
+		Recovered: oracle.State{"a": "1"},
+	})
+	if outOverEv.Class != oracle.ClassOracleError || outOverEv.Rule != "invalid_candidate" {
+		t.Fatalf("event > len(Events): got %s/%s, want oracle_error/invalid_candidate", outOverEv.Class, outOverEv.Rule)
+	}
+
+	invalidTrace := []trace.Event{
+		{ID: 2, Kind: trace.KindOpBegin, Op: 1, OpKind: "set"}, // non-consecutive ID
+	}
+	outTrace := oracle.Check(oracle.Context{
+		Candidate: candidate.Candidate{Event: 1, Percent: 100, Seed: 1},
+		History:   []history.Entry{validEntry},
+		Events:    invalidTrace,
+		Recovered: oracle.State{"a": "1"},
+	})
+	if outTrace.Class != oracle.ClassOracleError || outTrace.Rule != "invalid_trace" {
+		t.Fatalf("invalid trace: got %s/%s, want oracle_error/invalid_trace", outTrace.Class, outTrace.Rule)
+	}
+
+	// Marker mismatch on EndEvent Err field.
+	errMismatchEntry := validEntry
+	errMismatchEntry.Err = "disk full"
+	outErrMismatch := oracle.Check(oracle.Context{
+		Candidate: candidate.Candidate{Event: 2, Percent: 100, Seed: 1},
+		History:   []history.Entry{errMismatchEntry},
+		Events:    validEvents, // OpEnd has Err == ""
+		Recovered: oracle.State{"a": "1"},
+	})
+	if outErrMismatch.Class != oracle.ClassOracleError || outErrMismatch.Rule != "invalid_history" {
+		t.Fatalf("marker err mismatch: got %s/%s, want oracle_error/invalid_history", outErrMismatch.Class, outErrMismatch.Rule)
+	}
+}
+
+func TestOracleRule1PrecedenceAndRepeatedStateBackwardScan(t *testing.T) {
+	// Repeated state: Op 1 sets a=1, Op 2 deletes a (returns to empty state {}),
+	// Op 3 is synced ingest b=2 (lost). Recovered={} matches both states[0] and states[2].
+	// Backward scan of states[:lower] must attribute durably_committed to Op 3 ("ingest"), not Op 1 ("set").
+	op1 := testEntry(1, 1, 2, false, "set", setMut("a", "1"))
+	op2 := testEntry(2, 3, 4, true, "delete", history.Mutation{Kind: "delete", Key: []byte("a")})
+	op3 := testEntry(3, 5, 6, true, "ingest", setMut("b", "2"))
+
+	outRepeat := oracle.Check(oracle.Context{
+		Candidate: candidate.Candidate{Event: 6, Percent: 0, Seed: 1},
+		History:   []history.Entry{op1, op2, op3},
+		Recovered: oracle.State{},
+	})
+	wantSig := oracle.FormatSignature("durably_committed", "ingest", nil)
+	if outRepeat.Class != oracle.ClassViolation || outRepeat.Rule != "durably_committed" || outRepeat.Signature != wantSig {
+		t.Fatalf("repeated state durably_committed: got %+v, want signature %q", outRepeat, wantSig)
+	}
+
+	// Precedence: Rule 1 (durably_committed) must beat Rule 2 (atomic_batch) when recovered equals
+	// both an excluded whole state below lower and an interior batch state.
+	b1 := testEntry(1, 1, 2, true, "set", setMut("a", "1"))
+	b2 := testEntry(2, 3, 4, false, "ingest", setMut("b", "2"))
+	b3 := testEntry(3, 5, 6, true, "batch",
+		history.Mutation{Kind: "delete", Key: []byte("b")}, // interior state = {"a": "1"} == states[1]!
+		setMut("c", "3"),
+	)
+	outPrec := oracle.Check(oracle.Context{
+		Candidate: candidate.Candidate{Event: 6, Percent: 0, Seed: 1},
+		History:   []history.Entry{b1, b2, b3},
+		Recovered: oracle.State{"a": "1"},
+	})
+	wantPrecSig := oracle.FormatSignature("durably_committed", "ingest", nil)
+	if outPrec.Class != oracle.ClassViolation || outPrec.Rule != "durably_committed" || outPrec.Signature != wantPrecSig {
+		t.Fatalf("Rule 1 precedence over Rule 2 failed: got %+v, want durably_committed/%q", outPrec, wantPrecSig)
+	}
+}
+
+func TestOracleRule2NonPrefixTornBatch(t *testing.T) {
+	op1 := testEntry(1, 1, 2, true, "set", setMut("x", "9"))
+	op2 := testEntry(2, 3, 4, false, "batch", setMut("a", "1"), setMut("b", "2"))
+
+	// Second mutation (b=2) survived while first (a=1) did not -> non-prefix torn batch.
+	out := oracle.Check(oracle.Context{
+		Candidate: candidate.Candidate{Event: 4, Percent: 50, Seed: 1},
+		History:   []history.Entry{op1, op2},
+		Recovered: oracle.State{"x": "9", "b": "2"},
+	})
+	wantSig := oracle.FormatSignature("atomic_batch", "batch", nil)
+	if out.Class != oracle.ClassViolation || out.Rule != "atomic_batch" || out.Signature != wantSig {
+		t.Fatalf("non-prefix torn batch: got %+v, want atomic_batch/%q", out, wantSig)
+	}
+
+	// Mixed set+delete batch where delete survived but set did not.
+	opDelBatch := testEntry(1, 1, 2, false, "batch", setMut("a", "1"), history.Mutation{Kind: "delete", Key: []byte("b")})
+	outDel := oracle.Check(oracle.Context{
+		Candidate: candidate.Candidate{Event: 2, Percent: 50, Seed: 1},
+		History:   []history.Entry{opDelBatch},
+		Initial:   oracle.State{"b": "2"},
+		Recovered: oracle.State{},
+	})
+	if outDel.Class != oracle.ClassViolation || outDel.Rule != "atomic_batch" || outDel.Signature != wantSig {
+		t.Fatalf("non-prefix torn set+delete batch: got %+v, want atomic_batch/%q", outDel, wantSig)
+	}
+}
+
+func TestOracleRule3AttributionEdgeCases(t *testing.T) {
+	t.Run("TailDivergentMultiMutationBatchAndIngest", func(t *testing.T) {
+		op1 := testEntry(1, 1, 2, false, "set", setMut("a", "1"))
+		op2 := testEntry(2, 3, 4, false, "set", setMut("b", "2"))
+		op3 := testEntry(3, 5, 6, false, "ingest", setMut("c", "3"), setMut("d", "4"))
+
+		// d=4 survived while c=3 was lost; earlier clean ops a=1, b=2 are present.
+		out := oracle.Check(oracle.Context{
+			Candidate: candidate.Candidate{Event: 6, Percent: 50, Seed: 1},
+			History:   []history.Entry{op1, op2, op3},
+			Recovered: oracle.State{"a": "1", "b": "2", "d": "4"},
+		})
+		wantSig := oracle.FormatSignature("prefix", "ingest", nil)
+		if out.Class != oracle.ClassViolation || out.Rule != "prefix" || out.Signature != wantSig {
+			t.Fatalf("tail-divergent ingest: got %+v, want prefix/%q", out, wantSig)
+		}
+	})
+
+	t.Run("FallbackIgnoresPostCutoffAndNonMutatingOps", func(t *testing.T) {
+		op1 := testEntry(1, 1, 2, true, "set", setMut("a", "1"))
+		op2 := testEntry(2, 3, 4, false, "ingest", setMut("b", "2")) // post-cutoff for cut=2
+		op3 := testEntry(3, 5, 6, false, "get")                      // non-mutating post-cutoff
+
+		events := []trace.Event{
+			{ID: 1, Kind: trace.KindOpBegin, Op: 1, OpKind: "set"},
+			{ID: 2, Kind: trace.KindOpEnd, Op: 1, OpKind: "set"},
+			{ID: 3, Kind: trace.KindOpBegin, Op: 2, OpKind: "ingest"},
+			{ID: 4, Kind: trace.KindOpEnd, Op: 2, OpKind: "ingest"},
+			{ID: 5, Kind: trace.KindOpBegin, Op: 3, OpKind: "get"},
+			{ID: 6, Kind: trace.KindOpEnd, Op: 3, OpKind: "get"},
+		}
+		// Unexpected corrupt key at cut=2 must attribute to "set" (last mutating op <= cut), not "get" or "ingest".
+		out := oracle.Check(oracle.Context{
+			Candidate: candidate.Candidate{Event: 2, Percent: 0, Seed: 1},
+			History:   []history.Entry{op1, op2, op3},
+			Events:    events,
+			Recovered: oracle.State{"a": "1", "never_written": "corrupt"},
+		})
+		wantSig := oracle.FormatSignature("prefix", "set", nil)
+		if out.Class != oracle.ClassViolation || out.Rule != "prefix" || out.Signature != wantSig {
+			t.Fatalf("corrupt key at cut=2: got %+v, want prefix/%q", out, wantSig)
+		}
+
+		// When only a non-mutating op started by cut, fallback must be "unknown".
+		getOnly := testEntry(1, 1, 2, false, "get")
+		laterIngest := testEntry(2, 3, 4, false, "ingest", setMut("b", "2"))
+		outUnknown := oracle.Check(oracle.Context{
+			Candidate: candidate.Candidate{Event: 2, Percent: 0, Seed: 1},
+			History:   []history.Entry{getOnly, laterIngest},
+			Recovered: oracle.State{"never_written": "corrupt"},
+		})
+		wantUnknownSig := oracle.FormatSignature("prefix", "unknown", nil)
+		if outUnknown.Class != oracle.ClassViolation || outUnknown.Rule != "prefix" || outUnknown.Signature != wantUnknownSig {
+			t.Fatalf("no mutating op <= cut: got %+v, want prefix/%q", outUnknown, wantUnknownSig)
+		}
+	})
+
+	t.Run("DeleteAndRangeDeleteOverwriteAfterCreate", func(t *testing.T) {
+		op1 := testEntry(1, 1, 2, false, "set", setMut("a", "1"))
+		op2 := testEntry(2, 3, 4, false, "delete", history.Mutation{Kind: "delete", Key: []byte("a")})
+		op3 := testEntry(3, 5, 6, false, "ingest", setMut("b", "2")) // lost
+		op4 := testEntry(4, 7, 8, false, "set", setMut("d", "4"))    // present
+
+		outDel := oracle.Check(oracle.Context{
+			Candidate: candidate.Candidate{Event: 8, Percent: 0, Seed: 1},
+			History:   []history.Entry{op1, op2, op3, op4},
+			Recovered: oracle.State{"d": "4"},
+		})
+		wantSig := oracle.FormatSignature("prefix", "ingest", nil)
+		if outDel.Class != oracle.ClassViolation || outDel.Rule != "prefix" || outDel.Signature != wantSig {
+			t.Fatalf("set+delete overwrite before lost ingest: got %+v, want prefix/%q", outDel, wantSig)
+		}
+
+		// Same pattern with range_delete over [a, b).
+		op2Range := testEntry(2, 3, 4, false, "range_delete", history.Mutation{Kind: "range_delete", Key: []byte("a"), End: []byte("b")})
+		outRange := oracle.Check(oracle.Context{
+			Candidate: candidate.Candidate{Event: 8, Percent: 0, Seed: 1},
+			History:   []history.Entry{op1, op2Range, op3, op4},
+			Recovered: oracle.State{"d": "4"},
+		})
+		if outRange.Class != oracle.ClassViolation || outRange.Rule != "prefix" || outRange.Signature != wantSig {
+			t.Fatalf("set+range_delete overwrite before lost ingest: got %+v, want prefix/%q", outRange, wantSig)
+		}
+	})
+
+	t.Run("LostFutureOpDoesNotSatisfyOverwrite", func(t *testing.T) {
+		// Initial = {"a": "0", "r": "0"}.
+		// Op 1 (ingest): set a=2 (lost)
+		// Op 2 (batch): set a=1, range_delete [r, s) (lost: "r" is still "0" in Recovered)
+		// Op 3 (set): set r=1 (also lost!)
+		// Op 4 (set): set c=3 (present)
+		// Op 2 must NOT satisfy opSatisfiedModuloLater because Op 3's set r=1 did not reach Recovered.
+		op1 := testEntry(1, 1, 2, false, "ingest", setMut("a", "2"))
+		op2 := testEntry(2, 3, 4, false, "batch",
+			setMut("a", "1"),
+			history.Mutation{Kind: "range_delete", Key: []byte("r"), End: []byte("s")},
+		)
+		op3 := testEntry(3, 5, 6, false, "set", setMut("r", "1"))
+		op4 := testEntry(4, 7, 8, false, "set", setMut("c", "3"))
+
+		out := oracle.Check(oracle.Context{
+			Candidate: candidate.Candidate{Event: 8, Percent: 0, Seed: 1},
+			History:   []history.Entry{op1, op2, op3, op4},
+			Initial:   oracle.State{"a": "0", "r": "0"},
+			Recovered: oracle.State{"a": "1", "r": "0", "c": "3"},
+		})
+		wantSig := oracle.FormatSignature("prefix", "ingest", nil)
+		if out.Class != oracle.ClassViolation || out.Rule != "prefix" || out.Signature != wantSig {
+			t.Fatalf("lost future op must not mask earlier divergence: got %+v, want prefix/%q", out, wantSig)
 		}
 	})
 }

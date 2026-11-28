@@ -2,7 +2,6 @@ package recovery_test
 
 import (
 	"fmt"
-	"math/rand/v2"
 	"testing"
 	"time"
 
@@ -10,24 +9,35 @@ import (
 	"github.com/cockroachdb/pebble/v2/vfs"
 
 	"github.com/akshatrathore1/CraConTest/internal/recovery"
+	"github.com/akshatrathore1/CraConTest/internal/replay"
+	"github.com/akshatrathore1/CraConTest/internal/trace"
+	"github.com/akshatrathore1/CraConTest/internal/vfsrec"
 )
 
-// TestCostCheck1000Ops runs a 1,000-operation workload, then measures
-// the cost per crash-recovery candidate: clone time, recovery time,
-// and check time. This determines how many candidates an exhaustive
-// pass can afford.
+// TestCostCheck1000Ops runs a 1,000-operation workload through vfsrec, replays
+// up to the pre-close cutoff into a quiescent CrashableMem, and measures the
+// cost per crash-recovery candidate: clone time, recovery time, and check time.
 func TestCostCheck1000Ops(t *testing.T) {
 	memFS := vfs.NewCrashableMem()
+	rec := vfsrec.New(memFS)
+	listener := rec.EventListener()
 	opts := &pebble.Options{
-		FS:           memFS,
-		Logger:       recovery.PanicLogger{},
-		MemTableSize: 1024 * 64, // Small memtable to force flushes.
+		FS:            rec,
+		Logger:        recovery.PanicLogger{},
+		MemTableSize:  1024 * 64, // Small memtable to force flushes.
+		EventListener: &listener,
 	}
 
-	db, err := pebble.Open("", opts)
+	db, err := pebble.Open("db", opts)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
+	closed := false
+	defer func() {
+		if !closed {
+			_ = db.Close()
+		}
+	}()
 
 	// Write 1,000 keys with mixed sync (every 10th is synced).
 	for i := 0; i < 1000; i++ {
@@ -49,12 +59,29 @@ func TestCostCheck1000Ops(t *testing.T) {
 		}
 	}
 
-	// Do NOT flush or close db before CrashClone so that unsynced buffers
-	// in memFS are actually retained and tested across retention percentages.
-	defer db.Close()
+	// Capture pre-close cutoff before closing so unsynced buffers in the replayed
+	// trace are retained without mutating memFS concurrently with CrashClone.
+	preCloseCut := rec.CurrentEventID()
+	closed = true
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
 
-	// Measure costs at 20 evenly spaced "crash points" by using different
-	// retention percentages to simulate variety.
+	events := rec.Events()
+	if err := trace.Validate(events); err != nil {
+		t.Fatalf("trace.Validate: %v", err)
+	}
+	state, err := replay.Build(events, preCloseCut)
+	if err != nil {
+		t.Fatalf("replay.Build: %v", err)
+	}
+	defer func() {
+		if err := state.Close(); err != nil {
+			t.Errorf("state.Close: %v", err)
+		}
+	}()
+
+	// Measure costs across retention percentages and seeds.
 	retentions := []int{0, 25, 50, 75, 100}
 	seeds := []uint64{1, 2, 3, 4}
 
@@ -63,41 +90,48 @@ func TestCostCheck1000Ops(t *testing.T) {
 		totalRecover time.Duration
 		totalCheck   time.Duration
 		candidates   int
+		checkedCount int
 		openErrors   int
 		openPanics   int
+		timeouts     int
 	)
 
 	for _, ret := range retentions {
 		for _, seed := range seeds {
 			// --- Clone ---
 			cloneStart := time.Now()
-			rng := rand.New(rand.NewPCG(seed, 0))
-			crashedFS := memFS.CrashClone(vfs.CrashCloneCfg{
-				UnsyncedDataPercent: ret,
-				RNG:                 rng,
-			})
+			crashedFS, err := state.Clone(ret, seed)
 			cloneDur := time.Since(cloneStart)
+			if err != nil {
+				t.Fatalf("state.Clone(%d, %d): %v", ret, seed, err)
+			}
 			totalClone += cloneDur
 
 			// --- Recover ---
 			recoverStart := time.Now()
-			result := recovery.SafeOpen(crashedFS, "", 30*time.Second)
+			result := recovery.SafeOpen(crashedFS, "db", 30*time.Second)
 			recoverDur := time.Since(recoverStart)
 			totalRecover += recoverDur
+			candidates++
 
 			if result.Timeout {
+				timeouts++
 				t.Errorf("timeout at retention=%d seed=%d", ret, seed)
-				candidates++
 				continue
 			}
 			if result.Panic != "" {
 				openPanics++
-				candidates++
+				t.Errorf("panic at retention=%d seed=%d: %s", ret, seed, result.Panic)
 				continue
 			}
 			if result.Err != nil {
 				openErrors++
-				candidates++
+				t.Errorf("open error at retention=%d seed=%d: %v", ret, seed, result.Err)
+				continue
+			}
+			if result.DB == nil {
+				openErrors++
+				t.Errorf("nil DB without error at retention=%d seed=%d", ret, seed)
 				continue
 			}
 
@@ -106,29 +140,47 @@ func TestCostCheck1000Ops(t *testing.T) {
 			checkErr := recovery.CheckIntegrity(result.DB)
 			checkDur := time.Since(checkStart)
 			totalCheck += checkDur
+			checkedCount++
 
 			if checkErr != nil {
-				t.Logf("integrity error at retention=%d seed=%d: %v", ret, seed, checkErr)
+				t.Errorf("integrity error at retention=%d seed=%d: %v", ret, seed, checkErr)
 			}
 
-			result.DB.Close()
-			candidates++
+			if err := result.DB.Close(); err != nil {
+				t.Errorf("close recovered DB at retention=%d seed=%d: %v", ret, seed, err)
+			}
 		}
 	}
 
+	if candidates == 0 || checkedCount == 0 {
+		t.Fatalf("expected checked candidates > 0, got candidates=%d checked=%d", candidates, checkedCount)
+	}
+	if timeouts > 0 || openErrors > 0 || openPanics > 0 {
+		t.Fatalf("cost check encountered recovery failures: timeouts=%d openErrors=%d openPanics=%d",
+			timeouts, openErrors, openPanics)
+	}
+
 	// Report.
+	avgClone := totalClone / time.Duration(candidates)
+	avgRecover := totalRecover / time.Duration(candidates)
+	avgCheck := totalCheck / time.Duration(checkedCount)
+	avgTotal := avgClone + avgRecover + avgCheck
+
 	t.Logf("=== COST CHECK REPORT (1,000 operations) ===")
-	t.Logf("Candidates tested: %d", candidates)
-	t.Logf("Open errors: %d, Panics: %d", openErrors, openPanics)
-	t.Logf("Total clone time:   %v (avg %v/candidate)", totalClone, totalClone/time.Duration(candidates))
-	t.Logf("Total recover time: %v (avg %v/candidate)", totalRecover, totalRecover/time.Duration(candidates))
-	t.Logf("Total check time:   %v (avg %v/candidate)", totalCheck, totalCheck/time.Duration(candidates))
-	avgTotal := (totalClone + totalRecover + totalCheck) / time.Duration(candidates)
+	t.Logf("Candidates tested: %d (checked: %d)", candidates, checkedCount)
+	t.Logf("Open errors: %d, Panics: %d, Timeouts: %d", openErrors, openPanics, timeouts)
+	t.Logf("Total clone time:   %v (avg %v/candidate)", totalClone, avgClone)
+	t.Logf("Total recover time: %v (avg %v/candidate)", totalRecover, avgRecover)
+	t.Logf("Total check time:   %v (avg %v/checked)", totalCheck, avgCheck)
 	t.Logf("Avg total per candidate: %v", avgTotal)
 
 	// Estimate affordable universe size (target: 10 minutes total).
 	tenMin := 10 * time.Minute
-	affordable := int(tenMin / avgTotal)
-	t.Logf("Affordable candidates in 10 minutes: ~%d", affordable)
+	if avgTotal > 0 {
+		affordable := int(tenMin / avgTotal)
+		t.Logf("Affordable candidates in 10 minutes: ~%d", affordable)
+	} else {
+		t.Logf("Affordable candidates in 10 minutes: >%d (avgTotal < clock resolution)", int64(tenMin))
+	}
 	t.Logf("=============================================")
 }

@@ -72,6 +72,63 @@ func canonical(universe []candidate.Candidate) []candidate.Candidate {
 	return result
 }
 
+// cmpFloatDesc compares two float64 values in descending order.
+// Finite and infinite values rank ahead of NaN, and two NaNs tie.
+func cmpFloatDesc(a, b float64) (decided, greater bool) {
+	aNaN, bNaN := math.IsNaN(a), math.IsNaN(b)
+	if aNaN && bNaN {
+		return false, false
+	}
+	if aNaN != bNaN {
+		return true, !aNaN
+	}
+	if a != b {
+		return true, a > b
+	}
+	return false, false
+}
+
+type namedWeight struct {
+	name  string
+	value float64
+}
+
+func validateNamedWeights(prefix string, pairs []namedWeight) error {
+	for _, p := range pairs {
+		if math.IsNaN(p.value) || math.IsInf(p.value, 0) || p.value < 0 {
+			return fmt.Errorf("%s %s=%v must be finite and nonnegative", prefix, p.name, p.value)
+		}
+	}
+	return nil
+}
+
+func validateCombinedWeights(w Weights) error {
+	return validateNamedWeights("strategy: weight", []namedWeight{
+		{name: "alpha", value: w.Alpha},
+		{name: "beta", value: w.Beta},
+		{name: "gamma", value: w.Gamma},
+		{name: "delta", value: w.Delta},
+	})
+}
+
+func validateDCGWeightsFromWeights(name string, w Weights) (DCGWeights, error) {
+	if err := validateNamedWeights("strategy: dcg weight", []namedWeight{
+		{name: "wal", value: w.Alpha},
+		{name: "manifest", value: w.Beta},
+		{name: "rename", value: w.Gamma},
+	}); err != nil {
+		return DCGWeights{}, err
+	}
+	if math.IsNaN(w.Delta) || math.IsInf(w.Delta, 0) || w.Delta != 0 {
+		return DCGWeights{}, fmt.Errorf("strategy: %s does not accept non-zero delta weight=%v", name, w.Delta)
+	}
+	return DCGWeights{
+		WALWeight:      w.Alpha,
+		ManifestWeight: w.Beta,
+		RenameWeight:   w.Gamma,
+	}, nil
+}
+
 // features looks up every candidate's cutoff; ok is false if one is missing.
 func features(view *graph.View, universe []candidate.Candidate) ([]graph.Features, bool) {
 	if view == nil {
@@ -191,6 +248,9 @@ func (s stride) Rank(view *graph.View, universe []candidate.Candidate) []candida
 	if step < 1 {
 		step = 1
 	}
+	if step > n {
+		step = n
+	}
 
 	result := make([]candidate.Candidate, 0, n)
 	for offset := 0; offset < step; offset++ {
@@ -270,10 +330,8 @@ type combined struct{ weights Weights }
 // nonnegative. Persistence-only uses Gamma=0, semantic-only uses
 // Alpha=Beta=0, and an ablation zeroes exactly its named term.
 func NewCombined(weights Weights) (Strategy, error) {
-	for name, value := range map[string]float64{"alpha": weights.Alpha, "beta": weights.Beta, "gamma": weights.Gamma, "delta": weights.Delta} {
-		if math.IsNaN(value) || math.IsInf(value, 0) || value < 0 {
-			return nil, fmt.Errorf("strategy: weight %s=%v must be finite and nonnegative", name, value)
-		}
+	if err := validateCombinedWeights(weights); err != nil {
+		return nil, err
 	}
 	return combined{weights: weights}, nil
 }
@@ -292,13 +350,8 @@ type scoreHeap []scored
 
 func (h scoreHeap) Len() int { return len(h) }
 func (h scoreHeap) Less(left, right int) bool {
-	lNaN := math.IsNaN(h[left].score)
-	rNaN := math.IsNaN(h[right].score)
-	if lNaN != rNaN {
-		return !lNaN
-	}
-	if h[left].score != h[right].score {
-		return h[left].score > h[right].score
+	if dec, gt := cmpFloatDesc(h[left].score, h[right].score); dec {
+		return gt
 	}
 	return h[left].position < h[right].position
 }
@@ -311,18 +364,13 @@ func (h *scoreHeap) Pop() any {
 	return last
 }
 
-// Rank selects greedily: at each step the remaining candidate with the
-// highest score, where Novelty is one only while no selected candidate
-// shares its (StateKey, Percent). Ties go to the earlier canonical tuple.
-// Scores never increase, so a lazily re-scored max-heap gives exactly the
-// order of recomputing every remaining score at each step.
-func (strategy combined) Rank(view *graph.View, universe []candidate.Candidate) []candidate.Candidate {
+func runCombined(view *graph.View, universe []candidate.Candidate, w Weights, wantRecords bool) ([]candidate.Candidate, []ScoreRecord, bool) {
 	ordered := canonical(universe)
 	labels, ok := features(view, ordered)
 	if !ok {
-		return nil
+		return nil, nil, false
 	}
-	w := strategy.weights
+
 	base := make([]float64, len(ordered))
 	queue := make(scoreHeap, 0, len(ordered))
 	for index, label := range labels {
@@ -330,8 +378,15 @@ func (strategy combined) Rank(view *graph.View, universe []candidate.Candidate) 
 		queue = append(queue, scored{position: index, score: base[index] + w.Delta, novel: true})
 	}
 	heap.Init(&queue)
+
 	seen := make(map[statePercentKey]bool)
-	result := make([]candidate.Candidate, 0, len(ordered))
+	var result []candidate.Candidate
+	var records []ScoreRecord
+	if wantRecords {
+		records = make([]ScoreRecord, 0, len(ordered))
+	} else {
+		result = make([]candidate.Candidate, 0, len(ordered))
+	}
 	for queue.Len() > 0 {
 		top := heap.Pop(&queue).(scored)
 		key := statePercentKey{labels[top.position].StateKey, ordered[top.position].Percent}
@@ -340,7 +395,36 @@ func (strategy combined) Rank(view *graph.View, universe []candidate.Candidate) 
 			continue
 		}
 		seen[key] = true
-		result = append(result, ordered[top.position])
+		if wantRecords {
+			var novelty uint64
+			if top.novel {
+				novelty = 1
+			}
+			records = append(records, ScoreRecord{
+				Candidate: ordered[top.position],
+				Rank:      len(records),
+				Desc:      labels[top.position].Desc,
+				CrossFile: labels[top.position].CrossFile,
+				Semantic:  labels[top.position].Semantic,
+				Novelty:   novelty,
+				Score:     top.score,
+			})
+		} else {
+			result = append(result, ordered[top.position])
+		}
+	}
+	return result, records, true
+}
+
+// Rank selects greedily: at each step the remaining candidate with the
+// highest score, where Novelty is one only while no selected candidate
+// shares its (StateKey, Percent). Ties go to the earlier canonical tuple.
+// Scores never increase, so a lazily re-scored max-heap gives exactly the
+// order of recomputing every remaining score at each step.
+func (strategy combined) Rank(view *graph.View, universe []candidate.Candidate) []candidate.Candidate {
+	result, _, ok := runCombined(view, universe, strategy.weights, false)
+	if !ok {
+		return nil
 	}
 	return result
 }
@@ -359,51 +443,13 @@ type ScoreRecord struct {
 // Explain produces the detailed audit records explaining combined strategy ranking,
 // reproducing NewCombined(w).Rank exactly.
 func Explain(view *graph.View, universe []candidate.Candidate, w Weights) ([]ScoreRecord, error) {
-	for name, value := range map[string]float64{"alpha": w.Alpha, "beta": w.Beta, "gamma": w.Gamma, "delta": w.Delta} {
-		if math.IsNaN(value) || math.IsInf(value, 0) || value < 0 {
-			return nil, fmt.Errorf("strategy: weight %s=%v must be finite and nonnegative", name, value)
-		}
+	if err := validateCombinedWeights(w); err != nil {
+		return nil, err
 	}
-
-	ordered := canonical(universe)
-	labels, ok := features(view, ordered)
+	_, records, ok := runCombined(view, universe, w, true)
 	if !ok {
 		return nil, errors.New("strategy: view missing features for candidates")
 	}
-
-	base := make([]float64, len(ordered))
-	queue := make(scoreHeap, 0, len(ordered))
-	for index, label := range labels {
-		base[index] = w.Alpha*float64(label.Desc) + w.Beta*float64(label.CrossFile) + w.Gamma*float64(label.Semantic)
-		queue = append(queue, scored{position: index, score: base[index] + w.Delta, novel: true})
-	}
-	heap.Init(&queue)
-
-	seen := make(map[statePercentKey]bool)
-	records := make([]ScoreRecord, 0, len(ordered))
-	for queue.Len() > 0 {
-		top := heap.Pop(&queue).(scored)
-		key := statePercentKey{labels[top.position].StateKey, ordered[top.position].Percent}
-		if top.novel && seen[key] {
-			heap.Push(&queue, scored{position: top.position, score: base[top.position], novel: false})
-			continue
-		}
-		seen[key] = true
-		var novelty uint64
-		if top.novel {
-			novelty = 1
-		}
-		records = append(records, ScoreRecord{
-			Candidate: ordered[top.position],
-			Rank:      len(records),
-			Desc:      labels[top.position].Desc,
-			CrossFile: labels[top.position].CrossFile,
-			Semantic:  labels[top.position].Semantic,
-			Novelty:   novelty,
-			Score:     top.score,
-		})
-	}
-
 	return records, nil
 }
 
@@ -411,8 +457,22 @@ func Explain(view *graph.View, universe []candidate.Candidate, w Weights) ([]Sco
 var ErrUnknownStrategy = errors.New("strategy: unknown strategy name")
 
 // ByName constructs a ranking strategy by its name or canonical baseline code.
-// The seed is used only by random; weights only by combined or custom RHG.
-func ByName(name string, seed uint64, weights Weights) (Strategy, error) {
+// The seed is used by randomized strategies (random, r1, r2, dcg-flag-only).
+// When weights is omitted, each weighted strategy uses its own canonical defaults
+// (DefaultWeights for combined, DefaultRHGWeights for rhg, DefaultDCGWeights for
+// dcg and dcg-pr). When weights is provided, it supplies explicit custom weights
+// (including all-zero ablation Weights{}) and is validated as finite and nonnegative;
+// for dcg and dcg-pr, Delta must be zero.
+func ByName(name string, seed uint64, weights ...Weights) (Strategy, error) {
+	if len(weights) > 1 {
+		return nil, fmt.Errorf("strategy: ByName accepts at most one Weights override, got %d", len(weights))
+	}
+	hasCustomWeights := len(weights) == 1
+	var custom Weights
+	if hasCustomWeights {
+		custom = weights[0]
+	}
+
 	switch name {
 	case "random", "b0":
 		return NewRandom(seed), nil
@@ -423,18 +483,18 @@ func ByName(name string, seed uint64, weights Weights) (Strategy, error) {
 	case "stride", "b3", "even_interval", "even-interval":
 		return NewStride(), nil
 	case "combined", "b4":
-		return NewCombined(weights)
+		if hasCustomWeights {
+			return NewCombined(custom)
+		}
+		return NewCombined(DefaultWeights())
 	case "representative", "b5":
 		return NewRepresentative(), nil
 	case "sync-boundary", "b6", "sync_boundary", "c1":
 		return NewSyncBoundary(), nil
 	case "rhg", "b7", "risk_horizon", "risk-horizon":
-		if weights != (Weights{}) {
-			w := RHGWeights{Risk: weights.Alpha, Barrier: weights.Beta, Semantic: weights.Gamma, Novelty: weights.Delta}
-			if err := validateRHGWeights(w); err != nil {
-				return nil, err
-			}
-			return NewRiskHorizon(w), nil
+		if hasCustomWeights {
+			w := RHGWeights{Risk: custom.Alpha, Barrier: custom.Beta, Semantic: custom.Gamma, Novelty: custom.Delta}
+			return NewRiskHorizonWithWeights(w)
 		}
 		return NewRiskHorizon(DefaultRHGWeights()), nil
 	case "r1", "r1-random", "r1_random", "r1_zero_retention_first", "r0_retention_first_random":
@@ -442,19 +502,25 @@ func ByName(name string, seed uint64, weights Weights) (Strategy, error) {
 	case "r2", "r2-representative", "r2_representative", "r2_state_representative", "state_representative_r1":
 		return NewR2(seed), nil
 	case "dcg", "b8", "durability_contract", "durability-contract":
-		if weights != (Weights{}) {
-			w := DCGWeights{
-				WALWeight:      weights.Alpha,
-				ManifestWeight: weights.Beta,
-				RenameWeight:   weights.Gamma,
+		if hasCustomWeights {
+			w, err := validateDCGWeightsFromWeights(name, custom)
+			if err != nil {
+				return nil, err
 			}
 			return NewDCG(w), nil
 		}
-		return NewDCG(), nil
+		return NewDCG(DefaultDCGWeights()), nil
 	case "dcg-flag-only", "dcg_flag_only", "dcg-flagonly":
 		return NewDCGFlagOnly(seed), nil
 	case "dcg-pr", "dcg_partial", "dcg-partial":
-		return NewDCGPartial(), nil
+		if hasCustomWeights {
+			w, err := validateDCGWeightsFromWeights(name, custom)
+			if err != nil {
+				return nil, err
+			}
+			return NewDCGPartial(w), nil
+		}
+		return NewDCGPartial(DefaultDCGWeights()), nil
 	}
 	return nil, fmt.Errorf("%w: %q", ErrUnknownStrategy, name)
 }

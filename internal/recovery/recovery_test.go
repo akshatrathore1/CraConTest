@@ -1,6 +1,7 @@
 package recovery_test
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"math/rand/v2"
@@ -13,31 +14,35 @@ import (
 	"github.com/cockroachdb/pebble/v2/vfs"
 
 	"github.com/akshatrathore1/CraConTest/internal/recovery"
+	"github.com/akshatrathore1/CraConTest/internal/replay"
+	"github.com/akshatrathore1/CraConTest/internal/trace"
+	"github.com/akshatrathore1/CraConTest/internal/vfsrec"
 )
 
-// TestCrashCycle exercises the full Open→Write→Read→Crash→Recover→Verify
-// cycle using Pebble's in-memory CrashableMem filesystem.
-//
-// TestRecoveryEndToEnd verifies that the recovery harness can:
-//  1. Open a Pebble database on an in-memory VFS
-//  2. Write data with explicit sync
-//  3. Read it back
-//  4. Simulate a crash via CrashClone (100% retention = all synced data kept)
-//  5. Recover the database from the crashed filesystem
-//  6. Verify that synced data survived
+// TestCrashCycle exercises the full Open→Write→Read→Record→Replay→Crash→Recover→Verify
+// cycle using Pebble's in-memory CrashableMem filesystem and trace replay.
 func TestCrashCycle(t *testing.T) {
 	// --- RECORD PHASE: Open, Write, Sync ---
 
 	memFS := vfs.NewCrashableMem()
+	rec := vfsrec.New(memFS)
+	listener := rec.EventListener()
 	opts := &pebble.Options{
-		FS:     memFS,
-		Logger: recovery.PanicLogger{},
+		FS:            rec,
+		Logger:        recovery.PanicLogger{},
+		EventListener: &listener,
 	}
 
-	db, err := pebble.Open("", opts)
+	db, err := pebble.Open("db", opts)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
+	closed := false
+	defer func() {
+		if !closed {
+			_ = db.Close()
+		}
+	}()
 
 	// Write 10 key-value pairs with sync.
 	syncOpt := pebble.Sync
@@ -58,28 +63,43 @@ func TestCrashCycle(t *testing.T) {
 		}
 		expected := fmt.Sprintf("value-%03d", i)
 		if string(val) != expected {
+			_ = closer.Close()
 			t.Fatalf("pre-crash get %s: got %q, want %q", key, val, expected)
 		}
-		closer.Close()
+		if err := closer.Close(); err != nil {
+			t.Fatalf("pre-crash close %s: %v", key, err)
+		}
 	}
 
-	// --- CRASH PHASE: CrashClone with 100% retention before closing DB ---
-	// 100% retention means all unsynced data is kept. Combined with the
-	// synced writes above, the recovered database must contain everything.
-	rng := rand.New(rand.NewPCG(42, 0))
-	crashedFS := memFS.CrashClone(vfs.CrashCloneCfg{
-		UnsyncedDataPercent: 100,
-		RNG:                 rng,
-	})
+	// Capture cutoff before Close so the crash snapshot represents an unclosed WAL.
+	preCloseCut := rec.CurrentEventID()
 
-	// Close the original database after cloning the crash state.
+	// Close the original database cleanly before replaying the prefix.
+	closed = true
 	if err := db.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
 
+	// --- CRASH PHASE: Replay prefix and CrashClone with 100% retention ---
+	events := rec.Events()
+	if err := trace.Validate(events); err != nil {
+		t.Fatalf("trace.Validate: %v", err)
+	}
+	state, err := replay.Build(events, preCloseCut)
+	if err != nil {
+		t.Fatalf("replay.Build: %v", err)
+	}
+	crashedFS, err := state.Clone(100, 42)
+	if closeErr := state.Close(); closeErr != nil {
+		t.Fatalf("state.Close: %v", closeErr)
+	}
+	if err != nil {
+		t.Fatalf("state.Clone: %v", err)
+	}
+
 	// --- RECOVER PHASE: SafeOpen on the crashed filesystem ---
 
-	result := recovery.SafeOpen(crashedFS, "", 30*time.Second)
+	result := recovery.SafeOpen(crashedFS, "db", 30*time.Second)
 	if result.Err != nil {
 		t.Fatalf("recovery open error: %v", result.Err)
 	}
@@ -92,7 +112,11 @@ func TestCrashCycle(t *testing.T) {
 	if result.DB == nil {
 		t.Fatal("recovery returned nil DB without error")
 	}
-	defer result.DB.Close()
+	defer func() {
+		if err := result.DB.Close(); err != nil {
+			t.Errorf("close recovered DB: %v", err)
+		}
+	}()
 
 	// --- VERIFY PHASE: Check integrity and data ---
 
@@ -122,21 +146,30 @@ func TestCrashCycle(t *testing.T) {
 }
 
 // TestCrashCyclePartialRetention tests crash recovery with 0% retention
-// of unsynced data. Synced writes must still survive; unsynced writes
-// may be lost.
+// of unsynced data via trace replay. Synced writes must still survive; unsynced
+// writes may be lost.
 func TestCrashCyclePartialRetention(t *testing.T) {
 	memFS := vfs.NewCrashableMem()
+	rec := vfsrec.New(memFS)
+	listener := rec.EventListener()
 	opts := &pebble.Options{
-		FS:     memFS,
+		FS:     rec,
 		Logger: recovery.PanicLogger{},
 		// Small memtable to force flushes.
-		MemTableSize: 1024 * 64,
+		MemTableSize:  1024 * 64,
+		EventListener: &listener,
 	}
 
-	db, err := pebble.Open("", opts)
+	db, err := pebble.Open("db", opts)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
+	closed := false
+	defer func() {
+		if !closed {
+			_ = db.Close()
+		}
+	}()
 
 	// Write synced data.
 	for i := 0; i < 5; i++ {
@@ -156,18 +189,30 @@ func TestCrashCyclePartialRetention(t *testing.T) {
 		}
 	}
 
-	// Crash with 0% retention of unsynced data.
-	rng := rand.New(rand.NewPCG(99, 0))
-	crashedFS := memFS.CrashClone(vfs.CrashCloneCfg{
-		UnsyncedDataPercent: 0,
-		RNG:                 rng,
-	})
+	preCloseCut := rec.CurrentEventID()
 
+	closed = true
 	if err := db.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
 
-	result := recovery.SafeOpen(crashedFS, "", 30*time.Second)
+	events := rec.Events()
+	if err := trace.Validate(events); err != nil {
+		t.Fatalf("trace.Validate: %v", err)
+	}
+	state, err := replay.Build(events, preCloseCut)
+	if err != nil {
+		t.Fatalf("replay.Build: %v", err)
+	}
+	crashedFS, err := state.Clone(0, 99)
+	if closeErr := state.Close(); closeErr != nil {
+		t.Fatalf("state.Close: %v", closeErr)
+	}
+	if err != nil {
+		t.Fatalf("state.Clone: %v", err)
+	}
+
+	result := recovery.SafeOpen(crashedFS, "db", 30*time.Second)
 	if result.Panic != "" {
 		t.Fatalf("recovery panic: %s", result.Panic)
 	}
@@ -180,7 +225,11 @@ func TestCrashCyclePartialRetention(t *testing.T) {
 	if result.DB == nil {
 		t.Fatal("recovery returned nil DB without error")
 	}
-	defer result.DB.Close()
+	defer func() {
+		if err := result.DB.Close(); err != nil {
+			t.Errorf("close recovered DB: %v", err)
+		}
+	}()
 
 	// If recovery succeeded, check integrity.
 	if err := recovery.CheckIntegrity(result.DB); err != nil {
@@ -243,6 +292,12 @@ func TestCrashCycleManyOperations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
+	closed := false
+	defer func() {
+		if !closed {
+			_ = db.Close()
+		}
+	}()
 
 	// Write 100 keys with alternating sync.
 	syncedKeys := make(map[string]string)
@@ -264,6 +319,7 @@ func TestCrashCycleManyOperations(t *testing.T) {
 		t.Fatalf("flush: %v", err)
 	}
 
+	closed = true
 	if err := db.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
@@ -310,6 +366,7 @@ type blockingFS struct {
 	mu           sync.Mutex
 	listReturned bool
 	dirSyncOnce  sync.Once
+	lockOnce     sync.Once
 }
 
 func (b *blockingFS) List(dir string) ([]string, error) {
@@ -355,7 +412,7 @@ func (b *blockingFS) Lock(name string) (io.Closer, error) {
 		Closer: closer,
 		onClose: func() {
 			if b.lockClosed != nil {
-				close(b.lockClosed)
+				b.lockOnce.Do(func() { close(b.lockClosed) })
 			}
 		},
 	}, nil
@@ -441,23 +498,33 @@ func TestAllEntriesGracefulOnClosedOrValidDB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-
-	_ = db.Set([]byte("k1"), []byte("v1"), pebble.Sync)
-	_ = db.Set([]byte("k2"), []byte("v2"), pebble.Sync)
-
-	count := 0
-	for k, v := range recovery.AllEntries(db) {
-		if k == "" || v == "" {
-			t.Errorf("empty entry in AllEntries")
+	closed := false
+	defer func() {
+		if !closed {
+			_ = db.Close()
 		}
-		count++
+	}()
+
+	if err := db.Set([]byte("k1"), []byte("v1"), pebble.Sync); err != nil {
+		t.Fatalf("set k1: %v", err)
 	}
-	if count != 2 {
-		t.Errorf("expected 2 entries, got %d", count)
+	if err := db.Set([]byte("k2"), []byte("v2"), pebble.Sync); err != nil {
+		t.Fatalf("set k2: %v", err)
+	}
+
+	got := make(map[string]string)
+	for k, v := range recovery.AllEntries(db) {
+		got[k] = v
+	}
+	if len(got) != 2 || got["k1"] != "v1" || got["k2"] != "v2" {
+		t.Errorf("unexpected AllEntries output: %#v", got)
 	}
 
 	// Close database and verify AllEntries panics on invalid/closed DB
-	_ = db.Close()
+	closed = true
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
 	panicked := false
 	func() {
 		defer func() {
@@ -483,9 +550,15 @@ func TestAllEntriesPropagatesYieldPanic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	}()
 
-	_ = db.Set([]byte("k1"), []byte("v1"), pebble.Sync)
+	if err := db.Set([]byte("k1"), []byte("v1"), pebble.Sync); err != nil {
+		t.Fatalf("set k1: %v", err)
+	}
 
 	var recoveredVal any
 	func() {
@@ -504,24 +577,85 @@ func TestAllEntriesPropagatesYieldPanic(t *testing.T) {
 
 type hangingFS struct {
 	vfs.FS
-	block chan struct{}
+	block         chan struct{}
+	createStarted chan struct{}
+	lockClosed    chan struct{}
+	createOnce    sync.Once
+	lockOnce      sync.Once
 }
 
-func (h hangingFS) Create(name string, category vfs.DiskWriteCategory) (vfs.File, error) {
+func (h *hangingFS) Create(name string, category vfs.DiskWriteCategory) (vfs.File, error) {
 	if h.block != nil {
+		if h.createStarted != nil {
+			h.createOnce.Do(func() { close(h.createStarted) })
+		}
 		<-h.block
 	}
 	return h.FS.Create(name, category)
 }
 
-func TestSafeOpenTimeoutNoGoroutineLeak(t *testing.T) {
+func (h *hangingFS) Lock(name string) (io.Closer, error) {
+	closer, err := h.FS.Lock(name)
+	if err != nil {
+		return nil, err
+	}
+	return &lockCloserWrapper{
+		Closer: closer,
+		onClose: func() {
+			if h.lockClosed != nil {
+				h.lockOnce.Do(func() { close(h.lockClosed) })
+			}
+		},
+	}, nil
+}
+
+func TestSafeOpenTimeoutCleansUpAfterBlockedCreate(t *testing.T) {
 	mem := vfs.NewCrashableMem()
 	block := make(chan struct{})
-	t.Cleanup(func() { close(block) })
-	fs := hangingFS{FS: mem, block: block}
-	res := recovery.SafeOpen(fs, "db", 20*time.Millisecond)
+	var unblockOnce sync.Once
+	unblock := func() { unblockOnce.Do(func() { close(block) }) }
+	t.Cleanup(unblock)
+	fs := &hangingFS{
+		FS:            mem,
+		block:         block,
+		createStarted: make(chan struct{}),
+		lockClosed:    make(chan struct{}),
+	}
+	resultCh := make(chan recovery.OpenResult, 1)
+	go func() {
+		resultCh <- recovery.SafeOpen(fs, "db", 20*time.Millisecond)
+	}()
+	select {
+	case <-fs.createStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("recovery did not reach the blocked Create")
+	}
+	var res recovery.OpenResult
+	select {
+	case res = <-resultCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("SafeOpen did not return while Create was blocked")
+	}
 	if !res.Timeout {
+		if res.DB != nil {
+			_ = res.DB.Close()
+		}
 		t.Fatalf("expected timeout, got: %+v", res)
+	}
+
+	unblock()
+	select {
+	case <-fs.lockClosed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("late recovery did not release the database lock")
+	}
+
+	db, err := pebble.Open("db", &pebble.Options{FS: mem, Logger: recovery.PanicLogger{}})
+	if err != nil {
+		t.Fatalf("re-open after late cleanup: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close after late cleanup: %v", err)
 	}
 }
 
@@ -547,9 +681,16 @@ func TestRecoveryPipelineErrorPaths(t *testing.T) {
 		if err != nil {
 			t.Fatalf("setup open: %v", err)
 		}
+		closed := false
+		defer func() {
+			if !closed {
+				_ = db.Close()
+			}
+		}()
 		if err := db.Set([]byte("k1"), []byte("v1"), pebble.Sync); err != nil {
 			t.Fatalf("set: %v", err)
 		}
+		closed = true
 		if err := db.Close(); err != nil {
 			t.Fatalf("close: %v", err)
 		}
@@ -574,9 +715,16 @@ func TestRecoveryPipelineErrorPaths(t *testing.T) {
 		if err != nil {
 			t.Fatalf("setup open: %v", err)
 		}
+		closed := false
+		defer func() {
+			if !closed {
+				_ = db.Close()
+			}
+		}()
 		if err := db.Set([]byte("k1"), []byte("v1"), pebble.Sync); err != nil {
 			t.Fatalf("set: %v", err)
 		}
+		closed = true
 		if err := db.Close(); err != nil {
 			t.Fatalf("close: %v", err)
 		}
@@ -713,8 +861,19 @@ func TestRecoveryPipelineErrorPaths(t *testing.T) {
 		if err != nil {
 			t.Fatalf("setup open: %v", err)
 		}
-		_ = db.Set([]byte("k"), []byte("v"), pebble.Sync)
-		_ = db.Close()
+		closed := false
+		defer func() {
+			if !closed {
+				_ = db.Close()
+			}
+		}()
+		if err := db.Set([]byte("k"), []byte("v"), pebble.Sync); err != nil {
+			t.Fatalf("set: %v", err)
+		}
+		closed = true
+		if err := db.Close(); err != nil {
+			t.Fatalf("close: %v", err)
+		}
 
 		// Corrupt OPTIONS file
 		entries, err := mem.List("db")
@@ -757,14 +916,25 @@ func TestRecoveryPipelineErrorPaths(t *testing.T) {
 		if err != nil {
 			t.Fatalf("setup open: %v", err)
 		}
+		closed := false
+		defer func() {
+			if !closed {
+				_ = db.Close()
+			}
+		}()
 		// Write several keys and flush to create an SSTable
 		for i := 0; i < 50; i++ {
-			_ = db.Set([]byte(fmt.Sprintf("key-%03d", i)), []byte(fmt.Sprintf("val-%03d", i)), nil)
+			if err := db.Set(fmt.Appendf(nil, "key-%03d", i), fmt.Appendf(nil, "val-%03d", i), pebble.NoSync); err != nil {
+				t.Fatalf("set key-%03d: %v", i, err)
+			}
 		}
 		if err := db.Flush(); err != nil {
 			t.Fatalf("flush: %v", err)
 		}
-		_ = db.Close()
+		closed = true
+		if err := db.Close(); err != nil {
+			t.Fatalf("close: %v", err)
+		}
 
 		// Find the .sst file and corrupt it
 		entries, err := mem.List("db")
@@ -793,12 +963,15 @@ func TestRecoveryPipelineErrorPaths(t *testing.T) {
 		// Attempt SafeOpen on DB with corrupt SST
 		res := recovery.SafeOpen(mem, "db", 5*time.Second)
 		if res.DB != nil {
-			defer res.DB.Close()
-			// If Pebble opened without validating all SSTs upfront, CheckIntegrity or DumpContents MUST catch corruption
-			errInt := recovery.CheckIntegrity(res.DB)
-			_, errDump := recovery.DumpContents(res.DB)
-			if errInt == nil && errDump == nil {
-				t.Fatalf("expected CheckIntegrity or DumpContents to fail on corrupt SST")
+			defer func() {
+				_ = res.DB.Close()
+			}()
+			// If Pebble opened without validating all SSTs upfront, BOTH CheckIntegrity and DumpContents MUST catch corruption
+			if errInt := recovery.CheckIntegrity(res.DB); errInt == nil {
+				t.Fatalf("expected CheckIntegrity to fail on corrupt SST")
+			}
+			if _, errDump := recovery.DumpContents(res.DB); errDump == nil {
+				t.Fatalf("expected DumpContents to fail on corrupt SST")
 			}
 		} else {
 			// If SafeOpen caught corruption immediately, that is also a valid error outcome
@@ -807,4 +980,185 @@ func TestRecoveryPipelineErrorPaths(t *testing.T) {
 			}
 		}
 	})
+}
+
+type panicFS struct {
+	vfs.FS
+	panicVal any
+}
+
+func (p *panicFS) List(dir string) ([]string, error) {
+	panic(p.panicVal)
+}
+
+func TestSafeOpenInputGuardsAndEmptyPanic(t *testing.T) {
+	resNilFS := recovery.SafeOpen(nil, "db", time.Second)
+	if resNilFS.Err == nil || resNilFS.DB != nil || resNilFS.Timeout {
+		t.Fatalf("expected non-timeout error on nil FS, got %+v", resNilFS)
+	}
+
+	mem := vfs.NewCrashableMem()
+	for _, d := range []time.Duration{0, -5 * time.Millisecond} {
+		resBadTimeout := recovery.SafeOpen(mem, "db", d)
+		if resBadTimeout.Err == nil || resBadTimeout.DB != nil || resBadTimeout.Timeout {
+			t.Fatalf("expected error (not Timeout) for timeout=%v, got %+v", d, resBadTimeout)
+		}
+	}
+
+	pfs := &panicFS{FS: mem, panicVal: ""}
+	resPanic := recovery.SafeOpen(pfs, "db", time.Second)
+	if resPanic.Panic == "" || resPanic.Err != nil || resPanic.Timeout || resPanic.DB != nil {
+		t.Fatalf("expected non-empty Panic for panic(\"\"), got %+v", resPanic)
+	}
+}
+
+func TestCheckIntegrityAndDumpContentsReturnPanicErrorOnClosedDB(t *testing.T) {
+	mem := vfs.NewCrashableMem()
+	db, err := pebble.Open("db", &pebble.Options{
+		FS:     mem,
+		Logger: recovery.PanicLogger{},
+	})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	errInt := recovery.CheckIntegrity(db)
+	if errInt == nil {
+		t.Fatal("expected CheckIntegrity error on closed DB")
+	}
+	var peInt *recovery.PanicError
+	if !errors.As(errInt, &peInt) {
+		t.Fatalf("expected *recovery.PanicError from CheckIntegrity on closed DB, got %T: %v", errInt, errInt)
+	}
+
+	_, errDump := recovery.DumpContents(db)
+	if errDump == nil {
+		t.Fatal("expected DumpContents error on closed DB")
+	}
+	var peDump *recovery.PanicError
+	if !errors.As(errDump, &peDump) {
+		t.Fatalf("expected *recovery.PanicError from DumpContents on closed DB, got %T: %v", errDump, errDump)
+	}
+}
+
+func TestAllEntriesEarlyBreakChecksIterError(t *testing.T) {
+	mem := vfs.NewCrashableMem()
+	db, err := pebble.Open("db", &pebble.Options{
+		FS:                          mem,
+		Logger:                      recovery.PanicLogger{},
+		MemTableSize:                4 * 1024,
+		DisableAutomaticCompactions: true,
+	})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	for i := 0; i < 40; i++ {
+		if err := db.Set(fmt.Appendf(nil, "k-%03d", i), fmt.Appendf(nil, "v-%03d-padding", i), pebble.Sync); err != nil {
+			_ = db.Close()
+			t.Fatalf("set: %v", err)
+		}
+	}
+	if err := db.Flush(); err != nil {
+		_ = db.Close()
+		t.Fatalf("flush: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// Corrupt a byte in the middle of the SST data block (leaving footer/header readable by Open)
+	entries, err := mem.List("db")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	var sstPath string
+	for _, e := range entries {
+		if strings.HasSuffix(e, ".sst") {
+			sstPath = "db/" + e
+			break
+		}
+	}
+	if sstPath == "" {
+		t.Fatal("expected .sst file after flush")
+	}
+	f, err := mem.Open(sstPath)
+	if err != nil {
+		t.Fatalf("open sst: %v", err)
+	}
+	raw, err := io.ReadAll(f)
+	_ = f.Close()
+	if err != nil || len(raw) < 64 {
+		t.Fatalf("read sst: err=%v len=%d", err, len(raw))
+	}
+	raw[0] ^= 0xff
+	wf, err := mem.Create(sstPath, vfs.WriteCategoryUnspecified)
+	if err != nil {
+		t.Fatalf("recreate sst: %v", err)
+	}
+	if _, err := wf.Write(raw); err != nil {
+		_ = wf.Close()
+		t.Fatalf("write corrupt sst: %v", err)
+	}
+	if err := wf.Close(); err != nil {
+		t.Fatalf("close corrupt sst: %v", err)
+	}
+
+	res := recovery.SafeOpen(mem, "db", 5*time.Second)
+	if res.DB == nil {
+		t.Fatalf("expected SafeOpen to open DB with data-block bitflip, got %+v", res)
+	}
+	defer func() {
+		_ = res.DB.Close()
+	}()
+
+	// Verify CheckIntegrity catches the corruption
+	if err := recovery.CheckIntegrity(res.DB); err == nil {
+		t.Fatal("expected CheckIntegrity to fail on SST data-block bitflip")
+	}
+	// Verify DumpContents catches the corruption cleanly without panicking from use-after-close
+	if _, err := recovery.DumpContents(res.DB); err == nil {
+		t.Fatal("expected DumpContents to fail on SST data-block bitflip")
+	}
+
+	// Verify AllEntries catches iterator error (does not swallow corruption error).
+	var iterPanic any
+	func() {
+		defer func() {
+			iterPanic = recover()
+		}()
+		for range recovery.AllEntries(res.DB) {
+			break
+		}
+	}()
+	if iterPanic == nil {
+		t.Fatal("expected AllEntries to panic on corrupt SST even with early break")
+	}
+
+	// Also verify early break on a healthy DB closes iterator cleanly without leaking references.
+	healthyMem := vfs.NewCrashableMem()
+	hdb, err := pebble.Open("db", &pebble.Options{FS: healthyMem, Logger: recovery.PanicLogger{}})
+	if err != nil {
+		t.Fatalf("healthy open: %v", err)
+	}
+	for i := 0; i < 5; i++ {
+		if err := hdb.Set(fmt.Appendf(nil, "hk-%02d", i), []byte("hv"), pebble.Sync); err != nil {
+			_ = hdb.Close()
+			t.Fatalf("healthy set: %v", err)
+		}
+	}
+	seen := 0
+	for range recovery.AllEntries(hdb) {
+		seen++
+		break
+	}
+	if seen != 1 {
+		_ = hdb.Close()
+		t.Fatalf("expected 1 entry before early break, got %d", seen)
+	}
+	if err := hdb.Close(); err != nil {
+		t.Fatalf("healthy close after early break (iterator leaked if non-nil/panic): %v", err)
+	}
 }

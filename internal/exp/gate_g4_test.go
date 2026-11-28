@@ -1,9 +1,10 @@
 package exp_test
 
 import (
-	"bytes"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/akshatrathore1/CraConTest/internal/exp"
@@ -18,9 +19,9 @@ import (
 //     artifacts with "cracontest evaluate -discovery ... -plot ...".
 //   - Zero candidate re-execution.
 func TestGateG4(t *testing.T) {
-	// Root paths for stored results
-	mut0Dir := filepath.Join("..", "..", "results", "smoke_mut0")
-	mut1Dir := filepath.Join("..", "..", "results", "smoke_mut1")
+	resultsDir := findResultsDir(t)
+	mut0Dir := filepath.Join(resultsDir, "smoke_mut0")
+	mut1Dir := filepath.Join(resultsDir, "smoke_mut1")
 
 	// Check that stored tables exist
 	if _, err := os.Stat(filepath.Join(mut0Dir, "outcomes.json")); err != nil {
@@ -30,7 +31,6 @@ func TestGateG4(t *testing.T) {
 		t.Fatalf("stored MUT-1 outcome table not found: %v", err)
 	}
 
-	resultsDir := filepath.Join("..", "..", "results")
 	outDir := t.TempDir()
 	matchesCommitted := func(generated, committed string) {
 		t.Helper()
@@ -42,9 +42,40 @@ func TestGateG4(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read committed %s: %v", committed, err)
 		}
-		normalize := func(b []byte) []byte { return bytes.ReplaceAll(b, []byte("\r\n"), []byte("\n")) }
-		if !bytes.Equal(normalize(got), normalize(want)) {
-			t.Errorf("%s is stale: regenerate it from the stored outcome table", committed)
+		if msg := diffCSVLines(got, want); msg != "" {
+			t.Errorf("%s is stale (%s): regenerate it from the stored outcome table", committed, msg)
+		}
+	}
+
+	assertG4ReportAndSVG := func(label string, report *exp.G4RunReport, svgPath string) {
+		t.Helper()
+		if len(report.B0Summary) == 0 {
+			t.Fatalf("%s: expected non-empty B0Summary", label)
+		}
+		if len(report.Curves) != 3 {
+			t.Fatalf("%s: expected 3 deterministic curves (B4, B5, B6), got %d", label, len(report.Curves))
+		}
+		gotNames := make([]string, len(report.Curves))
+		for i, c := range report.Curves {
+			if len(c.Points) == 0 {
+				t.Fatalf("%s: curve %s has empty points", label, c.Name)
+			}
+			gotNames[i] = c.Name
+		}
+		wantNames := []string{"b4_combined", "b5_representative", "b6_sync_boundary"}
+		if !reflect.DeepEqual(gotNames, wantNames) {
+			t.Fatalf("%s: curve names = %v, want %v", label, gotNames, wantNames)
+		}
+		svgBytes, err := os.ReadFile(svgPath)
+		if err != nil {
+			t.Fatalf("%s: read SVG %s: %v", label, svgPath, err)
+		}
+		svgText := string(svgBytes)
+		if !strings.Contains(svgText, "<svg") || !strings.Contains(svgText, "</svg>") {
+			t.Fatalf("%s: malformed SVG %s", label, svgPath)
+		}
+		if !strings.Contains(svgText, "B0") || !strings.Contains(svgText, "B4") || !strings.Contains(svgText, "B5") || !strings.Contains(svgText, "B6") {
+			t.Fatalf("%s: SVG legend missing expected strategy labels in %s", label, svgPath)
 		}
 	}
 
@@ -57,6 +88,7 @@ func TestGateG4(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GenerateG4Artifacts MUT-0: %v", err)
 	}
+	assertG4ReportAndSVG("MUT-0", report0, svgMUT0)
 	matchesCommitted(csvMUT0, filepath.Join(resultsDir, "discovery_mut0.csv"))
 
 	// Verify MUT-0 has 0 failures and 0 bugs across all strategies and budgets
@@ -84,6 +116,7 @@ func TestGateG4(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GenerateG4Artifacts MUT-1: %v", err)
 	}
+	assertG4ReportAndSVG("MUT-1", report1, svgMUT1)
 	matchesCommitted(csvMUT1, filepath.Join(resultsDir, "discovery_mut1.csv"))
 
 	// Verify MUT-1 reveals failures

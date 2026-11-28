@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sort"
 
 	"github.com/akshatrathore1/CraConTest/internal/candidate"
 	"github.com/akshatrathore1/CraConTest/internal/graph"
@@ -24,7 +25,50 @@ const (
 	legacySemanticFallbackWeight = 2.0
 	// defaultBoundaryProximity is the barrier proximity assigned when BeforeBoundary is true but BarrierProximity is 0.
 	defaultBoundaryProximity = 1.0
+	// maxRHGSemanticWeight is the 5-tier maximum semantic weight used for normalization.
+	maxRHGSemanticWeight = 10.0
 )
+
+type effectiveRHG struct {
+	risk float64
+	bp   float64
+	semW float64
+}
+
+func effectiveRHGFeatures(f graph.Features) effectiveRHG {
+	bp := f.BarrierProximity
+	if bp == 0 && f.BeforeBoundary {
+		bp = defaultBoundaryProximity
+	}
+	semW := f.SemanticWeight
+	if semW == 0 && f.Semantic > 0 {
+		semW = legacySemanticFallbackWeight
+	}
+	risk := f.RiskScore
+	if risk == 0 && f.Desc > 0 {
+		risk = float64(f.Desc)
+	}
+	return effectiveRHG{risk: risk, bp: bp, semW: semW}
+}
+
+func computeRHGScore(w RHGWeights, eff effectiveRHG, maxRisk, nov float64) float64 {
+	normRisk := eff.risk / maxRisk
+	normSem := eff.semW / maxRHGSemanticWeight
+	return w.Risk*normRisk + w.Barrier*eff.bp + w.Semantic*normSem + w.Novelty*nov
+}
+
+func isRHGBetterRep(effA, effB effectiveRHG, candA, candB candidate.Candidate) bool {
+	if dec, gt := cmpFloatDesc(effA.bp, effB.bp); dec {
+		return gt
+	}
+	if dec, gt := cmpFloatDesc(effA.risk, effB.risk); dec {
+		return gt
+	}
+	if dec, gt := cmpFloatDesc(effA.semW, effB.semW); dec {
+		return gt
+	}
+	return candidate.Less(candA, candB)
+}
 
 // defaultRHGWeights are the literature-grounded default weights:
 // Barrier proximity has highest weight (4.0), followed by Reverse Risk (3.0),
@@ -41,14 +85,12 @@ var defaultRHGWeights = RHGWeights{
 func DefaultRHGWeights() RHGWeights { return defaultRHGWeights }
 
 func validateRHGWeights(w RHGWeights) error {
-	for name, value := range map[string]float64{
-		"risk": w.Risk, "barrier": w.Barrier, "semantic": w.Semantic, "novelty": w.Novelty,
-	} {
-		if math.IsNaN(value) || math.IsInf(value, 0) || value < 0 {
-			return fmt.Errorf("strategy: rhg weight %s=%v must be finite and nonnegative", name, value)
-		}
-	}
-	return nil
+	return validateNamedWeights("strategy: rhg weight", []namedWeight{
+		{name: "risk", value: w.Risk},
+		{name: "barrier", value: w.Barrier},
+		{name: "semantic", value: w.Semantic},
+		{name: "novelty", value: w.Novelty},
+	})
 }
 
 // rhgStrategy implements the Risk-Horizon Guided ranking strategy (RHG / B7).
@@ -114,17 +156,12 @@ func (strategy rhgStrategy) rankDetailed(view *graph.View, universe []candidate.
 	reps := make(map[eqKey]candidate.Candidate)
 	repIndices := make(map[eqKey]int)
 	var nonReps0 []candidate.Candidate
-	var nonReps100 []candidate.Candidate
 
 	for i, cand := range ordered {
 		f := labels[i]
 		epoch := f.NextBarrier
 		if epoch == 0 && f.BeforeBoundary {
 			epoch = cand.Event + 1
-		}
-		bp := f.BarrierProximity
-		if bp == 0 && f.BeforeBoundary {
-			bp = 1.0
 		}
 
 		key := eqKey{
@@ -139,38 +176,17 @@ func (strategy rhgStrategy) rankDetailed(view *graph.View, universe []candidate.
 			repIndices[key] = i
 		} else {
 			existIdx := repIndices[key]
-			existBP := labels[existIdx].BarrierProximity
-			if existBP == 0 && labels[existIdx].BeforeBoundary {
-				existBP = 1.0
-			}
-
 			// Boundary representative selection:
-			// Prioritize higher barrier proximity; break ties by risk score, semantic weight, then canonical order.
-			promote := false
-			if bp > existBP {
-				promote = true
-			} else if bp == existBP {
-				if f.RiskScore > labels[existIdx].RiskScore {
-					promote = true
-				} else if f.RiskScore == labels[existIdx].RiskScore && f.SemanticWeight > labels[existIdx].SemanticWeight {
-					promote = true
-				}
-			}
-
-			if promote {
+			// Prioritize higher effective barrier proximity; break ties by effective risk score,
+			// effective semantic weight, then canonical order.
+			if isRHGBetterRep(effectiveRHGFeatures(f), effectiveRHGFeatures(labels[existIdx]), cand, existing) {
 				if existing.Percent == 0 {
 					nonReps0 = append(nonReps0, existing)
-				} else {
-					nonReps100 = append(nonReps100, existing)
 				}
 				reps[key] = cand
 				repIndices[key] = i
-			} else {
-				if cand.Percent == 0 {
-					nonReps0 = append(nonReps0, cand)
-				} else {
-					nonReps100 = append(nonReps100, cand)
-				}
+			} else if cand.Percent == 0 {
+				nonReps0 = append(nonReps0, cand)
 			}
 		}
 	}
@@ -181,59 +197,41 @@ func (strategy rhgStrategy) rankDetailed(view *graph.View, universe []candidate.
 		repSet[rep] = true
 	}
 
-	// Step 2: Separate representatives into 0% retention (reps0) and 100% retention (reps100).
+	// Step 2: Separate representatives into 0% retention (reps0), partial retention (tailMid),
+	// and remaining non-zero/100% retention (tail100).
 	// Max-heap scoring is applied strictly to 0% retention representatives!
 	repList0 := make([]candidate.Candidate, 0, len(reps))
 	repFeats0 := make([]graph.Features, 0, len(reps))
-	var reps100 []candidate.Candidate
+	var tailMid []candidate.Candidate
+	var tail100 []candidate.Candidate
 
 	for i, cand := range ordered {
-		if repSet[cand] {
-			if cand.Percent == 0 {
+		if cand.Percent == 0 {
+			if repSet[cand] {
 				repList0 = append(repList0, cand)
 				repFeats0 = append(repFeats0, labels[i])
-			} else {
-				reps100 = append(reps100, cand)
 			}
+		} else if cand.Percent > 0 && cand.Percent < 100 {
+			tailMid = append(tailMid, cand)
+		} else {
+			tail100 = append(tail100, cand)
 		}
 	}
 
 	maxRisk := 1.0
 	for _, f := range repFeats0 {
-		if f.RiskScore > maxRisk {
-			maxRisk = f.RiskScore
+		eff := effectiveRHGFeatures(f)
+		if !math.IsNaN(eff.risk) && !math.IsInf(eff.risk, 0) && eff.risk > maxRisk {
+			maxRisk = eff.risk
 		}
 	}
-	for _, cand := range reps100 {
-		f := view.Cuts[cand.Event]
-		if f.RiskScore > maxRisk {
-			maxRisk = f.RiskScore
-		}
-	}
-	const maxSem = 10.0 // 5-tier maximum weight
 
 	baseScores := make([]float64, len(repList0))
 	queue := make(scoreHeap, 0, len(repList0))
 
 	for i := range repList0 {
-		f := repFeats0[i]
-		bp := f.BarrierProximity
-		if bp == 0 && f.BeforeBoundary {
-			bp = defaultBoundaryProximity
-		}
-		semW := f.SemanticWeight
-		if semW == 0 && f.Semantic > 0 {
-			semW = legacySemanticFallbackWeight
-		}
-		risk := f.RiskScore
-		if risk == 0 && f.Desc > 0 {
-			risk = float64(f.Desc)
-		}
-
-		normRisk := risk / maxRisk
-		normSem := semW / maxSem
-
-		base := w.Risk*normRisk + w.Barrier*bp + w.Semantic*normSem
+		eff := effectiveRHGFeatures(repFeats0[i])
+		base := computeRHGScore(w, eff, maxRisk, 0.0)
 		baseScores[i] = base
 		queue = append(queue, scored{position: i, score: base + w.Novelty, novel: true})
 	}
@@ -242,8 +240,8 @@ func (strategy rhgStrategy) rankDetailed(view *graph.View, universe []candidate.
 	// Step 3: Lazy re-scoring heap ranking of 0% representatives
 	seen := make(map[statePercentKey]bool)
 	rankedReps0 := make([]candidate.Candidate, 0, len(repList0))
-	repScores := make(map[candidate.Candidate]float64, len(reps))
-	repNovelty := make(map[candidate.Candidate]float64, len(reps))
+	repScores := make(map[candidate.Candidate]float64, len(repList0))
+	repNovelty := make(map[candidate.Candidate]float64, len(repList0))
 
 	for queue.Len() > 0 {
 		top := heap.Pop(&queue).(scored)
@@ -264,83 +262,54 @@ func (strategy rhgStrategy) rankDetailed(view *graph.View, universe []candidate.
 		}
 	}
 
-	// For reps100, calculate representative scores for audit records
-	for _, cand := range reps100 {
-		f := view.Cuts[cand.Event]
-		bp := f.BarrierProximity
-		if bp == 0 && f.BeforeBoundary {
-			bp = defaultBoundaryProximity
-		}
-		semW := f.SemanticWeight
-		if semW == 0 && f.Semantic > 0 {
-			semW = legacySemanticFallbackWeight
-		}
-		risk := f.RiskScore
-		if risk == 0 && f.Desc > 0 {
-			risk = float64(f.Desc)
-		}
-		normRisk := risk / maxRisk
-		normSem := semW / maxSem
-		repScores[cand] = w.Risk*normRisk + w.Barrier*bp + w.Semantic*normSem
-		repNovelty[cand] = 0.0
-	}
-
-	// Step 4: Append 0% Non-Representatives first, then tail 100% candidates in canonical order
+	// Step 4: Append 0% Non-Representatives first, then partial-retention (0 < Percent < 100),
+	// then 100% retention candidates (each tail tier ordered by Percent ascending, then canonical order).
 	candidate.Sort(nonReps0)
-	candidate.Sort(reps100)
-	candidate.Sort(nonReps100)
-
-	tail100 := make([]candidate.Candidate, 0, len(reps100)+len(nonReps100))
-	tail100 = append(tail100, reps100...)
-	tail100 = append(tail100, nonReps100...)
-	candidate.Sort(tail100)
+	sortByPercentThenCanonical := func(s []candidate.Candidate) {
+		sort.Slice(s, func(i, j int) bool {
+			if s[i].Percent != s[j].Percent {
+				return s[i].Percent < s[j].Percent
+			}
+			return candidate.Less(s[i], s[j])
+		})
+	}
+	sortByPercentThenCanonical(tailMid)
+	sortByPercentThenCanonical(tail100)
 
 	finalRanked := make([]candidate.Candidate, 0, len(universe))
 	finalRanked = append(finalRanked, rankedReps0...)
 	finalRanked = append(finalRanked, nonReps0...)
+	finalRanked = append(finalRanked, tailMid...)
 	finalRanked = append(finalRanked, tail100...)
 
 	if err := ValidatePermutation(universe, finalRanked); err != nil {
-		return canonical(universe), nil
+		return nil, nil
 	}
 
 	// Populate detailed audit records
 	records := make([]RHGScoreRecord, len(finalRanked))
 	for rank, cand := range finalRanked {
 		f := view.Cuts[cand.Event]
+		eff := effectiveRHGFeatures(f)
 		isRep := repSet[cand]
 		var score float64
 		var nov float64
-		if isRep {
+		if isRep && cand.Percent == 0 {
 			score = repScores[cand]
 			nov = repNovelty[cand]
 		} else {
-			bp := f.BarrierProximity
-			if bp == 0 && f.BeforeBoundary {
-				bp = 1.0
-			}
-			semW := f.SemanticWeight
-			if semW == 0 && f.Semantic > 0 {
-				semW = 2.0
-			}
-			risk := f.RiskScore
-			if risk == 0 && f.Desc > 0 {
-				risk = float64(f.Desc)
-			}
-			normRisk := risk / maxRisk
-			normSem := semW / maxSem
-			score = w.Risk*normRisk + w.Barrier*bp + w.Semantic*normSem
 			nov = 0.0
+			score = computeRHGScore(w, eff, maxRisk, nov)
 		}
 
 		records[rank] = RHGScoreRecord{
 			Candidate:        cand,
 			Rank:             rank,
 			IsRepresentative: isRep,
-			RiskScore:        f.RiskScore,
-			BarrierProximity: f.BarrierProximity,
+			RiskScore:        eff.risk,
+			BarrierProximity: eff.bp,
 			SemanticTier:     f.SemanticTier,
-			SemanticWeight:   f.SemanticWeight,
+			SemanticWeight:   eff.semW,
 			Novelty:          nov,
 			Score:            score,
 		}
@@ -350,6 +319,10 @@ func (strategy rhgStrategy) rankDetailed(view *graph.View, universe []candidate.
 }
 
 // RHGScoreRecord contains detailed audit records of an RHG ranking.
+// RiskScore, BarrierProximity, and SemanticWeight record the effective values
+// (including legacy Desc, BeforeBoundary, and Semantic fallbacks) used to compute Score.
+// Novelty is 1.0 for the first 0% representative selected per (StateKey, Percent) and 0.0
+// for duplicate-state representatives, non-representatives, and un-heaped non-zero tail candidates.
 type RHGScoreRecord struct {
 	Candidate        candidate.Candidate `json:"candidate"`
 	Rank             int                 `json:"rank"`

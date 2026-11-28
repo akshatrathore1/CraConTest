@@ -2,7 +2,7 @@
 
 **Date:** 2026-11-20  
 **Git Commit:** `f9202dfca579`  
-**Evaluation Engine:** CockroachDB Pebble v2.1.7 (Go runtime: go1.27.3)  
+**Evaluation Engine:** CockroachDB Pebble v2.1.7 (Go runtime: go1.27.3) (`go.mod` and CI pin go1.27.4)  
 **Workload Seeds (32):** `[42 100 200 300 400 500 600 700 800 900 1001 1002 1003 1004 1005 1006 1007 1008 1009 1010 1011 1012 1013 1014 1015 1016 1017 1018 1019 1020 1021 1022]`  
 **Execution Time:** 308.72 seconds total  
 **Null Control (MUT-0):** 0 observed failures across 32 evaluated seeds at 0%/100% retention  
@@ -35,29 +35,35 @@ Observed comparison:
 
 ### 2.2 Fault Model Taxonomy
 
-| Fault Model | Class | Target File / Trigger | Failure Signature | Failure Density |
+| Fault Model | Class | Target File / Trigger | Recovery Symptom | Failure Density |
 |---|---|---|---|---|
 | **MUT-0** | Control | Unfaulted filesystem | No failure observed in the evaluated null control | 0.0% |
-| **MUT-1** | Dense | All WAL `Sync()` calls suppressed | `v1:violation:durably_committed:lost_writes` | ~33% |
-| **MUT-2** | Dense/Sparse | MANIFEST `Sync()` calls suppressed | `v1:open_error:manifest_corrupt` | ~45% |
-| **MUT-3** | Dense/Sparse | Parent directory syncs suppressed | `v1:violation:durably_committed:lost_files` | ~37% |
-| **MUT-4** | Dense/Sparse | Memtable SST flush syncs suppressed | `v1:open_error:table_corrupt` | ~23% |
-| **MUT-5** | Sparse | Strictly $k$-th WAL sync dropped ($k=1$) | `v1:violation:durably_committed:lost_writes` | ~2.5% |
-| **MUT-6** | Sparse | Second `MANIFEST` sync dropped (first post-open manifest sync) | `v1:open_error:manifest_rotation` | ~0.8% |
+| **MUT-1** | Dense | All WAL `Sync()` calls suppressed | Prefix / durability violation (`v1:<sha256>`) | 36.4% |
+| **MUT-2** | Dense | MANIFEST `Sync()` calls suppressed | Open error (`v1:open_error:manifest_corrupt`) | 47.3% |
+| **MUT-3** | Dense | Parent directory syncs suppressed | Prefix / durability violation (`v1:<sha256>`) | 42.5% |
+| **MUT-4** | Dense | Memtable SST flush syncs suppressed | Open error (`v1:open_error:table_corrupt`) | 29.8% |
+| **MUT-5** | Sparse | Strictly $k$-th WAL sync dropped ($k=1$) | Prefix / durability violation (`v1:<sha256>`) | 2.7% |
+| **MUT-6** | Sparse | Second `MANIFEST` sync dropped (first post-open manifest sync) | Prefix / durability violation (`v1:<sha256>`) | 0.8% |
 | **MUT-7** | No-op Control | Directory sync drop after `CURRENT`/`OPTIONS` rename | None (Pebble v2 creates `CURRENT` once on Open) | 0.0% |
-| **MUT-8** | Windowed | Compaction/flush SST sync drop after `CompactionBegin` (RocksDB #10460) | `v1:open_error:compaction_state` | ~15.2% |
-| **MUT-9** | Dense ($k=1$) / Sparse ($k \ge 7$) | Single $k$-th directory sync drop ($k=1$ default; $k \in \{7,9,10,12\}$ sparse) | `v1:violation:durably_committed:lost_files` | ~41.4% ($k=1$) |
+| **MUT-8** | Windowed | Compaction/flush SST sync drop after `CompactionBegin` (RocksDB #10460) | Open error (`v1:open_error:table_corrupt`) | 15.2% |
+| **MUT-9** | Dense ($k=1$) / Sparse ($k \ge 7$) | Single $k$-th directory sync drop ($k=1$ default; $k \in \{7,9,10,12\}$ sparse) | Prefix / durability violation (`v1:<sha256>`) | 41.4% ($k=1$) |
+
+Note: `MUT-1` through `MUT-4` are grouped as **Dense** class-wide barrier drops here (29.8%–47.3% failure density); `faults.IsSparse` (`internal/faults/faults.go`) returns `true` for `MUT-3`–`MUT-9` and `MUT-X1`–`MUT-X6` relative to WAL write frequency.
 
 ### 2.3 Evaluated Ranking Strategies
 
-1. **DCG (Durability-Contract Guided / B8):** Trace-derived durability-contract analysis that prioritizes concrete durability contract violations (dangling table references, uncommitted directory renames, dropped WAL sync records) before exploring uncontracted state representatives.
-2. **DCG-FlagOnly (Contract-Flag Ablation):** Partitions candidate space strictly by contract violation flags without secondary scoring heuristics. Its near-ties with full DCG attribute most of the observed rank-position difference to binary contract flags and StateKey equivalence partitioning.
-3. **RHG (Reachability-Hazard Guided / B7):** Scores cutoffs by reachable uncommitted mutations and hazard surfaces.
-4. **R2 (State-Representative Random):** Partitions 0% retention candidates into equivalence classes by canonical `StateKey`, selects boundary-adjacent representatives within each `StateKey` class using graph features (`BeforeBoundary`, `BarrierProximity`, and canonical order `candidate.Less`) before shuffling classes, and tests redundant cutoffs afterward.
-5. **R1 (0%-Retention-First Random):** Partitions universe into 0% unsynced data retention and 100% retention; evaluates 0% retention first in pure random order.
-6. **LIFO (Recent-First):** Prioritizes the most recent crash cutoffs in reverse trace order.
-7. **B6 (Sync-Boundary):** Boundary-adjacent candidate prioritization.
-8. **B0 (Uniform Random):** Pure random selection across candidate cutoffs.
+The benchmark CSV exports **13 strategies** in total. Section 3 displays tables for the **9 focal strategies** below (`DCG`, `DCG-PR`, `DCG-FlagOnly`, `RHG`, `R2`, `R1`, `LIFO`, `B6`, `B0`), while `benchmark_summary.csv` and `benchmark_per_seed.csv` also retain the 4 remaining baselines (`B5 Representative`, `B4 Combined`, `B1 FIFO`, `B3 Stride`):
+
+1. **DCG (Durability-Contract Guided):** Trace-derived durability-contract analysis that prioritizes concrete durability contract violations (dangling table references, uncommitted directory renames, dropped WAL sync records) before exploring uncontracted state representatives.
+2. **DCG-PR (Partial-Retention Prior):** Variant of DCG that promotes partial-retention cutoffs with coexisting unsynced directory entries (coinciding with `DCG` under endpoint 0%/100% benchmark policies).
+3. **DCG-FlagOnly (Contract-Flag Ablation):** Partitions candidate space strictly by contract violation flags without secondary scoring heuristics. Its near-ties with full DCG attribute most of the observed rank-position difference to binary contract flags and StateKey equivalence partitioning.
+4. **RHG (Risk-Horizon Guided / B7):** Scores cutoffs by reachable uncommitted mutations and hazard surfaces.
+5. **R2 (State-Representative Random):** Partitions 0% retention candidates into equivalence classes by canonical `StateKey`, selects boundary-adjacent representatives within each `StateKey` class using graph features (`BeforeBoundary`, `BarrierProximity`, and canonical order `candidate.Less`) before shuffling classes, and tests redundant cutoffs afterward.
+6. **R1 (0%-Retention-First Random):** Partitions universe into 0% unsynced data retention and 100% retention; evaluates 0% retention first in pure random order.
+7. **B2 (LIFO / Recent-First):** Prioritizes the most recent crash cutoffs in reverse trace order.
+8. **B6 (Sync-Boundary):** Boundary-adjacent candidate prioritization.
+9. **B0 (Uniform Random):** Pure random selection across candidate cutoffs.
+10. **Additional CSV baselines:** `B5` (State-Representative), `B4` (Combined Reachability), `B1` (FIFO), and `B3` (Stride).
 
 ---
 
@@ -234,8 +240,8 @@ In a 120-operation workload, there are ~35–40 distinct 0%-retention persistenc
 Under early testing budgets ($B = 25$, $S_{25}$), DCG discovers substantially more failing states than R2 and B0: on MUT-9 ($k=1$), DCG achieves mean $S_{25} = 25.00$ vs R2's 17.75 and B0's 3.31; on MUT-8, DCG achieves mean $S_{25} = 12.88$ vs R2's 6.73 and B0's 2.12. Comparing DCG against the **DCG-FlagOnly** ablation isolates the contribution of each mechanism:
 
 1. **Binary Durability-Contract Flags + `StateKey` Equivalence Partitioning:** Drive the $k_1 = 1.00$ first-failure discovery on MUT-5, MUT-8, and MUT-9 as well as the early-budget $S_{25}$ lead (`DCG-FlagOnly` matches full `DCG` with mean $S_{25} = 25.00$ on MUT-9 and 12.88 on MUT-8).
-2. **Tier 1B Continuous Severity Scoring (`Score()`):** Breaks ties when multiple file classes or sync points are flagged within a trace—most visibly on **MUT-6** (second manifest sync drop), where full DCG achieves mean $k_1 = 1.00$ compared to 1.19 for `DCG-FlagOnly`.
-3. **Tier 3A Regime/Epoch Diversity Partitioning:** Operates in Pass 2 after unique `StateKey` representatives are exhausted, increasing full-budget failure-curve area (`AUCNormFailures`) rather than altering $k_1$ or $S_{25}$.
+2. **Continuous Contract Severity Scoring (`ContractFeatures.ContractScore`):** Breaks ties within Tier 1 when multiple file classes or sync points are flagged within a trace—most visibly on **MUT-6** (second manifest sync drop), where full DCG achieves mean $k_1 = 1.00$ compared to 1.19 for `DCG-FlagOnly`.
+3. **Pass 1 Category Interleaving & Pass 2 Violation Prioritization:** Pass 1 Tier 2 interleaves uncontracted barrier-adjacent candidates across write categories (`categoryOrder`), while Pass 2 Tier 3A prioritizes remaining violating non-representatives by contract tier, barrier proximity, and `ContractScore` after unique `StateKey` representatives are exhausted, increasing full-budget failure-curve area (`AUCNormFailures`) rather than altering $k_1$ or $S_{25}$.
 
 ### 4.3 MUT-8 Evaluation (Compaction-Triggered SST Sync Drop)
 

@@ -62,9 +62,10 @@ func TestWriteBufferMutation(t *testing.T) {
 	// Find the write events.
 	var writeEv, writeAtEv *trace.Event
 	for i := range events {
-		if events[i].Kind == trace.KindWrite {
+		switch events[i].Kind {
+		case trace.KindWrite:
 			writeEv = &events[i]
-		} else if events[i].Kind == trace.KindWriteAt {
+		case trace.KindWriteAt:
 			writeAtEv = &events[i]
 		}
 	}
@@ -820,15 +821,15 @@ func TestAppendSyncEventBoundaryEdgeCases(t *testing.T) {
 	t.Run("PrecedingWriteAt", func(t *testing.T) {
 		rec := vfsrec.New(vfs.NewMem())
 		rec.AppendEventForTesting(trace.Event{Kind: trace.KindWriteAt, Handle: 1, File: "manifest"})
-		rec.AppendEventForTesting(trace.Event{Kind: trace.KindRead, Handle: 2, File: "table.sst"})
+		rec.AppendEventForTesting(trace.Event{Kind: trace.KindClose, Handle: 2, File: "table.sst"})
 		rec.AppendSyncEventForTesting(trace.Event{Kind: trace.KindSync, Handle: 1, File: "manifest"})
 
 		evs := rec.Events()
 		if len(evs) != 3 {
 			t.Fatalf("expected 3 events, got %d", len(evs))
 		}
-		if evs[0].Kind != trace.KindWriteAt || evs[1].Kind != trace.KindSync || evs[2].Kind != trace.KindRead {
-			t.Fatalf("expected [WriteAt, Sync, Read], got kinds [%s, %s, %s]", evs[0].Kind, evs[1].Kind, evs[2].Kind)
+		if evs[0].Kind != trace.KindWriteAt || evs[1].Kind != trace.KindSync || evs[2].Kind != trace.KindClose {
+			t.Fatalf("expected [WriteAt, Sync, Close], got kinds [%s, %s, %s]", evs[0].Kind, evs[1].Kind, evs[2].Kind)
 		}
 		for i, e := range evs {
 			if e.ID != uint64(i+1) {
@@ -838,11 +839,11 @@ func TestAppendSyncEventBoundaryEdgeCases(t *testing.T) {
 	})
 
 	t.Run("ScanWindowExactBoundary", func(t *testing.T) {
-		// Case A: Exactly 8 trailing non-mutating events (within syncReorderScanWindow = 8)
+		// Case A: Exactly 8 trailing unrelated Close/EngineEvent events (within syncReorderScanWindow = 8)
 		recWithin := vfsrec.New(vfs.NewMem())
 		recWithin.AppendEventForTesting(trace.Event{Kind: trace.KindWrite, Handle: 1, File: "wal.log"})
 		for i := 0; i < 8; i++ {
-			recWithin.AppendEventForTesting(trace.Event{Kind: trace.KindRead, Handle: uint64(i + 2), File: "other"})
+			recWithin.AppendEventForTesting(trace.Event{Kind: trace.KindClose, Handle: uint64(i + 2), File: "other"})
 		}
 		recWithin.AppendSyncEventForTesting(trace.Event{Kind: trace.KindSync, Handle: 1, File: "wal.log"})
 		evsWithin := recWithin.Events()
@@ -854,11 +855,11 @@ func TestAppendSyncEventBoundaryEdgeCases(t *testing.T) {
 				evsWithin[0].Kind, evsWithin[1].Kind)
 		}
 
-		// Case B: Exactly 9 trailing non-mutating events (exceeds syncReorderScanWindow = 8)
+		// Case B: Exactly 9 trailing events (exceeds syncReorderScanWindow = 8)
 		recExceed := vfsrec.New(vfs.NewMem())
 		recExceed.AppendEventForTesting(trace.Event{Kind: trace.KindWrite, Handle: 1, File: "wal.log"})
 		for i := 0; i < 9; i++ {
-			recExceed.AppendEventForTesting(trace.Event{Kind: trace.KindRead, Handle: uint64(i + 2), File: "other"})
+			recExceed.AppendEventForTesting(trace.Event{Kind: trace.KindClose, Handle: uint64(i + 2), File: "other"})
 		}
 		recExceed.AppendSyncEventForTesting(trace.Event{Kind: trace.KindSync, Handle: 1, File: "wal.log"})
 		evsExceed := recExceed.Events()
@@ -877,7 +878,7 @@ func TestAppendSyncEventBoundaryEdgeCases(t *testing.T) {
 		rec := vfsrec.New(vfs.NewMem())
 		rec.AppendEventForTesting(trace.Event{Kind: trace.KindWrite, Handle: 1, File: "wal.log", Off: 0, Len: 10})
 		rec.AppendEventForTesting(trace.Event{Kind: trace.KindWrite, Handle: 1, File: "wal.log", Off: 10, Len: 10})
-		rec.AppendEventForTesting(trace.Event{Kind: trace.KindRead, Handle: 2, File: "other"})
+		rec.AppendEventForTesting(trace.Event{Kind: trace.KindClose, Handle: 2, File: "other"})
 		rec.AppendSyncEventForTesting(trace.Event{Kind: trace.KindSync, Handle: 1, File: "wal.log"})
 
 		evs := rec.Events()
@@ -885,8 +886,8 @@ func TestAppendSyncEventBoundaryEdgeCases(t *testing.T) {
 			t.Fatalf("expected 4 events, got %d", len(evs))
 		}
 		// Sync should be placed after the 2nd Write, not before it
-		if evs[0].Kind != trace.KindWrite || evs[1].Kind != trace.KindWrite || evs[2].Kind != trace.KindSync || evs[3].Kind != trace.KindRead {
-			t.Fatalf("expected [Write, Write, Sync, Read], got [%s, %s, %s, %s]",
+		if evs[0].Kind != trace.KindWrite || evs[1].Kind != trace.KindWrite || evs[2].Kind != trace.KindSync || evs[3].Kind != trace.KindClose {
+			t.Fatalf("expected [Write, Write, Sync, Close], got [%s, %s, %s, %s]",
 				evs[0].Kind, evs[1].Kind, evs[2].Kind, evs[3].Kind)
 		}
 	})
@@ -898,16 +899,19 @@ func TestAppendSyncEventBoundaryEdgeCases(t *testing.T) {
 			hookedIDs = append(hookedIDs, id)
 		})
 		rec.AppendEventForTesting(trace.Event{Kind: trace.KindWrite, Handle: 1, File: "wal.log"})
-		rec.AppendEventForTesting(trace.Event{Kind: trace.KindRead, Handle: 2, File: "other"})
+		rec.AppendEventForTesting(trace.Event{Kind: trace.KindClose, Handle: 2, File: "other"})
 		rec.AppendSyncEventForTesting(trace.Event{Kind: trace.KindSync, Handle: 1, File: "wal.log"})
 
-		// Write was ID 1, Read was ID 2. Sync was inserted at index 1 -> assigned ID 2.
-		// Hook for sync should receive ID 2.
-		if len(hookedIDs) != 3 {
-			t.Fatalf("expected 3 hook calls, got %v", hookedIDs)
+		// Write was ID 1, Close was ID 2. Sync was inserted at index 1 -> ID 2,
+		// shifting Close to ID 3. Hook receives inserted ID 2 and re-indexed tail ID 3.
+		want := []uint64{1, 2, 2, 3}
+		if len(hookedIDs) != len(want) {
+			t.Fatalf("expected hook calls %v, got %v", want, hookedIDs)
 		}
-		if hookedIDs[2] != 2 {
-			t.Fatalf("expected hook for sync to receive ID 2, got %d", hookedIDs[2])
+		for i := range want {
+			if hookedIDs[i] != want[i] {
+				t.Fatalf("hookedIDs[%d] = %d, want %d (full=%v)", i, hookedIDs[i], want[i], hookedIDs)
+			}
 		}
 	})
 
@@ -915,7 +919,7 @@ func TestAppendSyncEventBoundaryEdgeCases(t *testing.T) {
 		rec := vfsrec.New(vfs.NewMem())
 		rec.AppendEventForTesting(trace.Event{Kind: trace.KindWrite, Handle: 1, File: "wal.log"})
 		rec.AppendEventForTesting(trace.Event{Kind: trace.KindLock, Handle: 2, File: "db/LOCK"})
-		rec.AppendEventForTesting(trace.Event{Kind: trace.KindRead, Handle: 3, File: "other"})
+		rec.AppendEventForTesting(trace.Event{Kind: trace.KindClose, Handle: 3, File: "other"})
 		rec.AppendSyncEventForTesting(trace.Event{Kind: trace.KindSync, Handle: 1, File: "wal.log"})
 
 		evs := rec.Events()
@@ -931,7 +935,7 @@ func TestAppendSyncEventBoundaryEdgeCases(t *testing.T) {
 		rec := vfsrec.New(vfs.NewMem())
 		rec.AppendEventForTesting(trace.Event{Kind: trace.KindWrite, Handle: 1, File: "wal.log"})
 		rec.AppendEventForTesting(trace.Event{Kind: trace.KindUnlock, Handle: 2, File: "db/LOCK"})
-		rec.AppendEventForTesting(trace.Event{Kind: trace.KindRead, Handle: 3, File: "other"})
+		rec.AppendEventForTesting(trace.Event{Kind: trace.KindClose, Handle: 3, File: "other"})
 		rec.AppendSyncEventForTesting(trace.Event{Kind: trace.KindSync, Handle: 1, File: "wal.log"})
 
 		evs := rec.Events()
@@ -947,7 +951,7 @@ func TestAppendSyncEventBoundaryEdgeCases(t *testing.T) {
 		rec := vfsrec.New(vfs.NewMem())
 		rec.AppendEventForTesting(trace.Event{Kind: trace.KindWrite, Handle: 1, File: "wal.log"})
 		rec.AppendEventForTesting(trace.Event{Kind: trace.KindOpBegin, Op: 42, OpKind: "set"})
-		rec.AppendEventForTesting(trace.Event{Kind: trace.KindRead, Handle: 2, File: "other"})
+		rec.AppendEventForTesting(trace.Event{Kind: trace.KindClose, Handle: 2, File: "other"})
 		rec.AppendSyncEventForTesting(trace.Event{Kind: trace.KindSync, Handle: 1, File: "wal.log"})
 
 		evs := rec.Events()
@@ -963,7 +967,7 @@ func TestAppendSyncEventBoundaryEdgeCases(t *testing.T) {
 		rec := vfsrec.New(vfs.NewMem())
 		rec.AppendEventForTesting(trace.Event{Kind: trace.KindWrite, Handle: 1, File: "wal.log"})
 		rec.AppendEventForTesting(trace.Event{Kind: trace.KindOpEnd, Op: 42, OpKind: "set"})
-		rec.AppendEventForTesting(trace.Event{Kind: trace.KindRead, Handle: 2, File: "other"})
+		rec.AppendEventForTesting(trace.Event{Kind: trace.KindClose, Handle: 2, File: "other"})
 		rec.AppendSyncEventForTesting(trace.Event{Kind: trace.KindSync, Handle: 1, File: "wal.log"})
 
 		evs := rec.Events()
@@ -979,7 +983,7 @@ func TestAppendSyncEventBoundaryEdgeCases(t *testing.T) {
 		rec := vfsrec.New(vfs.NewMem())
 		rec.AppendEventForTesting(trace.Event{Kind: trace.KindWrite, Handle: 1, File: "wal.log", Off: 0, Len: 10})
 		rec.AppendEventForTesting(trace.Event{Kind: trace.KindCreate, Handle: 2, File: "table.sst"})
-		rec.AppendEventForTesting(trace.Event{Kind: trace.KindRead, Handle: 3, File: "other"})
+		rec.AppendEventForTesting(trace.Event{Kind: trace.KindClose, Handle: 3, File: "other"})
 		rec.AppendSyncEventForTesting(trace.Event{Kind: trace.KindSync, Handle: 1, File: "wal.log"})
 
 		evs := rec.Events()
@@ -988,6 +992,35 @@ func TestAppendSyncEventBoundaryEdgeCases(t *testing.T) {
 		}
 		if evs[len(evs)-1].Kind != trace.KindSync {
 			t.Fatalf("expected Sync to stay at tail when crossing a mutating Create on another handle, got %v at tail", evs[len(evs)-1])
+		}
+	})
+
+	t.Run("NonReorderableOtherHandleEventsHardStop", func(t *testing.T) {
+		cases := []struct {
+			name string
+			ev   trace.Event
+		}{
+			{"Open", trace.Event{Kind: trace.KindOpen, Handle: 2, File: "other"}},
+			{"OpenDir", trace.Event{Kind: trace.KindOpenDir, Handle: 2, File: "dir", Dir: true}},
+			{"Read", trace.Event{Kind: trace.KindRead, Handle: 2, File: "other", Size: 4, Len: 4}},
+			{"SyncToNonFull", trace.Event{Kind: trace.KindSyncTo, Handle: 2, File: "other", Size: 4, FullSync: false}},
+			{"FailedSync", trace.Event{Kind: trace.KindSync, Handle: 2, File: "other", Err: "io error"}},
+			{"FailedSyncData", trace.Event{Kind: trace.KindSyncData, Handle: 2, File: "other", Err: "io error"}},
+			{"ZeroWrite", trace.Event{Kind: trace.KindWrite, Handle: 2, File: "other", Len: 0}},
+			{"ZeroWriteAt", trace.Event{Kind: trace.KindWriteAt, Handle: 2, File: "other", Len: 0}},
+			{"ZeroPreallocate", trace.Event{Kind: trace.KindPreallocate, Handle: 2, File: "other", Size: 0}},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				rec := vfsrec.New(vfs.NewMem())
+				rec.AppendEventForTesting(trace.Event{Kind: trace.KindWrite, Handle: 1, File: "wal.log", Len: 10})
+				rec.AppendEventForTesting(tc.ev)
+				rec.AppendSyncEventForTesting(trace.Event{Kind: trace.KindSync, Handle: 1, File: "wal.log"})
+				evs := rec.Events()
+				if len(evs) != 3 || evs[2].Kind != trace.KindSync {
+					t.Fatalf("%s: expected Sync to stay at tail, got [%s, %s, %s]", tc.name, evs[0].Kind, evs[1].Kind, evs[2].Kind)
+				}
+			})
 		}
 	})
 
@@ -1143,6 +1176,21 @@ func TestIsDBManifestPathAndCustomPrimaryDBDir(t *testing.T) {
 	rec := vfsrec.New(mem)
 	rec.SetPrimaryDBDir("custom_db")
 
+	if !rec.IsDBManifestPathForTesting("custom_db/MANIFEST-000001") {
+		t.Errorf("rec.IsDBManifestPathForTesting(custom_db/MANIFEST-000001) = false, want true")
+	}
+	customFalseCases := []string{
+		"db/MANIFEST-000001",
+		"checkpoint/MANIFEST-000001",
+		"custom_db/marker.manifest.000001.MANIFEST-000001",
+		"custom_db/sub/MANIFEST-000001",
+	}
+	for _, p := range customFalseCases {
+		if rec.IsDBManifestPathForTesting(p) {
+			t.Errorf("rec.IsDBManifestPathForTesting(%q) = true, want false", p)
+		}
+	}
+
 	if err := rec.MkdirAll("custom_db", 0755); err != nil {
 		t.Fatalf("MkdirAll(custom_db): %v", err)
 	}
@@ -1151,6 +1199,10 @@ func TestIsDBManifestPathAndCustomPrimaryDBDir(t *testing.T) {
 	}
 	if err := rec.MkdirAll("db", 0755); err != nil {
 		t.Fatalf("MkdirAll(db): %v", err)
+	}
+
+	if got := rec.DBManifestCountForTesting(); got != 0 {
+		t.Fatalf("DBManifestCount initial: got %d, want 0", got)
 	}
 
 	fCustom, err := rec.Create("custom_db/000001.log", "pebble-wal")
@@ -1198,9 +1250,80 @@ func TestIsDBManifestPathAndCustomPrimaryDBDir(t *testing.T) {
 	}
 	_ = fMan.Close()
 
+	if got := rec.DBManifestCountForTesting(); got != 1 {
+		t.Fatalf("DBManifestCount after custom_db manifest create: got %d, want 1", got)
+	}
+
+	fOtherDB, err := rec.Create("db/MANIFEST-000001", "")
+	if err != nil {
+		t.Fatalf("Create db/MANIFEST-000001: %v", err)
+	}
+	_ = fOtherDB.Close()
+
+	fOtherCkpt, err := rec.Create("checkpoint/MANIFEST-000001", "")
+	if err != nil {
+		t.Fatalf("Create checkpoint/MANIFEST-000001: %v", err)
+	}
+	_ = fOtherCkpt.Close()
+
+	if got := rec.DBManifestCountForTesting(); got != 1 {
+		t.Fatalf("DBManifestCount after non-primary manifest creates: got %d, want 1", got)
+	}
+
 	if err := rec.Remove("custom_db/MANIFEST-000001"); err != nil {
 		t.Fatalf("Remove custom_db/MANIFEST-000001: %v", err)
 	}
+
+	if got := rec.DBManifestCountForTesting(); got != 0 {
+		t.Fatalf("DBManifestCount after custom_db manifest remove: got %d, want 0", got)
+	}
+
+	t.Run("RecountExistingManifestsOnSetPrimaryDBDir", func(t *testing.T) {
+		mem := vfs.NewMem()
+		rec := vfsrec.New(mem)
+
+		if err := rec.MkdirAll("custom_db", 0755); err != nil {
+			t.Fatalf("MkdirAll(custom_db): %v", err)
+		}
+		f1, err := rec.Create("custom_db/MANIFEST-000001", "")
+		if err != nil {
+			t.Fatalf("Create custom_db/MANIFEST-000001: %v", err)
+		}
+		_ = f1.Close()
+
+		if got := rec.DBManifestCountForTesting(); got != 0 {
+			t.Fatalf("DBManifestCount before SetPrimaryDBDir: got %d, want 0", got)
+		}
+
+		rec.SetPrimaryDBDir("custom_db")
+		if got := rec.DBManifestCountForTesting(); got != 1 {
+			t.Fatalf("DBManifestCount after SetPrimaryDBDir: got %d, want 1", got)
+		}
+
+		f2, err := rec.Create("custom_db/MANIFEST-000002", "")
+		if err != nil {
+			t.Fatalf("Create custom_db/MANIFEST-000002: %v", err)
+		}
+		_ = f2.Close()
+
+		f3, err := rec.Create("custom_db/MANIFEST-000003", "")
+		if err != nil {
+			t.Fatalf("Create custom_db/MANIFEST-000003: %v", err)
+		}
+		_ = f3.Close()
+
+		if got := rec.DBManifestCountForTesting(); got != 3 {
+			t.Fatalf("DBManifestCount after creating 2 more manifests: got %d, want 3", got)
+		}
+
+		if err := rec.Remove("custom_db/MANIFEST-000001"); err != nil {
+			t.Fatalf("Remove custom_db/MANIFEST-000001: %v", err)
+		}
+
+		if got := rec.DBManifestCountForTesting(); got != 2 {
+			t.Fatalf("DBManifestCount after removing custom_db/MANIFEST-000001: got %d, want 2", got)
+		}
+	})
 }
 
 func TestWaitForWALWriteSynchronizationAndExclusion(t *testing.T) {
@@ -1406,5 +1529,616 @@ func TestCurGoroutineID(t *testing.T) {
 				t.Errorf("ParseGoroutineID(%q) = %d, want %d", tc.input, got, tc.expected)
 			}
 		})
+	}
+}
+
+func TestFlushBeginDuringIngestSectionWaitsForManifestDeletionWithoutDeadlock(t *testing.T) {
+	rec := vfsrec.New(vfs.NewMem())
+	rec.SetWaitTimeoutForTesting(2 * time.Second)
+	listener := rec.EventListener()
+
+	if err := rec.MkdirAll("db", 0755); err != nil {
+		t.Fatalf("MkdirAll(db): %v", err)
+	}
+	for _, name := range []string{
+		"db/MANIFEST-000001",
+		"db/MANIFEST-000002",
+		"db/MANIFEST-000003",
+		"db/marker.manifest.000001.MANIFEST-000002",
+	} {
+		f, err := rec.Create(name, vfs.WriteCategoryUnspecified)
+		if err != nil {
+			t.Fatalf("Create(%q): %v", name, err)
+		}
+		_ = f.Close()
+	}
+
+	rec.BeginIngestSection()
+	defer rec.EndIngestSection()
+
+	if err := rec.Remove("db/marker.manifest.000001.MANIFEST-000002"); err != nil {
+		t.Fatalf("Remove(marker): %v", err)
+	}
+
+	flushDone := make(chan struct{})
+	flushPanicCh := make(chan any, 1)
+	go func() {
+		defer close(flushDone)
+		defer func() {
+			if r := recover(); r != nil {
+				flushPanicCh <- r
+			}
+		}()
+		listener.FlushBegin(pebble.FlushInfo{JobID: 12})
+	}()
+
+	removeErrCh := make(chan error, 1)
+	go func() {
+		if err := rec.Remove("db/MANIFEST-000001"); err != nil {
+			removeErrCh <- err
+			return
+		}
+		listener.ManifestDeleted(pebble.ManifestDeleteInfo{JobID: 11, Path: "db/MANIFEST-000001"})
+		removeErrCh <- nil
+	}()
+
+	if err := <-removeErrCh; err != nil {
+		t.Fatalf("non-ingest manifest Remove during ingest section failed: %v", err)
+	}
+	<-flushDone
+	select {
+	case p := <-flushPanicCh:
+		t.Fatalf("FlushBegin panicked unexpectedly: %v", p)
+	default:
+	}
+
+	events := rec.Events()
+	removeIdx := -1
+	deletedIdx := -1
+	flushBeginIdx := -1
+	for i, ev := range events {
+		switch {
+		case ev.Kind == trace.KindRemove && ev.File == "db/MANIFEST-000001":
+			removeIdx = i
+		case ev.Kind == trace.KindEngineEvent && ev.Note == "ManifestDeleted":
+			deletedIdx = i
+		case ev.Kind == trace.KindEngineEvent && ev.Note == "FlushBegin" && ev.Job == 12:
+			flushBeginIdx = i
+		}
+	}
+	if removeIdx < 0 {
+		t.Fatalf("missing Remove event for db/MANIFEST-000001 in trace")
+	}
+	if deletedIdx < 0 {
+		t.Fatalf("missing ManifestDeleted event in trace")
+	}
+	if flushBeginIdx < 0 {
+		t.Fatalf("missing FlushBegin(Job: 12) event in trace")
+	}
+	if !(removeIdx < deletedIdx && deletedIdx < flushBeginIdx) {
+		t.Fatalf("unexpected event order: removeIdx=%d, deletedIdx=%d, flushBeginIdx=%d (want removeIdx < deletedIdx < flushBeginIdx)", removeIdx, deletedIdx, flushBeginIdx)
+	}
+}
+
+type orderedReadWriteFS struct {
+	vfs.FS
+	readEntered  chan struct{}
+	releaseRead  chan struct{}
+	writeEntered chan struct{}
+	readOnce     sync.Once
+	writeOnce    sync.Once
+}
+
+func (fs *orderedReadWriteFS) Open(name string, opts ...vfs.OpenOption) (vfs.File, error) {
+	f, err := fs.FS.Open(name, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return &orderedReadFile{File: f, fs: fs}, nil
+}
+
+func (fs *orderedReadWriteFS) OpenReadWrite(name string, category vfs.DiskWriteCategory, opts ...vfs.OpenOption) (vfs.File, error) {
+	f, err := fs.FS.OpenReadWrite(name, category, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return &orderedReadFile{File: f, fs: fs}, nil
+}
+
+type orderedReadFile struct {
+	vfs.File
+	fs *orderedReadWriteFS
+}
+
+func (f *orderedReadFile) Read(p []byte) (int, error) {
+	n, err := f.File.Read(p)
+	f.fs.readOnce.Do(func() { close(f.fs.readEntered) })
+	<-f.fs.releaseRead
+	return n, err
+}
+
+func (f *orderedReadFile) Write(p []byte) (int, error) {
+	f.fs.writeOnce.Do(func() { close(f.fs.writeEntered) })
+	return f.File.Write(p)
+}
+
+func TestRecFileReadLinearization(t *testing.T) {
+	mem := vfs.NewMem()
+	f, err := mem.Create("shared.txt", vfs.WriteCategoryUnspecified)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+
+	inner := &orderedReadWriteFS{
+		FS:           mem,
+		readEntered:  make(chan struct{}),
+		releaseRead:  make(chan struct{}),
+		writeEntered: make(chan struct{}),
+	}
+	rec := vfsrec.New(inner)
+	rf, err := rec.Open("shared.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rf.Close()
+	wf, err := rec.OpenReadWrite("shared.txt", vfs.WriteCategoryUnspecified)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wf.Close()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	var readN int
+	var readErr error
+	go func() {
+		defer wg.Done()
+		buf := make([]byte, 8)
+		readN, readErr = rf.Read(buf)
+	}()
+	<-inner.readEntered
+
+	writeErrCh := make(chan error, 1)
+	go func() {
+		defer wg.Done()
+		_, err := wf.Write([]byte("payload"))
+		writeErrCh <- err
+	}()
+
+	enteredBeforeReadRecorded := false
+	select {
+	case <-inner.writeEntered:
+		enteredBeforeReadRecorded = true
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(inner.releaseRead)
+	wg.Wait()
+	if err := <-writeErrCh; err != nil {
+		t.Fatal(err)
+	}
+	if enteredBeforeReadRecorded {
+		t.Fatal("concurrent Write executed on inner FS while Read had not yet recorded its event")
+	}
+	if readN != 0 || !errors.Is(readErr, io.EOF) {
+		t.Fatalf("Read got (%d, %v), want (0, EOF)", readN, readErr)
+	}
+
+	events := rec.Events()
+	if err := trace.Validate(events); err != nil {
+		t.Fatalf("trace.Validate: %v", err)
+	}
+	readIdx, writeIdx := -1, -1
+	for i, ev := range events {
+		if ev.Kind == trace.KindRead {
+			readIdx = i
+		} else if ev.Kind == trace.KindWrite {
+			writeIdx = i
+		}
+	}
+	if readIdx < 0 || writeIdx < 0 || readIdx >= writeIdx {
+		t.Fatalf("expected KindRead before KindWrite, got readIdx=%d writeIdx=%d", readIdx, writeIdx)
+	}
+}
+
+func TestRecordEngineEventBoundaryAndHook(t *testing.T) {
+	t.Run("StopsAtOpBoundariesAndNotifiesShiftedTailHook", func(t *testing.T) {
+		rec := vfsrec.New(vfs.NewMem())
+		var hookedIDs []uint64
+		rec.SetHook(func(id uint64) {
+			hookedIDs = append(hookedIDs, id)
+		})
+		listener := rec.EventListener()
+
+		if err := rec.MkdirAll("db", 0755); err != nil {
+			t.Fatal(err)
+		}
+		f, err := rec.Create("db/000001.sst", vfs.WriteCategoryUnspecified)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = f.Close()
+
+		b1 := rec.BeginEvent(1, "compact")
+		if err := rec.Remove("db/000001.sst"); err != nil {
+			t.Fatal(err)
+		}
+		e1 := rec.EndEvent(1, "compact", "")
+		b2 := rec.BeginEvent(2, "set")
+		// TableDeleted arrives after OpEnd(1) and OpBegin(2); it must NOT cross OpBegin/OpEnd.
+		listener.TableDeleted(pebble.TableDeleteInfo{JobID: 5, Path: "db/000001.sst"})
+		e2 := rec.EndEvent(2, "set", "")
+
+		evs := rec.Events()
+		if err := trace.Validate(evs); err != nil {
+			t.Fatalf("trace.Validate: %v", err)
+		}
+		if evs[b1-1].Kind != trace.KindOpBegin || evs[b1-1].Op != 1 || evs[b1-1].ID != b1 {
+			t.Fatalf("BeginEvent(1) ID %d was invalidated: %+v", b1, evs[b1-1])
+		}
+		if evs[e1-1].Kind != trace.KindOpEnd || evs[e1-1].Op != 1 || evs[e1-1].ID != e1 {
+			t.Fatalf("EndEvent(1) ID %d was invalidated: %+v", e1, evs[e1-1])
+		}
+		if evs[b2-1].Kind != trace.KindOpBegin || evs[b2-1].Op != 2 || evs[b2-1].ID != b2 {
+			t.Fatalf("BeginEvent(2) ID %d was invalidated: %+v", b2, evs[b2-1])
+		}
+		if evs[e2-1].Kind != trace.KindOpEnd || evs[e2-1].Op != 2 || evs[e2-1].ID != e2 {
+			t.Fatalf("EndEvent(2) ID %d was invalidated: %+v", e2, evs[e2-1])
+		}
+		if evs[b2].Kind != trace.KindEngineEvent || evs[b2].Note != "TableDeleted" {
+			t.Fatalf("expected TableDeleted inside op 2 after OpBegin(2), got %+v", evs[b2])
+		}
+	})
+
+	t.Run("ReordersAcrossEngineEventAndUpdatesShiftedTailHook", func(t *testing.T) {
+		rec := vfsrec.New(vfs.NewMem())
+		var hooked []uint64
+		rec.SetHook(func(id uint64) {
+			hooked = append(hooked, id)
+		})
+		listener := rec.EventListener()
+
+		if err := rec.MkdirAll("db", 0755); err != nil {
+			t.Fatal(err)
+		}
+		f, err := rec.Create("db/000001.sst", vfs.WriteCategoryUnspecified)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := rec.Remove("db/000001.sst"); err != nil {
+			t.Fatal(err)
+		}
+		listener.TableStatsLoaded(pebble.TableStatsInfo{})
+		tailBefore := uint64(len(rec.Events()))
+		hooked = nil
+		listener.TableDeleted(pebble.TableDeleteInfo{JobID: 7, Path: "db/000001.sst"})
+
+		evs := rec.Events()
+		if len(evs) != int(tailBefore)+1 {
+			t.Fatalf("len(evs)=%d, want %d", len(evs), tailBefore+1)
+		}
+		if evs[len(evs)-2].Note != "TableDeleted" || evs[len(evs)-1].Note != "TableStatsLoaded" {
+			t.Fatalf("expected [TableDeleted, TableStatsLoaded] at tail, got [%s, %s]",
+				evs[len(evs)-2].Note, evs[len(evs)-1].Note)
+		}
+		// Hook must have received both inserted ID (tailBefore) and shifted tail ID (tailBefore+1).
+		if len(hooked) != 2 || hooked[0] != tailBefore || hooked[1] != tailBefore+1 {
+			t.Fatalf("hooked IDs after reorder = %v, want [%d %d]", hooked, tailBefore, tailBefore+1)
+		}
+	})
+
+	t.Run("CurrentEventIDPinsEarlierEvents", func(t *testing.T) {
+		rec := vfsrec.New(vfs.NewMem())
+		rec.AppendEventForTesting(trace.Event{Kind: trace.KindWrite, Handle: 1, File: "wal.log", Len: 4})
+		rec.AppendEventForTesting(trace.Event{Kind: trace.KindClose, Handle: 2, File: "other.sst"})
+		observedID := rec.CurrentEventID()
+		rec.AppendSyncEventForTesting(trace.Event{Kind: trace.KindSync, Handle: 1, File: "wal.log"})
+
+		evs := rec.Events()
+		if evs[observedID-1].Kind != trace.KindClose {
+			t.Fatalf("event at observed CurrentEventID %d shifted to %s", observedID, evs[observedID-1].Kind)
+		}
+	})
+}
+
+func TestRecFileRejectsInvalidTraceInputs(t *testing.T) {
+	mem := vfs.NewMem()
+	rec := vfsrec.New(mem)
+
+	if err := rec.MkdirAll("dir", 0755); err != nil {
+		t.Fatal(err)
+	}
+	rw, err := rec.Create("dir/rw.txt", vfs.WriteCategoryUnspecified)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rw.WriteAt([]byte("abc"), -1); err == nil {
+		t.Fatal("expected error for negative WriteAt offset")
+	}
+	if err := rw.Preallocate(-1, 10); err == nil {
+		t.Fatal("expected error for negative Preallocate offset")
+	}
+	if err := rw.Preallocate(0, -5); err == nil {
+		t.Fatal("expected error for negative Preallocate length")
+	}
+	if _, err := rw.SyncTo(-1); err == nil {
+		t.Fatal("expected error for negative SyncTo length")
+	}
+	_ = rw.Close()
+
+	ro, err := rec.Open("dir/rw.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ro.Preallocate(0, 16); err == nil {
+		t.Fatal("expected error for Preallocate on read-only handle")
+	}
+	_ = ro.Close()
+
+	dirH, err := rec.OpenDir("dir")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dirH.SyncData(); err == nil {
+		t.Fatal("expected error for SyncData on directory handle")
+	}
+	if _, err := dirH.SyncTo(0); err == nil {
+		t.Fatal("expected error for SyncTo on directory handle")
+	}
+	if err := dirH.Preallocate(0, 16); err == nil {
+		t.Fatal("expected error for Preallocate on directory handle")
+	}
+	_ = dirH.Close()
+
+	events := rec.Events()
+	if err := trace.Validate(events); err != nil {
+		t.Fatalf("trace.Validate failed after rejected calls: %v", err)
+	}
+}
+
+type silentShortWriteFS struct {
+	vfs.FS
+	limit int
+}
+
+func (fs *silentShortWriteFS) Create(name string, category vfs.DiskWriteCategory) (vfs.File, error) {
+	f, err := fs.FS.Create(name, category)
+	if err != nil {
+		return nil, err
+	}
+	return &silentShortWriteFile{File: f, limit: fs.limit}, nil
+}
+
+type silentShortWriteFile struct {
+	vfs.File
+	limit int
+}
+
+func (f *silentShortWriteFile) Write(p []byte) (int, error) {
+	if len(p) > f.limit {
+		return f.File.Write(p[:f.limit])
+	}
+	return f.File.Write(p)
+}
+
+func TestRecFileShortWriteWithoutError(t *testing.T) {
+	rec := vfsrec.New(&silentShortWriteFS{FS: vfs.NewMem(), limit: 4})
+	f, err := rec.Create("short.txt", vfs.WriteCategoryUnspecified)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, err := f.Write([]byte("12345678"))
+	if !errors.Is(err, io.ErrShortWrite) || n != 4 {
+		t.Fatalf("Write returned (%d, %v), want (4, io.ErrShortWrite)", n, err)
+	}
+	_ = f.Close()
+
+	events := rec.Events()
+	if err := trace.Validate(events); err != nil {
+		t.Fatalf("trace.Validate: %v", err)
+	}
+	if events[1].Len != 4 || len(events[1].Data) != 8 || events[1].Err == "" {
+		t.Fatalf("unexpected short-write event: %+v", events[1])
+	}
+}
+
+func TestFSRemoveAll(t *testing.T) {
+	mem := vfs.NewMem()
+	rec := vfsrec.New(mem)
+	if err := rec.MkdirAll("tree/sub", 0755); err != nil {
+		t.Fatal(err)
+	}
+	f, err := rec.Create("tree/sub/file.txt", vfs.WriteCategoryUnspecified)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+	if err := rec.RemoveAll("tree"); err != nil {
+		t.Fatalf("RemoveAll: %v", err)
+	}
+	if _, err := mem.Stat("tree"); !os.IsNotExist(err) {
+		t.Fatalf("expected tree to be removed, stat err=%v", err)
+	}
+	events := rec.Events()
+	if err := trace.Validate(events); err != nil {
+		t.Fatalf("trace.Validate: %v", err)
+	}
+	if events[len(events)-1].Kind != trace.KindRemoveAll || events[len(events)-1].File != "tree" {
+		t.Fatalf("unexpected RemoveAll event: %+v", events[len(events)-1])
+	}
+}
+
+func TestDBManifestCountAndPendingDeletionsEdgeCases(t *testing.T) {
+	t.Run("PrepopulatedCreateOverwriteLinkRenameRemoveAll", func(t *testing.T) {
+		mem := vfs.NewMem()
+		_ = mem.MkdirAll("db", 0755)
+		_ = mem.MkdirAll("staging", 0755)
+		_ = mem.MkdirAll("ingest_staging", 0755)
+		for _, p := range []string{"db/MANIFEST-000001", "db/MANIFEST-000002", "staging/MANIFEST-000003"} {
+			f, err := mem.Create(p, vfs.WriteCategoryUnspecified)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = f.Close()
+		}
+
+		rec := vfsrec.New(mem)
+		if got := rec.DBManifestCountForTesting(); got != 2 {
+			t.Fatalf("initial DBManifestCount = %d, want 2", got)
+		}
+
+		// Overwriting an existing MANIFEST must NOT increment count.
+		for i := 0; i < 3; i++ {
+			f, err := rec.Create("db/MANIFEST-000001", vfs.WriteCategoryUnspecified)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = f.Close()
+		}
+		if got := rec.DBManifestCountForTesting(); got != 2 {
+			t.Fatalf("DBManifestCount after overwrite = %d, want 2", got)
+		}
+
+		// Link into primary DB increments count.
+		if err := rec.Link("db/MANIFEST-000001", "db/MANIFEST-000009"); err != nil {
+			t.Fatal(err)
+		}
+		if got := rec.DBManifestCountForTesting(); got != 3 {
+			t.Fatalf("DBManifestCount after Link = %d, want 3", got)
+		}
+
+		// Failed Rename that still unlinks source in MemFS recounts accurately.
+		_ = rec.Rename("db/MANIFEST-000009", "missing/MANIFEST-000009")
+		if got := rec.DBManifestCountForTesting(); got != 2 {
+			t.Fatalf("DBManifestCount after failed Rename = %d, want 2", got)
+		}
+
+		// Directory Rename into db_new updates count.
+		if err := rec.Rename("staging", "db_new"); err != nil {
+			t.Fatal(err)
+		}
+		if got := rec.DBManifestCountForTesting(); got != 3 {
+			t.Fatalf("DBManifestCount after dir Rename = %d, want 3", got)
+		}
+
+		// RemoveAll clears db_new manifests.
+		if err := rec.RemoveAll("db_new"); err != nil {
+			t.Fatal(err)
+		}
+		if got := rec.DBManifestCountForTesting(); got != 2 {
+			t.Fatalf("DBManifestCount after RemoveAll = %d, want 2", got)
+		}
+	})
+
+	t.Run("MultiDBAndNoListenerAndNonPrimaryManifestDeleted", func(t *testing.T) {
+		mem := vfs.NewMem()
+		rec := vfsrec.New(mem)
+		rec.SetWaitTimeoutForTesting(50 * time.Millisecond)
+		_ = rec.MkdirAll("db", 0755)
+		_ = rec.MkdirAll("testdb", 0755)
+		_ = rec.MkdirAll("ingest_staging", 0755)
+		for _, p := range []string{
+			"db/MANIFEST-000001",
+			"db/MANIFEST-000002",
+			"testdb/MANIFEST-000001",
+			"db/marker.manifest.000001.MANIFEST-000002",
+			"ingest_staging/ingest_00001.sst",
+		} {
+			f, err := rec.Create(p, vfs.WriteCategoryUnspecified)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = f.Close()
+		}
+
+		// Even without EventListener or with another DB (testdb) having manifests,
+		// db only has 2 manifests, so removing marker and staging must not block.
+		if err := rec.Remove("db/marker.manifest.000001.MANIFEST-000002"); err != nil {
+			t.Fatal(err)
+		}
+		if err := rec.Remove("ingest_staging/ingest_00001.sst"); err != nil {
+			t.Fatalf("unexpected block/error removing staging: %v", err)
+		}
+
+		// With EventListener wired and >2 manifests in db, non-primary ManifestDeleted must not clear wait.
+		listener := rec.EventListener()
+		for _, p := range []string{"db/MANIFEST-000003", "db/foo.marker.manifest.000001", "db/marker.manifest.000002.MANIFEST-000003"} {
+			f, err := rec.Create(p, vfs.WriteCategoryUnspecified)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = f.Close()
+		}
+		// Basename not starting with "marker.manifest." must not arm pendingManifestDeletions.
+		if err := rec.Remove("db/foo.marker.manifest.000001"); err != nil {
+			t.Fatal(err)
+		}
+		fStg0, _ := rec.Create("ingest_staging/ingest_00000.sst", vfs.WriteCategoryUnspecified)
+		_ = fStg0.Close()
+		if err := rec.Remove("ingest_staging/ingest_00000.sst"); err != nil {
+			t.Fatalf("unexpected block after removing non-prefix marker file: %v", err)
+		}
+		if err := rec.Remove("db/marker.manifest.000002.MANIFEST-000003"); err != nil {
+			t.Fatal(err)
+		}
+		// Non-primary deletion does not decrement pendingManifestDeletions.
+		listener.ManifestDeleted(pebble.ManifestDeleteInfo{JobID: 1, Path: "checkpoint/MANIFEST-000001"})
+		fStg, _ := rec.Create("ingest_staging/ingest_00002.sst", vfs.WriteCategoryUnspecified)
+		_ = fStg.Close()
+		if err := rec.Remove("ingest_staging/ingest_00002.sst"); err == nil {
+			t.Fatal("expected staging Remove to time out while primary manifest deletion is still pending")
+		}
+		// Now primary ManifestDeleted unblocks FlushBegin cleanly.
+		listener.ManifestDeleted(pebble.ManifestDeleteInfo{JobID: 2, Path: "db/MANIFEST-000001"})
+		listener.FlushBegin(pebble.FlushInfo{JobID: 3})
+	})
+}
+
+func TestSetPrimaryDBDirRootAndIngestSectionCrossGoroutine(t *testing.T) {
+	rec := vfsrec.New(vfs.NewMem())
+	rec.SetWaitTimeoutForTesting(50 * time.Millisecond)
+
+	// SetPrimaryDBDir("/") must mean explicit root-only, not reset to allowlist.
+	rec.SetPrimaryDBDir("/")
+	if !rec.IsDBManifestPathForTesting("MANIFEST-000001") {
+		t.Fatal("SetPrimaryDBDir(\"/\"): expected root MANIFEST-000001 to be primary")
+	}
+	if rec.IsDBManifestPathForTesting("db/MANIFEST-000001") {
+		t.Fatal("SetPrimaryDBDir(\"/\"): expected db/MANIFEST-000001 not to be primary")
+	}
+	fRootMan, err := rec.Create("MANIFEST-000001", vfs.WriteCategoryUnspecified)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = fRootMan.Close()
+	if got := rec.DBManifestCountForTesting(); got != 1 {
+		t.Fatalf("SetPrimaryDBDir(\"/\") DBManifestCount = %d, want 1", got)
+	}
+	_ = rec.Remove("MANIFEST-000001")
+
+	// SetPrimaryDBDir("") resets to default allowlist.
+	rec.SetPrimaryDBDir("")
+	if !rec.IsDBManifestPathForTesting("db/MANIFEST-000001") {
+		t.Fatal("SetPrimaryDBDir(\"\"): expected db/MANIFEST-000001 to be primary after reset")
+	}
+
+	// EndIngestSection called from a different goroutine must clear inIngestSection.
+	f, err := rec.Create("victim.txt", vfs.WriteCategoryUnspecified)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+	rec.BeginIngestSection()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		rec.EndIngestSection()
+	}()
+	<-done
+	if err := rec.Remove("victim.txt"); err != nil {
+		t.Fatalf("Remove after cross-goroutine EndIngestSection failed: %v", err)
 	}
 }

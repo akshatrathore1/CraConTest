@@ -3,7 +3,6 @@ package exp
 import (
 	"fmt"
 	"math"
-	"regexp"
 	"sort"
 
 	"github.com/akshatrathore1/CraConTest/internal/candidate"
@@ -11,24 +10,18 @@ import (
 	"github.com/akshatrathore1/CraConTest/internal/strategy"
 )
 
-var digitRuns = regexp.MustCompile(`[0-9]+`)
-
-// FailureKind returns the deduplication key of a failed outcome: the
-// signature of a violation, or, for an open error, panic or hang, the class
-// followed by the error text with every digit run replaced by "N" (file
-// numbers, sizes and line numbers differ between candidates that fail the
-// same way). Valid outcomes have no kind.
+// FailureKind returns the normalized deduplication key of a failed outcome:
+// the violation signature, or the normalized v1 signature for open errors,
+// panics, and hangs. Valid and oracle_error outcomes have no failure kind.
 func FailureKind(o oracle.Outcome) string {
-	if o.Signature != "" {
-		return o.Signature
-	}
 	switch o.Class {
 	case oracle.ClassViolation:
 		return o.Signature
 	case oracle.ClassOpenError, oracle.ClassPanic, oracle.ClassHang:
-		return string(o.Class) + ":" + digitRuns.ReplaceAllString(o.Detail, "N")
+		return NormalizeOutcome(o).Signature
+	default:
+		return ""
 	}
-	return ""
 }
 
 // Positions reports where a ranking first exposes failures. Positions are
@@ -51,9 +44,6 @@ func kindTable(universe []candidate.Candidate, outcomes []oracle.Outcome) (map[c
 	kinds := make(map[candidate.Candidate]string)
 	distinct := make(map[string]bool)
 	for _, o := range outcomes {
-		if o.Class == oracle.ClassOracleError {
-			return nil, 0, fmt.Errorf("positions: oracle_error for %+v makes the table unusable", o.Candidate)
-		}
 		if kind := FailureKind(o); kind != "" {
 			kinds[o.Candidate] = kind
 			distinct[kind] = true

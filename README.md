@@ -29,9 +29,9 @@ CraConTest treats crash-consistency testing as an explicit resource-bounded sear
    - **B6 (Sync-Boundary):** Prioritizes cutoffs immediately preceding a `Sync`, `SyncData`, or `Rename`.
    - **R1 (0%-Retention-First Random):** Partitions the universe by retention policy, randomly sampling 0%-retention candidates before 100%-retention candidates.
    - **R2 (State-Representative Random):** Partitions 0%-retention candidates into canonical `StateKey` equivalence classes, selecting boundary-adjacent representatives within each `StateKey` class using graph features (`BeforeBoundary`, `BarrierProximity`, and canonical order `candidate.Less`) before shuffling classes, and tests redundant cutoffs afterward.
-   - **RHG / B7 (Reachability-Hazard Guided):** Ranks 0%-retention state representatives by uncommitted hazard reachability, barrier proximity, and semantic tier.
+   - **RHG / B7 (Risk-Horizon Guided):** Ranks 0%-retention state representatives by uncommitted hazard reachability, barrier proximity, and semantic tier.
    - **DCG / B8 (Durability-Contract Guided) & DCG-FlagOnly (Ablation):** Trace-derived durability-contract analysis that prioritizes 0%-retention state representatives that exhibit structural POSIX durability-contract violations (`ContractScore > 0`) ahead of unflagged representatives, alongside a randomized flag-only ablation (`DCG-FlagOnly`) that isolates the effect of the contract indicators (POSIX durability-contract priors instantiated for Pebble). DCG-FlagOnly ties full DCG on nearly every setting, showing that the binary durability-contract flags combined with StateKey equivalence partitioning drive the speedup.
-   - **DCG-PR (Durability-Contract Guided with Partial-Retention Prior):** A post-hoc variant of DCG that inspects `ContractFeatures.UnsyncedDirEntryCount` and promotes 50%-retention candidates (with ≥ 2 unsynced directory entries coexisting in the same parent) into Tier 1, ahead of the standard 0%-retention sweep. Achieves median $k_1 = 1.00$ on all 12 testable in-contract holdout fault settings, $k_1 = \mathbf{2.00}$ on Pebble issue `#5825`, and $k_1 = \mathbf{3.00}$ on the checkpoint race later fixed upstream by `15b500fb`.
+   - **DCG-PR (Durability-Contract Guided with Partial-Retention Prior):** A post-hoc variant of DCG that groups intermediate (`0 < Percent < 100`) candidates by `(StateKey, Percent)`, picks one canonical representative per group via `isDCGBetterRep` (preferring `UnsyncedDirEntryCount >= 2`), promotes only those selected representatives with `ContractFeatures.UnsyncedDirEntryCount >= 2` into Tier 1 ahead of the 0%-retention representative sweep, places remaining intermediate representatives after 0%-retention representatives, and places all intermediate non-representatives behind 0%-retention non-representatives. Achieves median $k_1 = 1.00$ on all 12 testable in-contract holdout fault settings, $k_1 = \mathbf{2.00}$ on Pebble issue `#5825`, and median $k_1 = \mathbf{245.00}$ (CI `[3.00, 306.00]`, mean `156.39`) on the checkpoint race later fixed upstream by `15b500fb`.
 
 4. **Strict Ground-Truth Crash Oracle (`oracle`):**
    - Evaluates recovered database states against an append-only mutation history ledger (`history`).
@@ -69,8 +69,9 @@ See [docs/architecture.md](docs/architecture.md) for full architectural details.
 .
 ├── cmd/cracontest/          # Command-line interface (record, plan, explore, evaluate, benchmark)
 ├── analysis/                # Statistical comparison scripts and dependencies
-│   ├── paired_stats.py      # Paired per-seed Wilcoxon & t-test statistical analysis
-│   └── requirements.txt     # Python dependencies (scipy)
+│   ├── paired_stats.py      # Paired per-seed exact sign, Wilcoxon signed-rank, and bootstrap CI analysis
+│   ├── test_paired_stats.py # Unit and integration tests for paired_stats.py
+│   └── requirements.txt     # Python dependency pin (scipy, with numpy resolved transitively)
 ├── docs/                    # Technical documentation and guides
 │   ├── architecture.md      # System architecture and data flow
 │   ├── crash-model.md       # Crash model, durability barriers, and invariants
@@ -88,7 +89,7 @@ See [docs/architecture.md](docs/architecture.md) for full architectural details.
 │   ├── oracle/              # Crash consistency validation oracle
 │   ├── recovery/            # Crash recovery harness and integrity verification
 │   ├── replay/              # VFS trace replay engine
-│   ├── strategy/            # Ranking strategies (B0–B6, R1, R2, RHG, DCG, DCG-FlagOnly)
+│   ├── strategy/            # Ranking strategies (B0–B6, R1, R2, RHG, DCG, DCG-FlagOnly, DCG-PR)
 │   ├── trace/               # Event schema and wire validation
 │   ├── vfsrec/              # Recording VFS filesystem wrapper
 │   └── workload/            # Seeded YCSB-style workload drivers
@@ -119,14 +120,20 @@ See [docs/architecture.md](docs/architecture.md) for full architectural details.
 
 ### Prerequisites
 
-- Go 1.27+ (`go.mod` specifies Go 1.27.1).
-- Python 3.10+ (for statistical analysis in `analysis/paired_stats.py`; compatible with NumPy ≥ 1.22.0 and SciPy ≥ 1.11.0, tested up to Python 3.15).
-- OS: Linux (Ubuntu/ext4) or Windows (NTFS). On Windows, build with `CGO_ENABLED=0`.
+- Go 1.27+ (`go.mod` specifies Go 1.27.4).
+- Python 3.12+ (for statistical analysis in `analysis/paired_stats.py`; pinned to `scipy==1.18.1` in `analysis/requirements.txt`, resolving `numpy` transitively, verified on CPython 3.12 and 3.15).
+- OS: Linux (Ubuntu/ext4) or Windows (NTFS). On Windows, build and test with `$env:CGO_ENABLED="0"`.
 
 ### Building the CLI
 
 ```bash
+# Linux / macOS
 go build -o cracontest ./cmd/cracontest
+```
+
+```powershell
+# Windows PowerShell
+$env:CGO_ENABLED="0"; go build -o cracontest.exe ./cmd/cracontest
 ```
 
 ### Running the End-to-End Smoke Test
@@ -147,21 +154,40 @@ Run the full lifecycle on the seeded 100-operation smoke workload (about half a 
 ./cracontest evaluate -run /tmp/smoke_mut1
 ```
 
-The curves are written to `/tmp/smoke_mut1/curves.csv`. The main 1,000-operation
+On Windows PowerShell:
+
+```powershell
+.\cracontest.exe record -spec experiments\configs\smoke.json -out $env:TEMP\smoke_mut1 -fault MUT-1
+.\cracontest.exe plan -run $env:TEMP\smoke_mut1
+.\cracontest.exe explore -run $env:TEMP\smoke_mut1
+.\cracontest.exe evaluate -run $env:TEMP\smoke_mut1
+```
+
+The curves are written to `/tmp/smoke_mut1/curves.csv` (or `$env:TEMP\smoke_mut1\curves.csv` on Windows). The main 1,000-operation
 experiment uses `experiments/configs/main.json`; see [docs/reproduce.md](docs/reproduce.md).
 
 ### Running the Multi-Seed Benchmark
 
-Run the full 32-seed benchmark across all fault models (`MUT-0` through `MUT-9`, holdouts `MUT-X1` through `MUT-X6`, and barrier controls):
+Run the full 32-seed in-sample benchmark across `MUT-1` through `MUT-9` (with `MUT-0` null-control verification), writing outputs to a scratch directory so tracked reference artifacts in `docs/` and `results/` are preserved:
 
 ```bash
-./cracontest benchmark -report docs/benchmark-report.md -csv results/benchmark_summary.csv -per-seed-csv results/benchmark_per_seed.csv
+./cracontest benchmark -report /tmp/benchmark-report.md -csv /tmp/benchmark_summary.csv -per-seed-csv /tmp/benchmark_per_seed.csv
 ```
 
-Run the paired statistical comparison across seeds via python3:
+```powershell
+# Windows PowerShell
+.\cracontest.exe benchmark -report $env:TEMP\benchmark-report.md -csv $env:TEMP\benchmark_summary.csv -per-seed-csv $env:TEMP\benchmark_per_seed.csv
+```
+
+Run the paired statistical comparison across the committed per-seed results:
 
 ```bash
 python3 analysis/paired_stats.py results/benchmark_per_seed.csv "Seeded Benchmark Faults (32 seeds)" MUT-1 MUT-2 MUT-3 MUT-4 MUT-5 MUT-6 MUT-8 MUT-9
+```
+
+```powershell
+# Windows PowerShell
+python analysis/paired_stats.py results/benchmark_per_seed.csv "Seeded Benchmark Faults (32 seeds)" MUT-1 MUT-2 MUT-3 MUT-4 MUT-5 MUT-6 MUT-8 MUT-9
 ```
 
 ---
@@ -186,7 +212,7 @@ To evaluate ranking strategies across both dense and sparse failure distribution
 
 #### Table 1: Cost-to-First-Failure ($k_1$ Mean [95% CI])
 
-The authoritative accounting-corrected table is in [the technical report](docs/report.md#81-multi-seed-benchmark-results) and is generated from [the summary CSV](results/benchmark_summary.csv). The active source is `v1.1.2-evaluation-freeze` (`f9202dfca579`).
+The authoritative accounting-corrected table is in [the technical report](docs/report.md#32-seed-benchmark-summary-tables) and is generated from [the summary CSV](results/benchmark_summary.csv). The active source is `v1.1.2-evaluation-freeze` (`f9202dfca579`).
 
 #### Table 2: Failing State Discovery ($S_{25}$ Early Budget / $S_{100}$ Exhaustive Budget Mean)
 
@@ -200,22 +226,22 @@ The corrected early/full-budget discovery values are reported alongside Table 1 
 2. **Component Attribution & DCG-FlagOnly Ablation:**
    Comparing full DCG against the **DCG-FlagOnly** ablation isolates the exact contribution of each mechanism:
    - **Binary Durability-Contract Flags + `StateKey` Equivalence Partitioning:** Drive the $k_1 = 1.00$ first-failure discovery on MUT-5, MUT-8, and MUT-9 as well as the early-budget $S_{25}$ lead (`DCG-FlagOnly` matches full `DCG` with mean $S_{25} = 25.00$ on MUT-9 and $12.88$ on MUT-8). On dense faults (`MUT-1`, `MUT-2`, `MUT-4`), sparse faults (`MUT-5`, `MUT-8`), and directory faults (`MUT-9`), DCG-FlagOnly achieves the identical optimal $k_1 = 1.00$ [1.00, 1.00] as full DCG, confirming that the contract indicators (POSIX durability-contract priors instantiated for Pebble) are the primary driver of first-failure cost reduction.
-   - **Tier 1B Continuous Severity Scoring (`Score()`):** Breaks ties when multiple file classes or sync points are flagged within a trace—most visibly on **MUT-6** (second manifest sync drop, ~0.8% density), where full DCG achieves mean $k_1 = 1.00$ compared to $1.20$ for `DCG-FlagOnly`.
-   - **Tier 3A Regime/Epoch Diversity Partitioning:** Operates in Pass 2 after unique `StateKey` representatives are exhausted, increasing full-budget failure-curve area (`AUCNormFailures`) rather than altering $k_1$ or $S_{25}$.
+   - **Continuous Contract Severity Scoring (`ContractFeatures.ContractScore`):** Breaks ties within Tier 1 when multiple file classes or sync points are flagged within a trace—most visibly on **MUT-6** (second manifest sync drop, ~0.8% density), where full DCG achieves mean $k_1 = 1.00$ compared to $1.19$ for `DCG-FlagOnly`.
+   - **Pass 1 Category Interleaving & Pass 2 Violation Prioritization:** Pass 1 Tier 2 interleaves uncontracted barrier-adjacent candidates across write categories (`categoryOrder`), while Pass 2 Tier 3A prioritizes remaining violating non-representatives by contract tier, barrier proximity, and `ContractScore` after unique `StateKey` representatives are exhausted, increasing full-budget failure-curve area (`AUCNormFailures`) rather than altering $k_1$ or $S_{25}$.
 
 3. **$S_{25}$ Early-Budget Discovery & The ~40-State Equivalence Ceiling:**
-   In a 120-operation workload, there are only ~35–40 distinct canonical `StateKey` persistence states under 0%-retention crashes. Under an exhaustive testing budget ($B = 100$, $S_{100}$), both DCG and R2 discover all reachable failing equivalence classes and tie because both strategies exhaust distinct state representatives before step 100 (reaching identical $S_{100} = 23.97$ on `MUT-1`, $33.00$ on `MUT-2`, $27.00$ on `MUT-3`, $21.69$ on `MUT-4`, and $27.00$ on `MUT-9`). Under MUT-8 (compaction-triggered SST sync drop, 15.2% density), DCG reaches the first failing state at median $k_1 = 1.0$ (mean 1.00) compared to R2's median $k_1 = 3.6$ (mean 3.58) and B0's median $k_1 = 4.0$ (mean 4.41), achieves early-budget $S_{25} = 12.88$ (vs R2's $6.74$ and B0's $2.00$), and matches R2 at full budget ($S_{100} = 12.88$ for DCG vs $12.82$ for R2, compared to $5.05$ for B0). Therefore, early-budget coverage $S_{25}$ ($B = 25$) is the critical discriminant metric for practical CI testing: DCG achieves near-full state discovery saturation within the first 25 tests (e.g. $S_{25} = 23.94$ vs R2's $17.12$ and B0's $6.12$ on `MUT-1`; $S_{25} = 12.88$ vs R2's $6.74$ and B0's $2.00$ on `MUT-8`; $S_{25} = 25.00$ vs R2's $17.78$ and B0's $3.03$ on `MUT-9`), yielding a 2x–8x throughput advantage over random selection.
+   On the evaluated 120-operation traces, full-budget discovery often approaches the available `StateKey` ceiling: DCG and R2 match at $S_{100}=23.97$ on `MUT-1`, $33.00$ on `MUT-2`, $27.00$ on `MUT-3`, $21.69$ on `MUT-4`, and $27.00$ on `MUT-9`. On `MUT-8`, DCG has median/mean $k_1=1.00/1.00$, compared with R2 $3.41/3.42$ and B0 $6.49/6.49$. Mean $S_{25}$ is DCG/R2/B0 $12.88/6.73/2.12$, and $S_{100}$ is $12.88/12.80/5.19$. Early-budget coverage therefore exposes differences that later saturation obscures. DCG/R2/B0 mean $S_{25}$ is $23.94/17.14/6.34$ on `MUT-1` and $25.00/17.75/3.31$ on `MUT-9`. These are failing-state coverage comparisons at a fixed candidate budget, not wall-clock throughput gains.
 
 ### 4. Parameterized & Stochastic Fault Generalization (MUT-X1..X5) and Out-of-Contract Control (MUT-X6)
 
 The parameterized $k$-index (`MUT-X1..X3`), stochastic probability-$p$ (`MUT-X4..X5`), and out-of-contract silent write-loss (`MUT-X6`) families were reevaluated without retuning under `v1.1.2-evaluation-freeze`. Across 12 analyzed in-contract settings, DCG records 246 wins, 1 loss, and 48 ties versus R2 (Holm-adjusted sign $p\le0.006$); the loss is on stochastic `MUT-X4_p04`. MUT-X6 remains a non-significant negative control (21/38/4, Holm $p=1.0$).
 
-Subsequently, `internal/strategy/dcg.go` and `internal/graph/features.go` were frozen at Git tag **`v1.0-dcg-pr-freeze` (`67bbe7d`)**, following the development and calibration of the partial-retention prior `DCG-PR` on Pebble `#5825` (§5.1). **Three strictly post-freeze evaluations** were designed and executed with 0 bytes of modification to the ranking or feature code:
-1. **Post-Freeze Evaluation 1 (Intra-Class Subsystem Transfer — checkpoint race later fixed by `15b500fb`, §5.2)**: Evaluated across 32 seeds (`MUT-0` vs. `BARRIER-CKPT`).
-2. **Post-Freeze Evaluation 2 (Cross-Channel Ordering — Direct L0 `db.Ingest` Cross-Channel Commit-Order Hole, §5.3)**: Evaluated across 32 seeds (`MUT-0` vs. path-pattern barrier control `BARRIER-INGEST`).
-3. **Post-Freeze Holdout 3 (Multi-Distribution Workload Suite, §8)**: 5 workload presets evaluated across 16 seeds and 4 fault models.
+Subsequently, `internal/strategy/dcg.go` and `internal/graph/features.go` were first frozen at Git tag **`v1.0-dcg-pr-freeze` (`67bbe7d`, 2026-11-02)** for the original chronological record of Evaluations 1–3 (Checkpoint, Direct L0 Ingest, and Workload Diversity), following the development and calibration of `DCG-PR` on Pebble `#5825` (§5.1). Commit `3c492bd` ("Harden crash replay, trace validation, and experiment accounting", 2026-11-19) later modified `internal/graph/features.go` and `internal/strategy/dcg.go` (238 insertions, 41 deletions) prior to `v1.1.2-evaluation-freeze` (`f9202dfca579`) for implementation and accounting corrections. Consequently, the active `v1.1.2-evaluation-freeze` campaign is an accounting-corrected reevaluation of those known settings rather than a new 0-byte-diff blind holdout:
+1. **Evaluation 1 (Intra-Class Subsystem Transfer — checkpoint race later fixed by `15b500fb`, §5.2)**: Evaluated across 32 seeds (`MUT-0` vs. `BARRIER-CKPT`).
+2. **Evaluation 2 (Cross-Channel Ordering — Direct L0 `db.Ingest` Cross-Channel Commit-Order Hole, §5.3)**: Evaluated across 32 seeds (`MUT-0` vs. pre-ingest WAL synchronization `BARRIER-INGEST`).
+3. **Evaluation 3 (Multi-Distribution Workload Suite, §8)**: 5 workload presets evaluated across 16 seeds and 4 fault models.
 
-Across all 12 testable in-contract holdout settings (`MUT-X1..X5`), `DCG`/`DCG-PR` achieves median $k_1 = 1.00$, winning 287/287 non-tied comparisons against `R2` (0 losses, Holm-adjusted sign-test $p \le 0.002$, mean speedup $2.0\times$–$19.9\times$ across 100-shuffle means ($2.2\times$–$19.1\times$ on single-seed rankings)). On the 3 out-of-contract settings (`MUT-X6`), performance degrades gracefully to the `R2` baseline (Holm-adjusted $p = 1.0$, not significant) — confirming the contract boundary is correctly defined.
+The revised campaign evaluates settings already known from the earlier studies; it is not a newly blind holdout. The silent-write-loss control includes regressions versus R2 and B0, so its non-significant paired tests do not establish equivalence. Together with the by-construction sync-omission results, these observations limit the claim to the evaluated contract-visible mechanisms.
 
 ### 5. Storage Engine Case Studies (Pebble #5825, Checkpoint Directory Race & Direct L0 Ingest)
 
@@ -229,7 +255,7 @@ CraConTest has been evaluated across two directory-sync crash bugs in Pebble v2.
 2. **Pebble Checkpoint Directory Race & `BARRIER-CKPT`:**
    - In Pebble's checkpoint subsystem, during `db.Checkpoint(destDir)`, Pebble creates hard-linked SSTables, `MANIFEST`, and `marker.manifest.*` inside `destDir` before directory synchronization. Under 50% partial retention this yields 53 open failures across 31 of 32 MUT-0 seeds in the accounting-corrected reevaluation.
    - Case Study 2 belongs to the same structural bug class as Case Study 1 (`#5825`) (multi-entry directory races in Pebble's `atomicfs` marker protocol), evaluating **intra-class subsystem transfer** of `dcg-pr` (from manifest rotation in `"db/"` to `db.Checkpoint` in `"checkpoint/"`), not generalization to an unseen bug class.
-   - The `BARRIER-CKPT` intervention (`internal/faults/faults.go:682-705`) adds destination-directory synchronization; no checkpoint recovery failures are observed across the 32 evaluated seeds.
+   - The `BARRIER-CKPT` intervention (`internal/faults/faults.go:695-707`, inside `maybeSyncParentDir`) adds destination-directory synchronization; no checkpoint recovery failures are observed across the 32 evaluated seeds.
    - This is intra-class transfer within Pebble's marker protocol, not a blind unseen bug class. DCG-PR records median/mean $k_1=245.00/156.39$ versus DCG 288.00/258.65, R2 280.41/271.55, and corrected B0 262.26/238.53; DCG-PR/R2 paired W/L/T is 22/9/0.
 
 3. **Direct L0 `db.Ingest` Cross-Channel Prefix Hole & `BARRIER-INGEST`:**
@@ -240,7 +266,7 @@ CraConTest has been evaluated across two directory-sync crash bugs in Pebble v2.
 
 ### 6. Candidate Universe Scaling (MUT-5, 120..1200 ops) & Multi-Shape Null Control (108 Runs)
 
-Across four evaluated workload sizes (`MUT-5`, 120–1,200 operations per seed), candidate universes grow from approximately 338 to 2,958 states while `DCG` retains median and mean $k_1 = 1.00$; measured planning time remains at most 63.0 ms. The baseline discovery positions increase over this range. The 108-run multi-shape null control produces no observed failures over >50,000 crash states, but its fixed workloads and dependent candidates do not support an independent-trial population bound.
+Across four evaluated workload sizes (`MUT-5`, 120–1,200 operations per seed), candidate universes grow from approximately 338 to 2,958 states while `DCG` retains median and mean $k_1 = 1.00$; measured planning time at 1,200 ops averages 38.5 ms (max 42 ms). The baseline discovery positions increase over this range. The 108-run multi-shape null control produces no observed failures over >50,000 crash states, but its fixed workloads and dependent candidates do not support an independent-trial population bound.
 
 ### 7. Pebble Subsystem Audit & Empirical Crash-Consistency Evaluation (MUT-0)
 
@@ -266,10 +292,10 @@ To examine selected Pebble v2.1.7 subsystems that perform multi-file and directo
 
 ### 8. Multi-Distribution Workload Diversity Suite
 
-To evaluate robustness and generalization across non-uniform key-value access distributions, CraConTest provides 5 distinct workload presets configured via `-preset` (`internal/workload/workload.go`):
+To evaluate robustness and generalization across non-uniform key-value access distributions, CraConTest provides 5 distinct workload presets configured via `-preset` (`internal/workload/workload.go`; the key counts below are the calibrated preset defaults when `KeyCount == 0`, as used by the diversity benchmark, whereas CLI `record`/`benchmark` inherit `DefaultConfig()` `KeyCount = 64` or `DefaultMultiSeedBenchmarkConfig()` `KeyCount = 16` unless `key_count: 0` is set in `-spec`):
 1. `ycsb-a`: 50% update (`set`), 50% point read (`get`) over 8 hot keys (`keyCount = 8`) with periodic sync/flush.
 2. `ycsb-b`: 75% point read (`get`), 25% update (`set`, 3 reads per write operation via `i%4 == 3`, adapted from YCSB-B for 25-operation traces so multiple sync cycles occur per run) over 12 keys (`keyCount = 12`) with periodic sync/flush.
-3. `ycsb-f`: 100% read-modify-write two-key atomic batch transactions (reading 2 keys via `Get` and updating 2 distinct keys atomically via `Batch` per transaction) over 8 keys (`keyCount = 8`) with periodic sync/flush.
+3. `ycsb-f`: 50% standalone point read (`get`, even steps) and 50% read-modify-write two-key atomic batch transaction (odd steps: reading 2 keys via `Get` and updating 2 distinct keys atomically via `Batch`) over 8 keys (`keyCount = 8`) with periodic sync/flush.
 4. `overwrite-heavy`: 100% overwrite (`set`) across 4 hot keys (`keyCount = 4`), driving deep per-key version chains and frequent memtable flush pressure.
 5. `delete-heavy`: Equal 1/3 cycling (`i%3`) of point `set`, point `delete`, and `range_delete` (`DeleteRange`) over 8 keys (`keyCount = 8`) with periodic checkpoints (`checkpointAt = 10`).
 
@@ -286,14 +312,15 @@ Evaluated across 16 seeds (`seed = 1..16`, 25 ops) and 4 fault models (`MUT-0`, 
 Run the full test suite and code linters:
 
 ```bash
-# Run Go vet
+# Linux / macOS
 go vet ./...
-
-# Run all unit and integration tests
 go test -count=1 ./...
-
-# Run race detector (Linux)
 go test -race -count=1 ./...
+```
+
+```powershell
+# Windows PowerShell
+$env:CGO_ENABLED="0"; go vet ./...; go test -count=1 ./...
 ```
 
 Continuous integration runs automatically on GitHub Actions (`.github/workflows/ci.yml`).

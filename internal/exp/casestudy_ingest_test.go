@@ -2,8 +2,8 @@ package exp
 
 import (
 	"encoding/csv"
-	"flag"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -24,20 +24,6 @@ import (
 	"github.com/cockroachdb/pebble/v2"
 	"github.com/cockroachdb/pebble/v2/vfs"
 )
-
-func init() {
-	if flag.Lookup("update-artifacts") == nil {
-		flag.BoolVar(updateArtifacts, "update-artifacts", false, "alias for -update")
-	}
-}
-
-func caseStudyIngestResultsDir() string {
-	dir := filepath.Join("..", "..", "results")
-	if fi, err := os.Stat(dir); err == nil && fi.IsDir() {
-		return dir
-	}
-	return "results"
-}
 
 func runIngestTrial(t *testing.T, seed uint64, barrierIngest bool, policies []int) (
 	*graph.View,
@@ -88,12 +74,12 @@ func runIngestTrial(t *testing.T, seed uint64, barrierIngest bool, policies []in
 
 	rawHist, err := workload.Run(db, rec, wCfg)
 	if err != nil {
-		_ = db.Close()
+		_, _ = safeCloseDB(db)
 		t.Fatalf("seed %d barrier=%v: run workload failed: %v", seed, barrierIngest, err)
 	}
 	db.TestOnlyWaitForCleaning()
-	if err := db.Close(); err != nil {
-		t.Fatalf("seed %d barrier=%v: close pebble failed: %v", seed, barrierIngest, err)
+	if panicked, closeErr := safeCloseDB(db); panicked || closeErr != nil {
+		t.Fatalf("seed %d barrier=%v: close pebble failed (panic=%v): %v", seed, barrierIngest, panicked, closeErr)
 	}
 
 	traceEvents := rec.Events()
@@ -126,8 +112,14 @@ func runIngestTrial(t *testing.T, seed uint64, barrierIngest bool, policies []in
 	if err != nil {
 		t.Fatalf("seed %d barrier=%v: run explore failed: %v", seed, barrierIngest, err)
 	}
+	if expRes.Summary.OracleErrors != 0 {
+		t.Fatalf("seed %d barrier=%v: expected 0 oracle_errors, got %d", seed, barrierIngest, expRes.Summary.OracleErrors)
+	}
 
 	normOutcomes := NormalizeTable(expRes.Outcomes)
+	if err := ValidateTable(universe, normOutcomes); err != nil {
+		t.Fatalf("seed %d barrier=%v: ValidateTable failed: %v", seed, barrierIngest, err)
+	}
 
 	var prefixViols int
 	for _, o := range expRes.Outcomes {
@@ -144,6 +136,7 @@ func assertDirectL0IngestPath(t *testing.T, events []trace.Event) int {
 	inIngest := false
 	var curEvents []trace.Event
 	directL0Count := 0
+	ingestOps := 0
 
 	for _, e := range events {
 		if e.Kind == trace.KindOpBegin && e.OpKind == "ingest" {
@@ -153,11 +146,12 @@ func assertDirectL0IngestPath(t *testing.T, events []trace.Event) int {
 		}
 		if e.Kind == trace.KindOpEnd && e.OpKind == "ingest" {
 			inIngest = false
+			ingestOps++
 			hasLink := false
 			hasManifestSync := false
 			hasFlush := false
 			for _, ce := range curEvents {
-				if ce.Kind == trace.KindLink && (strings.HasPrefix(ce.File2, "db/") || strings.Contains(ce.File2, ".sst")) {
+				if ce.Kind == trace.KindLink && strings.HasPrefix(ce.File2, "db/") && strings.Contains(ce.File2, ".sst") {
 					hasLink = true
 				}
 				if ce.Kind == trace.KindSync && strings.Contains(ce.File, "MANIFEST") {
@@ -167,7 +161,10 @@ func assertDirectL0IngestPath(t *testing.T, events []trace.Event) int {
 					hasFlush = true
 				}
 			}
-			if hasLink && hasManifestSync && !hasFlush {
+			if !hasLink || !hasManifestSync {
+				t.Errorf("ingest op #%d missing SST link or MANIFEST sync: hasLink=%v hasManifestSync=%v",
+					ingestOps, hasLink, hasManifestSync)
+			} else if !hasFlush {
 				directL0Count++
 			}
 			continue
@@ -176,6 +173,9 @@ func assertDirectL0IngestPath(t *testing.T, events []trace.Event) int {
 			curEvents = append(curEvents, e)
 		}
 	}
+	if ingestOps == 0 || directL0Count == 0 {
+		t.Fatalf("expected direct L0 ingest ops > 0, got ingestOps=%d directL0Count=%d", ingestOps, directL0Count)
+	}
 	return directL0Count
 }
 
@@ -183,9 +183,14 @@ func assertDirectL0IngestPath(t *testing.T, events []trace.Event) int {
 // under MUT-0 (BarrierIngest: false), and asserts 0 violations under BARRIER-INGEST (BarrierIngest: true).
 func TestCaseStudyIngestABSmoke(t *testing.T) {
 	// Condition A: MUT-0 (BarrierIngest: false), ret=0.00
-	viewA, universeA, _, normOutcomesA, prefixViolsA, eventsA := runIngestTrial(t, 1, false, []int{0})
+	viewA, universeA, rawOutcomesA, normOutcomesA, prefixViolsA, eventsA := runIngestTrial(t, 1, false, []int{0})
 	if prefixViolsA == 0 {
 		t.Fatalf("Condition A (MUT-0): expected prefix violations > 0, got 0")
+	}
+	for _, o := range rawOutcomesA {
+		if o.Class == oracle.ClassOracleError || o.Class == oracle.ClassPanic || o.Class == oracle.ClassHang {
+			t.Fatalf("Condition A (MUT-0): unexpected non-prefix error outcome %+v", o)
+		}
 	}
 
 	dcgStrat := NewDCGStrategy()
@@ -234,7 +239,7 @@ var ingestStratSpecs = []ingestStratSpec{
 	{"dcg-flag-only", "dcg-flag-only", "dcg-flag-only", "DCG Flag-Only (Ablation)"},
 	{"r2", "r2", "r2", "State-Representative Random (R2)"},
 	{"r1", "r1", "r1", "0%-Retention-First Random (R1)"},
-	{"c1", "b6", "sync-boundary", "sync-boundary"},
+	{"b6", "b6", "sync-boundary", "sync-boundary"},
 	{"b0", "b0", "Uniform Random (B0)", "Uniform Random (B0)"},
 	{"b4", "b4", "combined", "combined"},
 	{"b1", "b1", "fifo", "fifo"},
@@ -266,9 +271,37 @@ func validateCaseStudyIngestCSVs(t *testing.T, perSeedPath, summaryPath string) 
 		"k1_failure_mean", "s25_mean", "s100_mean", "b_full_mean",
 		"auc_norm_failures", "auc_norm_bugs", "git_commit",
 	}
+	if len(rows1[0]) != len(expectedHeader1) {
+		t.Fatalf("per-seed header length = %d, want %d", len(rows1[0]), len(expectedHeader1))
+	}
 	for i, col := range expectedHeader1 {
 		if rows1[0][i] != col {
 			t.Fatalf("per-seed header col %d: expected %q, got %q", i, col, rows1[0][i])
+		}
+	}
+	for rowIdx, row := range rows1[1:] {
+		if len(row) != len(expectedHeader1) {
+			t.Fatalf("per-seed row %d length = %d, want %d", rowIdx+1, len(row), len(expectedHeader1))
+		}
+		if row[0] != "MUT-0" && row[0] != "BARRIER-INGEST" {
+			t.Fatalf("per-seed row %d unexpected fault_id %q", rowIdx+1, row[0])
+		}
+		univ, err := strconv.Atoi(row[2])
+		if err != nil || univ <= 0 {
+			t.Fatalf("per-seed row %d invalid universe_size %q", rowIdx+1, row[2])
+		}
+		fails, err := strconv.Atoi(row[3])
+		if err != nil || fails < 0 {
+			t.Fatalf("per-seed row %d invalid total_failures %q", rowIdx+1, row[3])
+		}
+		if row[0] == "BARRIER-INGEST" && fails != 0 {
+			t.Fatalf("per-seed row %d BARRIER-INGEST expected total_failures == 0, got %d", rowIdx+1, fails)
+		}
+		for _, colIdx := range []int{4, 7, 8, 9, 10, 11, 12, 13, 14} {
+			v, err := strconv.ParseFloat(row[colIdx], 64)
+			if err != nil || math.IsNaN(v) || math.IsInf(v, 0) || v < 0 {
+				t.Fatalf("per-seed row %d col %d (%s=%q) invalid", rowIdx+1, colIdx, expectedHeader1[colIdx], row[colIdx])
+			}
 		}
 	}
 
@@ -301,56 +334,61 @@ func validateCaseStudyIngestCSVs(t *testing.T, perSeedPath, summaryPath string) 
 		"theoretical_expectation_mean",
 		"git_commit",
 	}
+	if len(rows2[0]) != len(expectedHeader2) {
+		t.Fatalf("summary header length = %d, want %d", len(rows2[0]), len(expectedHeader2))
+	}
 	for i, col := range expectedHeader2 {
 		if rows2[0][i] != col {
 			t.Fatalf("summary header col %d: expected %q, got %q", i, col, rows2[0][i])
 		}
 	}
 
-	for _, row := range rows2[1:] {
+	for rowIdx, row := range rows2[1:] {
+		if len(row) != len(expectedHeader2) {
+			t.Fatalf("summary row %d length = %d, want %d", rowIdx+1, len(row), len(expectedHeader2))
+		}
 		fid := row[0]
 		strat := row[1]
+		if len(strat) == 0 {
+			t.Errorf("summary row %d: empty strategy", rowIdx+1)
+		}
+		for colIdx := 2; colIdx < len(expectedHeader2)-1; colIdx++ {
+			v, err := strconv.ParseFloat(row[colIdx], 64)
+			if err != nil || math.IsNaN(v) || math.IsInf(v, 0) || v < 0 {
+				t.Fatalf("summary row %d col %d (%s=%q) invalid", rowIdx+1, colIdx, expectedHeader2[colIdx], row[colIdx])
+			}
+		}
+		s25Mean, _ := strconv.ParseFloat(row[13], 64)
+		s25MeanHi, _ := strconv.ParseFloat(row[15], 64)
+		s100Mean, _ := strconv.ParseFloat(row[19], 64)
+		if s25Mean > 25.0 || s25MeanHi > 25.0 {
+			t.Errorf("%s %s s25 exceeds cap 25: mean=%.2f upper=%.2f", fid, strat, s25Mean, s25MeanHi)
+		}
+		if s100Mean > 100.0 {
+			t.Errorf("%s %s s100 exceeds cap 100: mean=%.2f", fid, strat, s100Mean)
+		}
 		switch fid {
 		case "BARRIER-INGEST":
-			if len(strat) == 0 {
-				t.Errorf("BARRIER-INGEST has empty strategy")
-			}
-			if row[2] != "0.00" {
-				t.Errorf("BARRIER-INGEST strategy %s expected k1_failure_median == 0.00, got %s", strat, row[2])
-			}
-			if row[5] != "0.00" {
-				t.Errorf("BARRIER-INGEST strategy %s expected k1_failure_mean == 0.00, got %s", strat, row[5])
+			if row[2] != "0.00" || row[5] != "0.00" {
+				t.Errorf("BARRIER-INGEST strategy %s expected k1_failure median/mean == 0.00, got %s / %s", strat, row[2], row[5])
 			}
 		case "MUT-0":
-			if strat == "Durability-Contract Guided (DCG)" {
-				k1Med, _ := strconv.ParseFloat(row[2], 64)
-				if k1Med <= 0 {
-					t.Errorf("MUT-0 DCG expected k1 median > 0, got %f", k1Med)
-				}
+			k1Med, _ := strconv.ParseFloat(row[2], 64)
+			k1Mean, _ := strconv.ParseFloat(row[5], 64)
+			if k1Med <= 0 || k1Mean <= 0 {
+				t.Errorf("MUT-0 strategy %s expected positive k1 median/mean, got %.2f / %.2f", strat, k1Med, k1Mean)
 			}
+		default:
+			t.Errorf("summary row %d unexpected fault_id %q", rowIdx+1, fid)
 		}
 	}
 	t.Logf("Validated %s (%d rows) and %s (%d rows) successfully", perSeedPath, len(rows1), summaryPath, len(rows2))
 }
 
-// TestCaseStudyIngestBenchmark evaluates the Direct L0 Ingest prefix race across 32 canonical seeds (1..32)
-// under MUT-0 (BarrierIngest: false) and BARRIER-INGEST (BarrierIngest: true) across 11 strategies.
-// When -update-artifacts is false, it performs fast read-only validation of committed CSVs.
-func TestCaseStudyIngestBenchmark(t *testing.T) {
-	perSeedPath := filepath.Join(caseStudyIngestResultsDir(), "casestudy_ingest_per_seed.csv")
-	summaryPath := filepath.Join(caseStudyIngestResultsDir(), "casestudy_ingest_summary.csv")
-
-	if !*updateArtifacts {
-		validateCaseStudyIngestCSVs(t, perSeedPath, summaryPath)
-		return
-	}
+func writeAndRunIngestSuite(t *testing.T, perSeedPath, summaryPath string, seeds []uint64, policies []int, b0Shuffles int) {
+	t.Helper()
 
 	gitCommit := CurrentGitCommit()
-	seeds := make([]uint64, 32)
-	for i := range seeds {
-		seeds[i] = uint64(i + 1)
-	}
-
 	conditions := []struct {
 		id            string
 		barrierIngest bool
@@ -359,58 +397,11 @@ func TestCaseStudyIngestBenchmark(t *testing.T) {
 		{"BARRIER-INGEST", true},
 	}
 
-	if err := os.MkdirAll(caseStudyIngestResultsDir(), 0755); err != nil {
-		t.Fatalf("mkdir results dir: %v", err)
-	}
-
-	fSeed, err := os.Create(perSeedPath)
-	if err != nil {
-		t.Fatalf("create per-seed csv: %v", err)
-	}
-	defer fSeed.Close()
-	wSeed := csv.NewWriter(fSeed)
-	wSeed.UseCRLF = false
-	defer wSeed.Flush()
-
-	header1 := []string{
-		"fault_id", "seed", "universe_size", "total_failures", "fault_density_pct",
-		"strategy_code", "strategy", "k1_single", "s25_single",
-		"k1_failure_mean", "s25_mean", "s100_mean", "b_full_mean",
-		"auc_norm_failures", "auc_norm_bugs", "git_commit",
-	}
-	if err := wSeed.Write(header1); err != nil {
-		t.Fatalf("write per-seed header: %v", err)
-	}
-
-	fSummary, err := os.Create(summaryPath)
-	if err != nil {
-		t.Fatalf("create summary csv: %v", err)
-	}
-	defer fSummary.Close()
-	wSummary := csv.NewWriter(fSummary)
-	wSummary.UseCRLF = false
-	defer wSummary.Flush()
-
-	header2 := []string{
-		"fault_id", "strategy",
-		"k1_failure_median", "k1_failure_median_ci95_lower", "k1_failure_median_ci95_upper",
-		"k1_failure_mean", "k1_failure_mean_ci95_lower", "k1_failure_mean_ci95_upper",
-		"k1_failure_p10", "k1_failure_p90",
-		"s25_median", "s25_median_ci95_lower", "s25_median_ci95_upper",
-		"s25_mean", "s25_mean_ci95_lower", "s25_mean_ci95_upper",
-		"s100_median", "s100_median_ci95_lower", "s100_median_ci95_upper",
-		"s100_mean", "s100_mean_ci95_lower", "s100_mean_ci95_upper",
-		"b_full_median", "b_full_mean",
-		"auc_norm_failures", "auc_norm_bugs",
-		"theoretical_expectation_mean",
-		"git_commit",
-	}
-	if err := wSummary.Write(header2); err != nil {
-		t.Fatalf("write summary header: %v", err)
-	}
+	var perSeedRows [][]string
+	var summaryRows [][]string
 
 	for _, cond := range conditions {
-		t.Logf("Running condition %s (barrierIngest=%v) across 32 seeds...", cond.id, cond.barrierIngest)
+		t.Logf("Running condition %s (barrierIngest=%v, policies=%v) across %d seeds...", cond.id, cond.barrierIngest, policies, len(seeds))
 		var runs []SingleRunResult
 
 		for _, seed := range seeds {
@@ -425,16 +416,18 @@ func TestCaseStudyIngestBenchmark(t *testing.T) {
 					IngestEvery:   5,
 					BarrierIngest: cond.barrierIngest,
 				},
-				Policies:        []int{0, 100},
+				Policies:        policies,
 				SafeOpenTimeout: 3 * time.Second,
-				// B0PercentileCnt is set to 50 (vs DefaultB0PercentileCnt=100) to keep 32-seed test runtime manageable.
-				B0PercentileCnt: 50,
+				B0PercentileCnt: b0Shuffles,
 				Budgets:         []int{0, 1, 5, 10, 25},
 			}
 
 			res, err := RunSingleSeedFault(seed, faults.MUT0, benchCfg)
 			if err != nil {
 				t.Fatalf("seed %d cond %s: RunSingleSeedFault failed: %v", seed, cond.id, err)
+			}
+			if cond.barrierIngest && res.TotalFailures != 0 {
+				t.Fatalf("seed %d BARRIER-INGEST: expected 0 failures, got %d", seed, res.TotalFailures)
 			}
 			runs = append(runs, *res)
 
@@ -457,7 +450,10 @@ func TestCaseStudyIngestBenchmark(t *testing.T) {
 					aucF = res.B0.AUCNormFailures
 					aucB = res.B0.AUCNormBugs
 				} else {
-					m := res.Strategies[spec.resKey]
+					m, ok := res.Strategies[spec.resKey]
+					if !ok {
+						t.Fatalf("seed %d cond %s missing strategy %q", seed, cond.id, spec.resKey)
+					}
 					k1Single = m.K1SingleSeed
 					s25Single = m.S25SingleSeed
 					k1Mean = m.K1FailureFloat
@@ -468,7 +464,7 @@ func TestCaseStudyIngestBenchmark(t *testing.T) {
 					aucB = m.AUCNormBugs
 				}
 
-				row := []string{
+				perSeedRows = append(perSeedRows, []string{
 					cond.id,
 					fmt.Sprintf("%d", seed),
 					fmt.Sprintf("%d", res.UniverseSize),
@@ -485,79 +481,132 @@ func TestCaseStudyIngestBenchmark(t *testing.T) {
 					fmt.Sprintf("%.4f", aucF),
 					fmt.Sprintf("%.4f", aucB),
 					gitCommit,
-				}
-				if err := wSeed.Write(row); err != nil {
-					t.Fatalf("write per-seed row: %v", err)
-				}
+				})
 			}
 		}
 
-		// Compute summary metrics for this condition
+		if !cond.barrierIngest && len(runs) > 0 {
+			activeCount := 0
+			for _, r := range runs {
+				if r.TotalFailures > 0 {
+					activeCount++
+				}
+			}
+			if activeCount == 0 {
+				t.Fatalf("condition %s: expected at least one active failing seed", cond.id)
+			}
+		}
+
+		// Align active-seed denominator across all ranking metrics and theoretical expectation.
+		meanTheo := activeTheoreticalExpectationMean(runs)
+		activeOnly := false
+		for _, r := range runs {
+			if r.TotalFailures > 0 {
+				activeOnly = true
+				break
+			}
+		}
+
 		for _, spec := range ingestStratSpecs {
-			var k1Vals, s25Vals, s100Vals, bFullVals, aucFVals, aucBVals, theoVals []float64
+			var k1Vals, s25Vals, s100Vals, bFullVals, aucFVals, aucBVals []float64
+			var k1Clusters, s25Clusters, s100Clusters, bFullClusters [][]float64
 
 			for _, r := range runs {
+				if activeOnly && r.TotalFailures == 0 {
+					continue
+				}
 				var k1Val, s25Val, s100Val, bfVal, aF, aB float64
+				var k1Samp, s25Samp, s100Samp, bfSamp []float64
 
 				if spec.code == "b0" {
-					if r.TotalFailures > 0 {
-						k1Val = r.B0.K1FailureMean
-						bfVal = r.B0.BFullMean
-					}
+					k1Val = r.B0.K1FailureMean
+					bfVal = r.B0.BFullMean
 					s25Val = r.B0.S25Mean
 					s100Val = r.B0.S100Mean
 					aF = r.B0.AUCNormFailures
 					aB = r.B0.AUCNormBugs
+					k1Samp = r.B0.K1FailureSamples
+					s25Samp = r.B0.S25Samples
+					s100Samp = r.B0.S100Samples
+					bfSamp = r.B0.BFullSamples
 				} else {
 					m := r.Strategies[spec.resKey]
-					if r.TotalFailures > 0 {
-						k1Val = m.K1FailureFloat
-						bfVal = m.BFullFloat
-					}
-					s25Val = m.S25Float
-					s100Val = m.S100Float
+					k1Val, _, bfVal, s25Val, s100Val = resolveStrategyMetrics(m)
 					aF = m.AUCNormFailures
 					aB = m.AUCNormBugs
+					k1Samp = m.K1FailureSamples
+					s25Samp = m.S25Samples
+					s100Samp = m.S100Samples
+					bfSamp = m.BFullSamples
 				}
 
 				if r.TotalFailures > 0 && k1Val > 0 {
 					k1Vals = append(k1Vals, k1Val)
 					bFullVals = append(bFullVals, bfVal)
+					if len(k1Samp) > 0 {
+						k1Clusters = append(k1Clusters, k1Samp)
+					}
+					if len(bfSamp) > 0 {
+						bFullClusters = append(bFullClusters, bfSamp)
+					}
 				}
-				s25Vals = append(s25Vals, s25Val)
-				s100Vals = append(s100Vals, s100Val)
-				aucFVals = append(aucFVals, aF)
-				aucBVals = append(aucBVals, aB)
-				theoVals = append(theoVals, r.TheoreticalExpectation)
+				if activeOnly {
+					s25Vals = append(s25Vals, s25Val)
+					s100Vals = append(s100Vals, s100Val)
+					if len(s25Samp) > 0 {
+						s25Clusters = append(s25Clusters, s25Samp)
+					}
+					if len(s100Samp) > 0 {
+						s100Clusters = append(s100Clusters, s100Samp)
+					}
+					aucFVals = append(aucFVals, aF)
+					aucBVals = append(aucBVals, aB)
+				}
 			}
 
-			var medK1F, k1FMedLow, k1FMedHigh float64
-			var meanK1F, k1FMeanLow, k1FMeanHigh float64
-			var p10K1F, p90K1F float64
+			var medK1F, k1FMedLow, k1FMedHigh, meanK1F, k1FMeanLow, k1FMeanHigh, p10K1F, p90K1F float64
 			var medBF, meanBF float64
+			var medS25, s25MedLow, s25MedHigh, meanS25, s25MeanLow, s25MeanHigh float64
+			var medS100, s100MedLow, s100MedHigh, meanS100, s100MeanLow, s100MeanHigh float64
 
-			if len(k1Vals) > 0 {
-				medK1F, k1FMedLow, k1FMedHigh = BootstrapMedianCI95(k1Vals, 10000, 42)
-				meanK1F, k1FMeanLow, k1FMeanHigh = StudentTCI95(k1Vals)
+			if len(k1Clusters) > 0 && len(k1Clusters) == len(k1Vals) {
+				meanK1F, k1FMeanLow, k1FMeanHigh, medK1F, k1FMedLow, k1FMedHigh, p10K1F, p90K1F =
+					ClusterBootstrapCI95(k1Clusters, 2000, 42, 1.0, math.Inf(1))
+			} else if len(k1Vals) > 0 {
+				medK1F, k1FMedLow, k1FMedHigh = BootstrapMedianCI95(k1Vals, 2000, 42)
+				meanK1F, k1FMeanLow, k1FMeanHigh = StudentTCI95Range(k1Vals, 1.0, math.Inf(1))
 				sortedK1 := append([]float64{}, k1Vals...)
 				sort.Float64s(sortedK1)
 				p10K1F = percentile(sortedK1, 10)
 				p90K1F = percentile(sortedK1, 90)
+			}
+			if len(bFullClusters) > 0 && len(bFullClusters) == len(bFullVals) {
+				meanBF, _, _, medBF, _, _, _, _ = ClusterBootstrapCI95(bFullClusters, 0, 42, 0.0, math.Inf(1))
+			} else if len(bFullVals) > 0 {
 				medBF = median(bFullVals)
 				meanBF = average(bFullVals)
 			}
 
-			medS25, s25MedLow, s25MedHigh := BootstrapMedianCI95(s25Vals, 10000, 42)
-			meanS25, s25MeanLow, s25MeanHigh := StudentTCI95(s25Vals)
+			if len(s25Clusters) > 0 && len(s25Clusters) == len(s25Vals) {
+				meanS25, s25MeanLow, s25MeanHigh, medS25, s25MedLow, s25MedHigh, _, _ =
+					ClusterBootstrapCI95(s25Clusters, 2000, 42, 0.0, 25.0)
+			} else if len(s25Vals) > 0 {
+				medS25, s25MedLow, s25MedHigh = BootstrapMedianCI95(s25Vals, 2000, 42)
+				meanS25, s25MeanLow, s25MeanHigh = StudentTCI95Range(s25Vals, 0.0, 25.0)
+			}
 
-			medS100, s100MedLow, s100MedHigh := BootstrapMedianCI95(s100Vals, 10000, 42)
-			meanS100, s100MeanLow, s100MeanHigh := StudentTCI95(s100Vals)
+			if len(s100Clusters) > 0 && len(s100Clusters) == len(s100Vals) {
+				meanS100, s100MeanLow, s100MeanHigh, medS100, s100MedLow, s100MedHigh, _, _ =
+					ClusterBootstrapCI95(s100Clusters, 2000, 42, 0.0, 100.0)
+			} else if len(s100Vals) > 0 {
+				medS100, s100MedLow, s100MedHigh = BootstrapMedianCI95(s100Vals, 2000, 42)
+				meanS100, s100MeanLow, s100MeanHigh = StudentTCI95Range(s100Vals, 0.0, 100.0)
+			}
 
 			meanAUCF := average(aucFVals)
 			meanAUCB := average(aucBVals)
-			meanTheo := average(theoVals)
 
-			row := []string{
+			summaryRows = append(summaryRows, []string{
 				cond.id,
 				spec.summaryName,
 				fmt.Sprintf("%.2f", medK1F),
@@ -586,19 +635,81 @@ func TestCaseStudyIngestBenchmark(t *testing.T) {
 				fmt.Sprintf("%.4f", meanAUCB),
 				fmt.Sprintf("%.2f", meanTheo),
 				gitCommit,
-			}
-			if err := wSummary.Write(row); err != nil {
-				t.Fatalf("write summary row: %v", err)
-			}
+			})
 		}
 	}
 
-	wSeed.Flush()
-	if err := wSeed.Error(); err != nil {
-		t.Fatalf("flush per-seed csv: %v", err)
+	header1 := []string{
+		"fault_id", "seed", "universe_size", "total_failures", "fault_density_pct",
+		"strategy_code", "strategy", "k1_single", "s25_single",
+		"k1_failure_mean", "s25_mean", "s100_mean", "b_full_mean",
+		"auc_norm_failures", "auc_norm_bugs", "git_commit",
 	}
-	wSummary.Flush()
-	if err := wSummary.Error(); err != nil {
-		t.Fatalf("flush summary csv: %v", err)
+	if err := writeCSVAtomic(perSeedPath, func(w *csv.Writer) error {
+		if err := w.Write(header1); err != nil {
+			return err
+		}
+		for _, row := range perSeedRows {
+			if err := w.Write(row); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("write per-seed csv %s: %v", perSeedPath, err)
 	}
+
+	header2 := []string{
+		"fault_id", "strategy",
+		"k1_failure_median", "k1_failure_median_ci95_lower", "k1_failure_median_ci95_upper",
+		"k1_failure_mean", "k1_failure_mean_ci95_lower", "k1_failure_mean_ci95_upper",
+		"k1_failure_p10", "k1_failure_p90",
+		"s25_median", "s25_median_ci95_lower", "s25_median_ci95_upper",
+		"s25_mean", "s25_mean_ci95_lower", "s25_mean_ci95_upper",
+		"s100_median", "s100_median_ci95_lower", "s100_median_ci95_upper",
+		"s100_mean", "s100_mean_ci95_lower", "s100_mean_ci95_upper",
+		"b_full_median", "b_full_mean",
+		"auc_norm_failures", "auc_norm_bugs",
+		"theoretical_expectation_mean",
+		"git_commit",
+	}
+	if err := writeCSVAtomic(summaryPath, func(w *csv.Writer) error {
+		if err := w.Write(header2); err != nil {
+			return err
+		}
+		for _, row := range summaryRows {
+			if err := w.Write(row); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("write summary csv %s: %v", summaryPath, err)
+	}
+}
+
+// TestCaseStudyIngestBenchmark evaluates the Direct L0 Ingest prefix race across 32 canonical seeds (1..32)
+// under MUT-0 (BarrierIngest: false) and BARRIER-INGEST (BarrierIngest: true) across 11 strategies.
+// When -update is false, it validates committed CSVs and runs a live 3-policy [0,50,100] smoke matrix into TempDir.
+func TestCaseStudyIngestBenchmark(t *testing.T) {
+	resultsDir := findResultsDirInternal(t)
+	perSeedPath := filepath.Join(resultsDir, "casestudy_ingest_per_seed.csv")
+	summaryPath := filepath.Join(resultsDir, "casestudy_ingest_summary.csv")
+
+	if !*updateArtifacts {
+		validateCaseStudyIngestCSVs(t, perSeedPath, summaryPath)
+		if !testing.Short() {
+			tmpDir := t.TempDir()
+			livePerSeed := filepath.Join(tmpDir, "live_per_seed.csv")
+			liveSummary := filepath.Join(tmpDir, "live_summary.csv")
+			writeAndRunIngestSuite(t, livePerSeed, liveSummary, []uint64{1, 2}, []int{0, 50, 100}, 5)
+		}
+		return
+	}
+
+	seeds := make([]uint64, 32)
+	for i := range seeds {
+		seeds[i] = uint64(i + 1)
+	}
+	writeAndRunIngestSuite(t, perSeedPath, summaryPath, seeds, []int{0, 100}, 50)
 }

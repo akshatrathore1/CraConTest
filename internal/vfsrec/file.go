@@ -11,15 +11,16 @@ import (
 )
 
 type recFile struct {
-	mu     sync.Mutex
-	fs     *FS
-	inner  vfs.File
-	handle uint64
-	label  string
-	isDir  bool
-	cat    vfs.DiskWriteCategory
-	closed bool
-	cursor int64
+	mu       sync.Mutex
+	fs       *FS
+	inner    vfs.File
+	handle   uint64
+	label    string
+	isDir    bool
+	writable bool
+	cat      vfs.DiskWriteCategory
+	closed   bool
+	cursor   int64
 }
 
 var _ vfs.File = (*recFile)(nil)
@@ -65,7 +66,11 @@ func (f *recFile) Read(p []byte) (int, error) {
 	off := f.cursor
 	size := int64(len(p))
 	n, err := f.inner.Read(p)
-	f.cursor += int64(n)
+	if n > 0 {
+		f.cursor += int64(n)
+	} else if n < 0 {
+		n = 0
+	}
 
 	event := trace.Event{
 		Kind:   trace.KindRead,
@@ -82,28 +87,17 @@ func (f *recFile) Read(p []byte) (int, error) {
 	return n, err
 }
 
-func (f *recFile) Write(p []byte) (int, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	if f.closed {
-		return 0, os.ErrClosed
+func (f *recFile) recordWriteLocked(kind trace.Kind, off int64, p []byte, n int, err error) (int, error) {
+	if n < 0 {
+		n = 0
 	}
-	f.fs.mu.Lock()
-	defer f.fs.mu.Unlock()
-
-	dataCopy := bytes.Clone(p)
-	off := f.cursor
-	n, err := f.inner.Write(p)
-	f.cursor += int64(n)
-
 	event := trace.Event{
-		Kind:   trace.KindWrite,
+		Kind:   kind,
 		File:   f.label,
 		Handle: f.handle,
 		Off:    off,
 		Len:    n,
-		Data:   dataCopy,
+		Data:   p,
 	}
 	if err != nil {
 		event.Err = err.Error()
@@ -121,7 +115,7 @@ func (f *recFile) Write(p []byte) (int, error) {
 	return n, err
 }
 
-func (f *recFile) WriteAt(p []byte, off int64) (int, error) {
+func (f *recFile) Write(p []byte) (int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -132,30 +126,38 @@ func (f *recFile) WriteAt(p []byte, off int64) (int, error) {
 	defer f.fs.mu.Unlock()
 
 	dataCopy := bytes.Clone(p)
-	n, err := f.inner.WriteAt(p, off)
+	off := f.cursor
+	n, err := f.inner.Write(p)
+	if n > 0 {
+		f.cursor += int64(n)
+	}
+	return f.recordWriteLocked(trace.KindWrite, off, dataCopy, n, err)
+}
 
-	event := trace.Event{
-		Kind:   trace.KindWriteAt,
-		File:   f.label,
-		Handle: f.handle,
-		Off:    off,
-		Len:    n,
-		Data:   dataCopy,
+func (f *recFile) WriteAt(p []byte, off int64) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.closed {
+		return 0, os.ErrClosed
 	}
-	if err != nil {
-		event.Err = err.Error()
-	} else if n < len(p) {
-		err = io.ErrShortWrite
-		event.Err = err.Error()
+	if off < 0 {
+		return 0, &os.PathError{Op: "writeat", Path: f.label, Err: os.ErrInvalid}
 	}
-	f.fs.appendEventLocked(event)
-	if err == nil && f.fs.isDBWALPathLocked(f.label) && (f.cat == "pebble-wal" || f.cat == vfs.WriteCategoryUnspecified || f.cat == "") {
-		f.fs.walWrites++
-		if f.fs.walCond != nil {
-			f.fs.walCond.Broadcast()
-		}
+	f.fs.mu.Lock()
+	defer f.fs.mu.Unlock()
+
+	dataCopy := bytes.Clone(p)
+	n, err := f.inner.WriteAt(p, off)
+	return f.recordWriteLocked(trace.KindWriteAt, off, dataCopy, n, err)
+}
+
+func (f *recFile) appendSyncOrEventLocked(event trace.Event) {
+	if !f.isDir && event.IsBarrier() {
+		f.fs.appendSyncEventLocked(event)
+	} else {
+		f.fs.appendEventLocked(event)
 	}
-	return n, err
 }
 
 func (f *recFile) Sync() error {
@@ -178,11 +180,7 @@ func (f *recFile) Sync() error {
 	if err != nil {
 		event.Err = err.Error()
 	}
-	if !f.isDir && event.Err == "" {
-		f.fs.appendSyncEventLocked(event)
-	} else {
-		f.fs.appendEventLocked(event)
-	}
+	f.appendSyncOrEventLocked(event)
 	return err
 }
 
@@ -192,6 +190,9 @@ func (f *recFile) SyncData() error {
 
 	if f.closed {
 		return os.ErrClosed
+	}
+	if f.isDir {
+		return &os.PathError{Op: "syncdata", Path: f.label, Err: os.ErrInvalid}
 	}
 	f.fs.mu.Lock()
 	defer f.fs.mu.Unlock()
@@ -206,11 +207,7 @@ func (f *recFile) SyncData() error {
 	if err != nil {
 		event.Err = err.Error()
 	}
-	if !f.isDir && event.Err == "" {
-		f.fs.appendSyncEventLocked(event)
-	} else {
-		f.fs.appendEventLocked(event)
-	}
+	f.appendSyncOrEventLocked(event)
 	return err
 }
 
@@ -220,6 +217,9 @@ func (f *recFile) SyncTo(length int64) (bool, error) {
 
 	if f.closed {
 		return false, os.ErrClosed
+	}
+	if f.isDir || length < 0 {
+		return false, &os.PathError{Op: "syncto", Path: f.label, Err: os.ErrInvalid}
 	}
 	f.fs.mu.Lock()
 	defer f.fs.mu.Unlock()
@@ -236,11 +236,7 @@ func (f *recFile) SyncTo(length int64) (bool, error) {
 	if err != nil {
 		event.Err = err.Error()
 	}
-	if !f.isDir && event.Err == "" {
-		f.fs.appendSyncEventLocked(event)
-	} else {
-		f.fs.appendEventLocked(event)
-	}
+	f.appendSyncOrEventLocked(event)
 	return fullSync, err
 }
 
@@ -270,6 +266,9 @@ func (f *recFile) Preallocate(offset, length int64) error {
 
 	if f.closed {
 		return os.ErrClosed
+	}
+	if f.isDir || !f.writable || offset < 0 || length < 0 {
+		return &os.PathError{Op: "preallocate", Path: f.label, Err: os.ErrInvalid}
 	}
 	f.fs.mu.Lock()
 	defer f.fs.mu.Unlock()

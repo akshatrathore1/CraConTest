@@ -30,6 +30,20 @@ func IsDBManifestPathForTesting(path string) bool {
 	return isDBManifestPath(path)
 }
 
+// IsDBManifestPathForTesting reports whether path is considered a primary DB MANIFEST path for fs.
+func (fs *FS) IsDBManifestPathForTesting(path string) bool {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	return fs.isDBManifestPathLocked(path)
+}
+
+// DBManifestCountForTesting returns fs.dbManifestCount under fs.mu.
+func (fs *FS) DBManifestCountForTesting() int {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	return fs.dbManifestCount
+}
+
 // SetWaitTimeoutForTesting sets fs.waitTimeout under fs.mu.
 func (fs *FS) SetWaitTimeoutForTesting(d time.Duration) {
 	fs.mu.Lock()

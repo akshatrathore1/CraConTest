@@ -5,6 +5,7 @@ package workload
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"math/rand/v2"
@@ -22,8 +23,10 @@ import (
 
 // Workload preset identifiers for multi-distribution evaluation.
 const (
-	PresetYCSBA          = "ycsb-a"
-	PresetYCSBB          = "ycsb-b"
+	PresetYCSBA = "ycsb-a"
+	PresetYCSBB = "ycsb-b"
+	// PresetYCSBF generates 50% standalone point gets (even iterations) and
+	// 50% two-key read-modify-write batches (odd iterations).
 	PresetYCSBF          = "ycsb-f"
 	PresetOverwriteHeavy = "overwrite-heavy"
 	PresetDeleteHeavy    = "delete-heavy"
@@ -62,8 +65,11 @@ type walWriteSyncer interface {
 // flush_every), while the operation mix is governed by Plan() or selected via Preset
 // (ycsb-a, ycsb-b, ycsb-f, overwrite-heavy, delete-heavy).
 type Config struct {
-	Preset              string `json:"preset,omitempty"`
-	Dir                 string `json:"dir,omitempty"` // Optional primary DB directory name; when non-empty, passed to vfsrec.SetPrimaryDBDir.
+	Preset string `json:"preset,omitempty"`
+	// Dir is the primary DB directory name passed to vfsrec.SetPrimaryDBDir when
+	// non-empty. Required whenever the DB directory is not "", "db", "db_*", or
+	// "testdb" so WAL write barriers can track primary-DB writes without timing out.
+	Dir                 string `json:"dir,omitempty"`
 	Seed                uint64 `json:"seed"`
 	Operations          int    `json:"operations"`
 	KeyCount            int    `json:"key_count"`
@@ -72,6 +78,7 @@ type Config struct {
 	FlushEvery          int    `json:"flush_every"`
 	CompactAt           int    `json:"compact_at,omitempty"`
 	CheckpointAt        int    `json:"checkpoint_at,omitempty"`
+	UniqueCheckpoints   bool   `json:"unique_checkpoints,omitempty"`
 	MaxManifestFileSize int64  `json:"max_manifest_file_size,omitempty"`
 	IngestEvery         int    `json:"ingest_every,omitempty"`
 	RatchetAt           int    `json:"ratchet_at,omitempty"`
@@ -88,6 +95,23 @@ func DefaultConfig() Config {
 		ValueBytes: 128,
 		SyncEvery:  10,
 		FlushEvery: 100,
+	}
+}
+
+func defaultPresetKeyCount(preset string) int {
+	switch preset {
+	case PresetYCSBA:
+		return 8
+	case PresetYCSBB:
+		return 12
+	case PresetYCSBF:
+		return 8
+	case PresetOverwriteHeavy:
+		return 4
+	case PresetDeleteHeavy:
+		return 8
+	default:
+		return 64
 	}
 }
 
@@ -139,17 +163,14 @@ func Validate(cfg Config) error {
 	if cfg.RatchetAt < 0 {
 		return fmt.Errorf("ratchet_at must be >= 0, got %d", cfg.RatchetAt)
 	}
-	hasRangeDeleteOrIngest := cfg.Preset == "" || cfg.Preset == PresetDeleteHeavy || cfg.IngestEvery > 0
-	if hasRangeDeleteOrIngest {
+	hasRangeDeleteOrBatch := cfg.Preset == "" || cfg.Preset == PresetDeleteHeavy || cfg.Preset == PresetYCSBF || cfg.IngestEvery > 0
+	if hasRangeDeleteOrBatch {
 		effectiveKeys := cfg.KeyCount
-		if effectiveKeys <= 0 && cfg.Preset != "" {
-			effectiveKeys = 64
-			if cfg.Preset == PresetDeleteHeavy {
-				effectiveKeys = 128
-			}
+		if effectiveKeys <= 0 {
+			effectiveKeys = defaultPresetKeyCount(cfg.Preset)
 		}
 		if effectiveKeys < 2 {
-			return fmt.Errorf("key_count must be >= 2 when range deletes or ingest operations are enabled, got %d", cfg.KeyCount)
+			return fmt.Errorf("key_count must be >= 2 when range deletes, multi-key batches, or ingest operations are enabled, got %d", effectiveKeys)
 		}
 	}
 	return nil
@@ -178,13 +199,32 @@ type PlanOperation struct {
 	MultiFile bool
 }
 
-func formatKey(index int) []byte {
-	return fmt.Appendf(nil, "key-%04d", index)
+func keyWidthForCount(keyCount int) int {
+	width := 4
+	for n := keyCount - 1; n >= 10000; n /= 10 {
+		width++
+	}
+	return width
+}
+
+func formatKey(index, width int) []byte {
+	return fmt.Appendf(nil, "key-%0*d", width, index)
 }
 
 func makeValue(rng *rand.Rand, size int, tag string) []byte {
 	buf := make([]byte, size)
+	if size <= 0 {
+		return buf
+	}
 	header := fmt.Sprintf("val-%s-", tag)
+	if size < len(header) {
+		const alphabet = "0123456789abcdefghijklmnopqrstuvwxyz"
+		sum := sha256.Sum256([]byte(tag))
+		for i := 0; i < size; i++ {
+			buf[i] = alphabet[int(sum[i%len(sum)])%len(alphabet)]
+		}
+		return buf
+	}
 	copy(buf, header)
 	for i := len(header); i < size; i++ {
 		buf[i] = byte(rng.IntN(26) + 'a')
@@ -198,35 +238,17 @@ func Plan(cfg Config) []PlanOperation {
 		return nil
 	}
 	keyCount := cfg.KeyCount
+	if keyCount <= 0 {
+		keyCount = defaultPresetKeyCount(cfg.Preset)
+	}
+	keyWidth := keyWidthForCount(keyCount)
 	valueBytes := cfg.ValueBytes
 	if valueBytes <= 0 {
 		valueBytes = 64
 	}
 	checkpointAt := cfg.CheckpointAt
-	switch cfg.Preset {
-	case PresetYCSBA:
-		if keyCount <= 0 {
-			keyCount = 8
-		}
-	case PresetYCSBB:
-		if keyCount <= 0 {
-			keyCount = 12
-		}
-	case PresetYCSBF:
-		if keyCount <= 0 {
-			keyCount = 8
-		}
-	case PresetOverwriteHeavy:
-		if keyCount <= 0 {
-			keyCount = 4
-		}
-	case PresetDeleteHeavy:
-		if keyCount <= 0 {
-			keyCount = 8
-		}
-		if checkpointAt <= 0 {
-			checkpointAt = 10
-		}
+	if cfg.Preset == PresetDeleteHeavy && checkpointAt <= 0 {
+		checkpointAt = 10
 	}
 
 	rng := rand.New(rand.NewPCG(0, cfg.Seed))
@@ -243,7 +265,7 @@ func Plan(cfg Config) []PlanOperation {
 				mutatingCount++
 				sync := (cfg.SyncEvery > 0 && mutatingCount%cfg.SyncEvery == 0)
 				kIdx := rng.IntN(keyCount)
-				k := formatKey(kIdx)
+				k := formatKey(kIdx, keyWidth)
 				v := makeValue(rng, valueBytes, fmt.Sprintf("%05d", opID))
 				plan = append(plan, PlanOperation{
 					Op:       opID,
@@ -259,7 +281,7 @@ func Plan(cfg Config) []PlanOperation {
 					Op:       opID,
 					Kind:     "get",
 					Mutating: false,
-					Key:      formatKey(kIdx),
+					Key:      formatKey(kIdx, keyWidth),
 				})
 			}
 
@@ -269,7 +291,7 @@ func Plan(cfg Config) []PlanOperation {
 				mutatingCount++
 				sync := (cfg.SyncEvery > 0 && mutatingCount%cfg.SyncEvery == 0)
 				kIdx := rng.IntN(keyCount)
-				k := formatKey(kIdx)
+				k := formatKey(kIdx, keyWidth)
 				v := makeValue(rng, valueBytes, fmt.Sprintf("%05d", opID))
 				plan = append(plan, PlanOperation{
 					Op:       opID,
@@ -285,7 +307,7 @@ func Plan(cfg Config) []PlanOperation {
 					Op:       opID,
 					Kind:     "get",
 					Mutating: false,
-					Key:      formatKey(kIdx),
+					Key:      formatKey(kIdx, keyWidth),
 				})
 			}
 
@@ -299,8 +321,8 @@ func Plan(cfg Config) []PlanOperation {
 				if kIdx1 == kIdx2 {
 					kIdx2 = (kIdx1 + 1) % keyCount
 				}
-				k1 := formatKey(kIdx1)
-				k2 := formatKey(kIdx2)
+				k1 := formatKey(kIdx1, keyWidth)
+				k2 := formatKey(kIdx2, keyWidth)
 				v1 := makeValue(rng, valueBytes, fmt.Sprintf("%05da", opID))
 				v2 := makeValue(rng, valueBytes, fmt.Sprintf("%05db", opID))
 				plan = append(plan, PlanOperation{
@@ -319,7 +341,7 @@ func Plan(cfg Config) []PlanOperation {
 					Op:       opID,
 					Kind:     "get",
 					Mutating: false,
-					Key:      formatKey(kIdx),
+					Key:      formatKey(kIdx, keyWidth),
 				})
 			}
 
@@ -328,7 +350,7 @@ func Plan(cfg Config) []PlanOperation {
 			mutatingCount++
 			sync := (cfg.SyncEvery > 0 && mutatingCount%cfg.SyncEvery == 0)
 			kIdx := rng.IntN(keyCount)
-			k := formatKey(kIdx)
+			k := formatKey(kIdx, keyWidth)
 			v := makeValue(rng, valueBytes, fmt.Sprintf("%05d", opID))
 			plan = append(plan, PlanOperation{
 				Op:       opID,
@@ -346,7 +368,7 @@ func Plan(cfg Config) []PlanOperation {
 			switch i % 3 {
 			case 0: // set
 				kIdx := rng.IntN(keyCount)
-				k := formatKey(kIdx)
+				k := formatKey(kIdx, keyWidth)
 				v := makeValue(rng, valueBytes, fmt.Sprintf("%05d", opID))
 				plan = append(plan, PlanOperation{
 					Op:       opID,
@@ -358,7 +380,7 @@ func Plan(cfg Config) []PlanOperation {
 				})
 			case 1: // delete
 				kIdx := rng.IntN(keyCount)
-				k := formatKey(kIdx)
+				k := formatKey(kIdx, keyWidth)
 				plan = append(plan, PlanOperation{
 					Op:       opID,
 					Kind:     "delete",
@@ -375,8 +397,8 @@ func Plan(cfg Config) []PlanOperation {
 				if idx1 > idx2 {
 					idx1, idx2 = idx2, idx1
 				}
-				k1 := formatKey(idx1)
-				k2 := formatKey(idx2)
+				k1 := formatKey(idx1, keyWidth)
+				k2 := formatKey(idx2, keyWidth)
 				plan = append(plan, PlanOperation{
 					Op:       opID,
 					Kind:     "range_delete",
@@ -396,7 +418,7 @@ func Plan(cfg Config) []PlanOperation {
 				mutatingCount++
 				sync := (cfg.SyncEvery > 0 && mutatingCount%cfg.SyncEvery == 0)
 				kIdx := rng.IntN(cfg.KeyCount)
-				k := formatKey(kIdx)
+				k := formatKey(kIdx, keyWidth)
 				v := makeValue(rng, cfg.ValueBytes, fmt.Sprintf("%05d", opID))
 				plan = append(plan, PlanOperation{
 					Op:       opID,
@@ -413,7 +435,7 @@ func Plan(cfg Config) []PlanOperation {
 					Op:       opID,
 					Kind:     "get",
 					Mutating: false,
-					Key:      formatKey(kIdx),
+					Key:      formatKey(kIdx, keyWidth),
 				})
 
 			case roll < 80: // 10% delete
@@ -425,7 +447,7 @@ func Plan(cfg Config) []PlanOperation {
 					Kind:     "delete",
 					Mutating: true,
 					Sync:     sync,
-					Key:      formatKey(kIdx),
+					Key:      formatKey(kIdx, keyWidth),
 				})
 
 			case roll < 90: // 10% batch of exactly two sets
@@ -433,8 +455,8 @@ func Plan(cfg Config) []PlanOperation {
 				sync := (cfg.SyncEvery > 0 && mutatingCount%cfg.SyncEvery == 0)
 				kIdx1 := rng.IntN(cfg.KeyCount)
 				kIdx2 := rng.IntN(cfg.KeyCount)
-				k1 := formatKey(kIdx1)
-				k2 := formatKey(kIdx2)
+				k1 := formatKey(kIdx1, keyWidth)
+				k2 := formatKey(kIdx2, keyWidth)
 				v1 := makeValue(rng, cfg.ValueBytes, fmt.Sprintf("%05da", opID))
 				v2 := makeValue(rng, cfg.ValueBytes, fmt.Sprintf("%05db", opID))
 				plan = append(plan, PlanOperation{
@@ -459,8 +481,8 @@ func Plan(cfg Config) []PlanOperation {
 				if idx1 > idx2 {
 					idx1, idx2 = idx2, idx1
 				}
-				k1 := formatKey(idx1)
-				k2 := formatKey(idx2)
+				k1 := formatKey(idx1, keyWidth)
+				k2 := formatKey(idx2, keyWidth)
 				plan = append(plan, PlanOperation{
 					Op:       opID,
 					Kind:     "range_delete",
@@ -518,9 +540,9 @@ func Plan(cfg Config) []PlanOperation {
 					idx1 = rng.IntN(keyCount - 1)
 					idx2 = idx1 + 1 + rng.IntN(keyCount-idx1-1)
 				}
-				k1 := formatKey(idx1)
+				k1 := formatKey(idx1, keyWidth)
 				v1 := makeValue(rng, valueBytes, fmt.Sprintf("%05da", opID))
-				k2 := formatKey(idx2)
+				k2 := formatKey(idx2, keyWidth)
 				v2 := makeValue(rng, valueBytes, fmt.Sprintf("%05db", opID))
 				mutations = []history.Mutation{
 					{Kind: "set", Key: k1, Value: v1},
@@ -538,7 +560,7 @@ func Plan(cfg Config) []PlanOperation {
 				for mIdx := 0; mIdx < 4; mIdx++ {
 					mutations[mIdx] = history.Mutation{
 						Kind:  "set",
-						Key:   formatKey(indices[mIdx]),
+						Key:   formatKey(indices[mIdx], keyWidth),
 						Value: makeValue(rng, valueBytes, fmt.Sprintf("%05d_%d", opID, mIdx)),
 					}
 				}
@@ -587,10 +609,12 @@ func drainBackgroundWork(db *pebble.DB) error {
 			db.TestOnlyWaitForCleaning()
 			close(done)
 		}()
+		timer := time.NewTimer(rem)
+		defer timer.Stop()
 		select {
 		case <-done:
 			return nil
-		case <-time.After(rem):
+		case <-timer.C:
 			return fmt.Errorf("workload: drainBackgroundWork exceeded %v deadline waiting for cleaning", timeout)
 		}
 	}
@@ -633,43 +657,9 @@ type primaryDirSetter interface {
 	SetPrimaryDBDir(string)
 }
 
-func findPrimaryDirSetter(targets ...any) primaryDirSetter {
-	for _, t := range targets {
-		curr := t
-		for curr != nil {
-			if ps, ok := curr.(primaryDirSetter); ok {
-				return ps
-			}
-			if u, ok := curr.(interface{ Unwrap() vfs.FS }); ok {
-				curr = u.Unwrap()
-			} else {
-				break
-			}
-		}
-	}
-	return nil
-}
-
 type ingestSectionGate interface {
 	BeginIngestSection()
 	EndIngestSection()
-}
-
-func findEventProvider(targets ...any) interface{ CurrentEventID() uint64 } {
-	for _, t := range targets {
-		curr := t
-		for curr != nil {
-			if ep, ok := curr.(interface{ CurrentEventID() uint64 }); ok {
-				return ep
-			}
-			if u, ok := curr.(interface{ Unwrap() vfs.FS }); ok {
-				curr = u.Unwrap()
-			} else {
-				break
-			}
-		}
-	}
-	return nil
 }
 
 type eventAwareMarker interface {
@@ -677,12 +667,12 @@ type eventAwareMarker interface {
 	EndEvent(op uint64, kind string, err string) uint64
 }
 
-func findEventAwareMarker(targets ...any) eventAwareMarker {
+func findInChain[T any](targets ...any) (T, bool) {
 	for _, t := range targets {
 		curr := t
 		for curr != nil {
-			if em, ok := curr.(eventAwareMarker); ok {
-				return em
+			if match, ok := curr.(T); ok {
+				return match, true
 			}
 			if u, ok := curr.(interface{ Unwrap() vfs.FS }); ok {
 				curr = u.Unwrap()
@@ -691,7 +681,8 @@ func findEventAwareMarker(targets ...any) eventAwareMarker {
 			}
 		}
 	}
-	return nil
+	var zero T
+	return zero, false
 }
 
 // Run executes the planned workload on db, calling marker methods around each
@@ -699,6 +690,9 @@ func findEventAwareMarker(targets ...any) eventAwareMarker {
 func Run(db *pebble.DB, marker Marker, cfg Config) ([]history.Entry, error) {
 	if err := Validate(cfg); err != nil {
 		return nil, fmt.Errorf("workload validate config: %w", err)
+	}
+	if db == nil {
+		return nil, errors.New("workload: db cannot be nil")
 	}
 	plan := Plan(cfg)
 	historyEntries := make([]history.Entry, 0, len(plan))
@@ -714,33 +708,23 @@ func Run(db *pebble.DB, marker Marker, cfg Config) ([]history.Entry, error) {
 	}
 
 	if cfg.Dir != "" {
-		if setter := findPrimaryDirSetter(targetFS, cfg.FS); setter != nil {
-			setter.SetPrimaryDBDir(cfg.Dir)
+		setter, ok := findInChain[primaryDirSetter](targetFS, cfg.FS)
+		if !ok {
+			return nil, fmt.Errorf("workload: Dir %q configured but no recording FS found in wrapper chain", cfg.Dir)
 		}
+		setter.SetPrimaryDBDir(cfg.Dir)
 	}
 
-	var ingestGate ingestSectionGate
-	if ig, ok := marker.(ingestSectionGate); ok {
-		ingestGate = ig
-	} else if ig, ok := targetFS.(ingestSectionGate); ok {
-		ingestGate = ig
-	}
+	ingestGate, _ := findInChain[ingestSectionGate](marker, targetFS, cfg.FS)
 
 	if err := drainBackgroundWork(db); err != nil {
 		return nil, err
 	}
 
-	var walSync walWriteSyncer
-	if ws, ok := cfg.FS.(walWriteSyncer); ok {
-		walSync = ws
-	} else if ws, ok := targetFS.(walWriteSyncer); ok {
-		walSync = ws
-	} else if ws, ok := marker.(walWriteSyncer); ok {
-		walSync = ws
-	}
+	walSync, _ := findInChain[walWriteSyncer](cfg.FS, targetFS, marker)
 
-	evMarker := findEventAwareMarker(marker, targetFS, cfg.FS)
-	evProvider := findEventProvider(marker, targetFS, cfg.FS)
+	evMarker, _ := findInChain[eventAwareMarker](marker)
+	evProvider, _ := findInChain[interface{ CurrentEventID() uint64 }](marker)
 
 	var eventTracker uint64
 
@@ -761,6 +745,8 @@ func Run(db *pebble.DB, marker Marker, cfg Config) ([]history.Entry, error) {
 		if beginEv == 0 {
 			eventTracker++
 			beginEv = eventTracker
+		} else if eventTracker < beginEv {
+			eventTracker = beginEv
 		}
 
 		var opErr error
@@ -776,9 +762,11 @@ func Run(db *pebble.DB, marker Marker, cfg Config) ([]history.Entry, error) {
 		case "get":
 			v, closer, err := db.Get(op.Key)
 			if err == nil {
-				_ = closer.Close()
 				_ = v
-			} else if err != pebble.ErrNotFound {
+				if closeErr := closer.Close(); closeErr != nil {
+					opErr = closeErr
+				}
+			} else if !errors.Is(err, pebble.ErrNotFound) {
 				opErr = err
 			}
 
@@ -788,17 +776,23 @@ func Run(db *pebble.DB, marker Marker, cfg Config) ([]history.Entry, error) {
 		case "batch":
 			v1, closer1, err1 := db.Get(op.Key)
 			if err1 == nil {
-				_ = closer1.Close()
 				_ = v1
+				if closeErr := closer1.Close(); closeErr != nil {
+					opErr = closeErr
+				}
 			} else if !errors.Is(err1, pebble.ErrNotFound) {
 				opErr = err1
 			}
-			v2, closer2, err2 := db.Get(op.Key2)
-			if err2 == nil {
-				_ = closer2.Close()
-				_ = v2
-			} else if opErr == nil && !errors.Is(err2, pebble.ErrNotFound) {
-				opErr = err2
+			if opErr == nil {
+				v2, closer2, err2 := db.Get(op.Key2)
+				if err2 == nil {
+					_ = v2
+					if closeErr := closer2.Close(); closeErr != nil {
+						opErr = closeErr
+					}
+				} else if !errors.Is(err2, pebble.ErrNotFound) {
+					opErr = err2
+				}
 			}
 			if opErr == nil {
 				b := db.NewBatch()
@@ -809,7 +803,9 @@ func Run(db *pebble.DB, marker Marker, cfg Config) ([]history.Entry, error) {
 				} else {
 					opErr = b.Commit(wo)
 				}
-				_ = b.Close()
+				if closeErr := b.Close(); closeErr != nil {
+					opErr = errors.Join(opErr, closeErr)
+				}
 			}
 
 		case "range_delete":
@@ -822,22 +818,18 @@ func Run(db *pebble.DB, marker Marker, cfg Config) ([]history.Entry, error) {
 				for valid := it.First(); valid && count < 10; valid = it.Next() {
 					count++
 				}
-				_ = it.Close()
+				iterErr := it.Error()
+				closeErr := it.Close()
+				opErr = errors.Join(iterErr, closeErr)
 			} else {
 				opErr = err
 			}
 
 		case "flush":
 			opErr = db.Flush()
-			if opErr == nil {
-				db.TestOnlyWaitForCleaning()
-			}
 
 		case "compact":
 			opErr = db.Compact(context.Background(), nil, []byte("\xff"), false)
-			if opErr == nil {
-				db.TestOnlyWaitForCleaning()
-			}
 
 		case "checkpoint":
 			// In workloads with periodic checkpoints (e.g., PresetDeleteHeavy with 25 ops
@@ -845,8 +837,12 @@ func Run(db *pebble.DB, marker Marker, cfg Config) ([]history.Entry, error) {
 			// returns "checkpoint checkpoint: file already exists" because the target
 			// directory "checkpoint" already exists from the first checkpoint. Since
 			// results/workload_diversity_*.csv is frozen at f9202dfca579, this deterministic
-			// behavior is preserved and documented.
-			opErr = db.Checkpoint("checkpoint")
+			// behavior is preserved by default unless UniqueCheckpoints is enabled.
+			ckptDir := "checkpoint"
+			if cfg.UniqueCheckpoints {
+				ckptDir = fmt.Sprintf("checkpoint_%05d", op.Op)
+			}
+			opErr = db.Checkpoint(ckptDir)
 
 		case "ingest":
 			opErr = runIngest(db, targetFS, ingestGate, op, cfg.BarrierIngest)
@@ -864,10 +860,8 @@ func Run(db *pebble.DB, marker Marker, cfg Config) ([]history.Entry, error) {
 			}
 		}
 
-		if opErr == nil {
-			if drainErr := drainBackgroundWork(db); drainErr != nil {
-				opErr = drainErr
-			}
+		if drainErr := drainBackgroundWork(db); drainErr != nil {
+			opErr = errors.Join(opErr, drainErr)
 		}
 
 		errStr := ""
@@ -883,9 +877,11 @@ func Run(db *pebble.DB, marker Marker, cfg Config) ([]history.Entry, error) {
 				endEv = evProvider.CurrentEventID()
 			}
 		}
-		if endEv == 0 {
+		if endEv == 0 || endEv <= beginEv {
 			eventTracker++
 			endEv = eventTracker
+		} else if eventTracker < endEv {
+			eventTracker = endEv
 		}
 
 		// Build history entry with owned bytes.
@@ -938,26 +934,52 @@ func Run(db *pebble.DB, marker Marker, cfg Config) ([]history.Entry, error) {
 
 // Correlate maps history entries to the exact event IDs of matching OpBegin and OpEnd in events.
 func Correlate(entries []history.Entry, events []trace.Event) ([]history.Entry, error) {
-	begins := make(map[uint64]uint64)
-	ends := make(map[uint64]uint64)
+	if err := trace.Validate(events); err != nil {
+		return nil, fmt.Errorf("correlate: invalid trace: %w", err)
+	}
+
+	begins := make(map[uint64]trace.Event)
+	ends := make(map[uint64]trace.Event)
 
 	for _, e := range events {
-		if e.Kind == "OpBegin" && e.Op > 0 {
-			begins[e.Op] = e.ID
-		} else if e.Kind == "OpEnd" && e.Op > 0 {
-			ends[e.Op] = e.ID
+		if e.Kind == trace.KindOpBegin && e.Op > 0 {
+			if _, dup := begins[e.Op]; dup {
+				return nil, fmt.Errorf("correlate: duplicate OpBegin for op %d", e.Op)
+			}
+			begins[e.Op] = e
+		} else if e.Kind == trace.KindOpEnd && e.Op > 0 {
+			if _, dup := ends[e.Op]; dup {
+				return nil, fmt.Errorf("correlate: duplicate OpEnd for op %d", e.Op)
+			}
+			ends[e.Op] = e
 		}
 	}
 
 	result := history.Clone(entries)
 	for i := range result {
-		bID, ok := begins[result[i].Op]
-		if ok {
-			result[i].BeginEvent = bID
+		b, ok := begins[result[i].Op]
+		if !ok {
+			return nil, fmt.Errorf("correlate: op %d (%s) has no OpBegin in trace", result[i].Op, result[i].Kind)
 		}
-		eID, ok := ends[result[i].Op]
+		if b.OpKind != result[i].Kind {
+			return nil, fmt.Errorf("correlate: op %d OpBegin kind %q does not match history kind %q",
+				result[i].Op, b.OpKind, result[i].Kind)
+		}
+		result[i].BeginEvent = b.ID
+
+		e, ok := ends[result[i].Op]
 		if ok {
-			result[i].EndEvent = eID
+			if e.OpKind != result[i].Kind {
+				return nil, fmt.Errorf("correlate: op %d OpEnd kind %q does not match history kind %q",
+					result[i].Op, e.OpKind, result[i].Kind)
+			}
+			if e.Err != result[i].Err {
+				return nil, fmt.Errorf("correlate: op %d OpEnd error %q does not match history error %q",
+					result[i].Op, e.Err, result[i].Err)
+			}
+			result[i].EndEvent = e.ID
+		} else {
+			result[i].EndEvent = 0
 		}
 	}
 
@@ -975,42 +997,8 @@ func runIngest(db *pebble.DB, targetFS vfs.FS, ingestGate ingestSectionGate, op 
 	if err := targetFS.MkdirAll(stagingDir, 0755); err != nil {
 		return fmt.Errorf("mkdir staging: %w", err)
 	}
-	writeSST := func(path string, muts []history.Mutation) error {
-		f, err := targetFS.Create(path, vfs.WriteCategoryUnspecified)
-		if err != nil {
-			return err
-		}
-		w := sstable.NewWriter(objstorageprovider.NewFileWritable(f), sstable.WriterOptions{
-			TableFormat: db.TableFormat(),
-		})
-		for _, m := range muts {
-			if err := w.Set(m.Key, m.Value); err != nil {
-				_ = w.Close()
-				return err
-			}
-		}
-		return w.Close()
-	}
 
 	var paths []string
-	if !op.MultiFile || len(op.Mutations) < 2 {
-		path := fmt.Sprintf("%s/ingest_%05d.sst", stagingDir, op.Op)
-		if err := writeSST(path, op.Mutations); err != nil {
-			return err
-		}
-		paths = []string{path}
-	} else {
-		mid := len(op.Mutations) / 2
-		path1 := fmt.Sprintf("%s/ingest_%05d_a.sst", stagingDir, op.Op)
-		path2 := fmt.Sprintf("%s/ingest_%05d_b.sst", stagingDir, op.Op)
-		if err := writeSST(path1, op.Mutations[:mid]); err != nil {
-			return err
-		}
-		if err := writeSST(path2, op.Mutations[mid:]); err != nil {
-			return err
-		}
-		paths = []string{path1, path2}
-	}
 	defer func() {
 		if err != nil {
 			for _, p := range paths {
@@ -1018,6 +1006,41 @@ func runIngest(db *pebble.DB, targetFS vfs.FS, ingestGate ingestSectionGate, op 
 			}
 		}
 	}()
+
+	writeSST := func(path string, muts []history.Mutation) error {
+		f, err := targetFS.Create(path, vfs.WriteCategoryUnspecified)
+		if err != nil {
+			return err
+		}
+		paths = append(paths, path)
+		w := sstable.NewWriter(objstorageprovider.NewFileWritable(f), sstable.WriterOptions{
+			TableFormat: db.TableFormat(),
+		})
+		for _, m := range muts {
+			if setErr := w.Set(m.Key, m.Value); setErr != nil {
+				closeErr := w.Close()
+				return errors.Join(setErr, closeErr)
+			}
+		}
+		return w.Close()
+	}
+
+	if !op.MultiFile || len(op.Mutations) < 2 {
+		path := fmt.Sprintf("%s/ingest_%05d.sst", stagingDir, op.Op)
+		if err = writeSST(path, op.Mutations); err != nil {
+			return err
+		}
+	} else {
+		mid := len(op.Mutations) / 2
+		path1 := fmt.Sprintf("%s/ingest_%05d_a.sst", stagingDir, op.Op)
+		path2 := fmt.Sprintf("%s/ingest_%05d_b.sst", stagingDir, op.Op)
+		if err = writeSST(path1, op.Mutations[:mid]); err != nil {
+			return err
+		}
+		if err = writeSST(path2, op.Mutations[mid:]); err != nil {
+			return err
+		}
+	}
 
 	sDir, err := targetFS.OpenDir(stagingDir)
 	if err != nil {

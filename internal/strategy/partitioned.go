@@ -15,11 +15,12 @@ type r1 struct {
 
 // NewR1 returns the R1 baseline (0%-Retention-First Random):
 // It partitions the candidate universe into 0% unsynced data retention candidates
-// (U_0%) and non-zero / 100% retention candidates (U_100%).
-// It shuffles U_0% using a deterministic PCG generator, shuffles U_100% using
-// an independent deterministic PCG generator, and returns U_0% followed by U_100%.
-// This establishes a fair random baseline by eliminating trials on 100% retention
-// candidates (which have zero failure density) while maintaining pure random ordering.
+// (U_0%), partial-retention candidates (U_mid, 0 < Percent < 100), and remaining
+// non-zero / 100% retention candidates (U_100%).
+// Each partition is shuffled using an independent deterministic PCG generator,
+// returning U_0% followed by U_mid followed by U_100%.
+// This establishes a fair random baseline by separating lower-density / 100%
+// retention trials while maintaining pure random ordering within each tier.
 func NewR1(seed uint64) Strategy {
 	return r1{seed: seed}
 }
@@ -43,7 +44,7 @@ func (s r1) Rank(view *graph.View, universe []candidate.Candidate) []candidate.C
 	for _, c := range ordered {
 		if c.Percent == 0 {
 			u0 = append(u0, c)
-		} else if c.Percent < 100 {
+		} else if c.Percent > 0 && c.Percent < 100 {
 			uMid = append(uMid, c)
 		} else {
 			u100 = append(u100, c)
@@ -54,7 +55,6 @@ func (s r1) Rank(view *graph.View, universe []candidate.Candidate) []candidate.C
 	rng0.Shuffle(len(u0), func(left, right int) { u0[left], u0[right] = u0[right], u0[left] })
 
 	if len(uMid) > 0 {
-		candidate.Sort(uMid)
 		rngMid := rand.New(rand.NewPCG(2, s.seed))
 		rngMid.Shuffle(len(uMid), func(left, right int) { uMid[left], uMid[right] = uMid[right], uMid[left] })
 	}
@@ -77,10 +77,11 @@ type r2 struct {
 // Exactly one representative candidate per distinct persistence state is selected
 // (prioritizing boundary cutoffs with highest barrier proximity), and the distinct
 // representatives are shuffled and placed first.
-// Then, remaining 0% candidates (shuffled) and 100% retention candidates (shuffled)
-// are appended, guaranteeing that all distinct persistence states are explored
-// at 0% retention before any redundant cutoff is tested, while strictly returning
-// a valid permutation of the candidate universe.
+// Then, remaining 0% candidates (shuffled), partial-retention candidates U_mid
+// (0 < Percent < 100, shuffled), and 100% retention candidates (shuffled) are
+// appended, guaranteeing that all distinct persistence states are explored at 0%
+// retention before any redundant cutoff is tested, while strictly returning a valid
+// permutation of the candidate universe.
 func NewR2(seed uint64) Strategy {
 	return r2{seed: seed}
 }
@@ -109,7 +110,7 @@ func (s r2) Rank(view *graph.View, universe []candidate.Candidate) []candidate.C
 		if c.Percent == 0 {
 			u0 = append(u0, c)
 			u0Labels = append(u0Labels, labels[i])
-		} else if c.Percent < 100 {
+		} else if c.Percent > 0 && c.Percent < 100 {
 			uMid = append(uMid, c)
 		} else {
 			u100 = append(u100, c)
@@ -162,10 +163,9 @@ func (s r2) Rank(view *graph.View, universe []candidate.Candidate) []candidate.C
 	}
 
 	// 4. Ensure canonical order before shuffling to eliminate map/group iteration non-determinism.
+	// uMid and u100 were appended from ordered (canonical) and are already sorted.
 	candidate.Sort(zeroReps)
 	candidate.Sort(zeroNonReps)
-	candidate.Sort(uMid)
-	candidate.Sort(u100)
 
 	// 5. Shuffle partitions using independent PCG generators seeded deterministically.
 	rng0 := rand.New(rand.NewPCG(0, s.seed))
@@ -196,8 +196,8 @@ func isR2BetterRepresentative(fA, fB graph.Features, cA, cB candidate.Candidate)
 	if fA.BeforeBoundary != fB.BeforeBoundary {
 		return fA.BeforeBoundary // boundary cutoffs preferred
 	}
-	if fA.BarrierProximity != fB.BarrierProximity {
-		return fA.BarrierProximity > fB.BarrierProximity
+	if dec, gt := cmpFloatDesc(fA.BarrierProximity, fB.BarrierProximity); dec {
+		return gt
 	}
 	return candidate.Less(cA, cB)
 }

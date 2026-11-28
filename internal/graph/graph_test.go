@@ -2,6 +2,7 @@ package graph_test
 
 import (
 	"bytes"
+	"errors"
 	"math"
 	"reflect"
 	"strings"
@@ -349,9 +350,14 @@ func TestDeferredEngineEdgesAndUnknownPaths(t *testing.T) {
 func TestRemoveAllPendingLifecycle(t *testing.T) {
 	events := []trace.Event{
 		{ID: 1, Kind: trace.KindMkdirAll, File: "dir/sub", Mode: 0755},
-		{ID: 2, Kind: trace.KindCreate, File: "dir/sub/f1", Handle: 1},
-		{ID: 3, Kind: trace.KindCreate, File: "dir/sub/f2", Handle: 2},
-		{ID: 4, Kind: trace.KindRemoveAll, File: "dir/sub"},
+		{ID: 2, Kind: trace.KindOpenDir, File: "dir", Handle: 1, Dir: true},
+		{ID: 3, Kind: trace.KindCreate, File: "dir/sub/f1", Handle: 2},
+		{ID: 4, Kind: trace.KindCreate, File: "dir/sub/f2", Handle: 3},
+		{ID: 5, Kind: trace.KindClose, File: "dir/sub/f1", Handle: 2},
+		{ID: 6, Kind: trace.KindClose, File: "dir/sub/f2", Handle: 3},
+		{ID: 7, Kind: trace.KindRemoveAll, File: "dir/sub"},
+		{ID: 8, Kind: trace.KindSync, File: "dir", Handle: 1, Dir: true},
+		{ID: 9, Kind: trace.KindMkdirAll, File: "dir/sub", Mode: 0755},
 	}
 
 	view, err := graph.Build(events)
@@ -359,9 +365,17 @@ func TestRemoveAllPendingLifecycle(t *testing.T) {
 		t.Fatalf("graph.Build: %v", err)
 	}
 
-	cut4 := view.Cuts[4]
-	if cut4.StateKey == "" {
-		t.Fatal("cut 4 has empty StateKey")
+	cut7 := view.Cuts[7]
+	if cut7.StateKey == "" {
+		t.Fatal("cut 7 has empty StateKey")
+	}
+	cut8 := view.Cuts[8]
+	cut9 := view.Cuts[9]
+	if cut8.StateKey == cut9.StateKey {
+		t.Fatal("MkdirAll after RemoveAll should mutate StateKey (dir/sub must not be resurrected)")
+	}
+	if _, err := graph.Build(append(events[:7], trace.Event{ID: 8, Kind: trace.KindOpen, File: "dir/sub/f1", Handle: 4})); err == nil {
+		t.Fatal("expected Open on removed child after RemoveAll to fail lookup")
 	}
 }
 
@@ -543,5 +557,193 @@ func TestReverseRiskHorizonComputation(t *testing.T) {
 	}
 	if c8.RiskScore >= c7.RiskScore {
 		t.Errorf("cut 8 RiskScore (%.2f) should be lower than pre-sync cut 7 RiskScore (%.2f)", c8.RiskScore, c7.RiskScore)
+	}
+}
+
+type errDOTWriter struct{}
+
+func (errDOTWriter) Write(_ []byte) (int, error) {
+	return 0, errors.New("write boom")
+}
+
+func TestGraphWriteDOTErrorPreallocateAndReuseDirtyReset(t *testing.T) {
+	events := []trace.Event{
+		{ID: 1, Kind: trace.KindMkdirAll, File: "db", Mode: 0755},
+		{ID: 2, Kind: trace.KindOpenDir, File: "db", Handle: 1, Dir: true},
+		{ID: 3, Kind: trace.KindSync, File: "db", Handle: 1, Dir: true},
+		{ID: 4, Kind: trace.KindCreate, File: "db/a.log", Handle: 2, Cat: "pebble-wal"},
+		{ID: 5, Kind: trace.KindPreallocate, File: "db/a.log", Handle: 2, Off: 0, Size: 64},
+		{ID: 6, Kind: trace.KindWrite, File: "db/a.log", Handle: 2, Data: []byte("abcd"), Len: 4},
+		{ID: 7, Kind: trace.KindClose, File: "db/a.log", Handle: 2},
+		{ID: 8, Kind: trace.KindReuseForWrite, File: "db/a.log", File2: "db/b.log", Handle: 3, Cat: "pebble-wal"},
+		{ID: 9, Kind: trace.KindClose, File: "db/b.log", Handle: 3},
+	}
+
+	view, err := graph.Build(events)
+	if err != nil {
+		t.Fatalf("graph.Build: %v", err)
+	}
+	if err := view.WriteDOT(errDOTWriter{}); err == nil || !strings.Contains(err.Error(), "write boom") {
+		t.Fatalf("expected WriteDOT write error, got: %v", err)
+	}
+
+	cut8 := view.Cuts[8]
+	if cut8.DirtyBytes != 0 {
+		t.Fatalf("expected ReuseForWrite to clear dirty bytes on destination, got %d", cut8.DirtyBytes)
+	}
+}
+
+func TestCutoffTierNoFutureLeakageAndBarrierResource(t *testing.T) {
+	// Case 1: Renaming tmp -> MANIFEST-000001 later must NOT promote cut 1 to TierManifest.
+	manifestLater := []trace.Event{
+		{ID: 1, Kind: trace.KindCreate, File: "db/tmp", Handle: 1},
+		{ID: 2, Kind: trace.KindWrite, File: "db/tmp", Handle: 1, Data: []byte("abcd"), Len: 4},
+		{ID: 3, Kind: trace.KindClose, File: "db/tmp", Handle: 1},
+		{ID: 4, Kind: trace.KindRename, File: "db/tmp", File2: "db/MANIFEST-000001"},
+	}
+	v1, err := graph.Build(manifestLater)
+	if err != nil {
+		t.Fatalf("graph.Build(manifestLater): %v", err)
+	}
+	if v1.Cuts[1].SemanticTier != graph.TierData || v1.Cuts[2].SemanticTier != graph.TierData {
+		t.Fatalf("future MANIFEST rename leaked into earlier cutoffs: cut1=%d cut2=%d",
+			v1.Cuts[1].SemanticTier, v1.Cuts[2].SemanticTier)
+	}
+	if v1.Cuts[3].SemanticTier != graph.TierManifest {
+		t.Fatalf("cut 3 immediately before MANIFEST rename should be TierManifest, got %d", v1.Cuts[3].SemanticTier)
+	}
+
+	// Case 2: Renaming 000001.log -> archive.bak later must NOT demote earlier WAL cutoffs.
+	walRenamedLater := []trace.Event{
+		{ID: 1, Kind: trace.KindCreate, File: "db/000001.log", Handle: 1},
+		{ID: 2, Kind: trace.KindWrite, File: "db/000001.log", Handle: 1, Data: []byte("abcd"), Len: 4},
+		{ID: 3, Kind: trace.KindClose, File: "db/000001.log", Handle: 1},
+		{ID: 4, Kind: trace.KindRename, File: "db/000001.log", File2: "db/archive.bak"},
+	}
+	v2, err := graph.Build(walRenamedLater)
+	if err != nil {
+		t.Fatalf("graph.Build(walRenamedLater): %v", err)
+	}
+	if v2.Cuts[1].SemanticTier != graph.TierWAL || v2.Cuts[2].SemanticTier != graph.TierWAL {
+		t.Fatalf("later rename demoted earlier WAL cutoffs: cut1=%d cut2=%d",
+			v2.Cuts[1].SemanticTier, v2.Cuts[2].SemanticTier)
+	}
+
+	// Case 3: Cutoff immediately before SyncData on a flush SST gets TierFlush even when anchored on another resource.
+	flushBarrier := []trace.Event{
+		{ID: 1, Kind: trace.KindCreate, File: "db/000003.sst", Cat: "pebble-memtable-flush", Handle: 1},
+		{ID: 2, Kind: trace.KindCreate, File: "db/other.dat", Handle: 2},
+		{ID: 3, Kind: trace.KindWrite, File: "db/other.dat", Handle: 2, Data: []byte("abcd"), Len: 4},
+		{ID: 4, Kind: trace.KindSyncData, File: "db/000003.sst", Handle: 1},
+	}
+	v3, err := graph.Build(flushBarrier)
+	if err != nil {
+		t.Fatalf("graph.Build(flushBarrier): %v", err)
+	}
+	if v3.Cuts[3].SemanticTier != graph.TierFlush {
+		t.Fatalf("cut 3 immediately before flush SST SyncData should be TierFlush, got %d", v3.Cuts[3].SemanticTier)
+	}
+}
+
+func TestPreallocateVertexAnchorConsistency(t *testing.T) {
+	events := []trace.Event{
+		{ID: 1, Kind: trace.KindCreate, File: "db/data", Cat: "pebble-wal", Handle: 1},
+		{ID: 2, Kind: trace.KindPreallocate, File: "db/data", Handle: 1, Off: 0, Size: 0},
+		{ID: 3, Kind: trace.KindPreallocate, File: "db/data", Handle: 1, Off: 0, Size: 64, Err: "enospc"},
+		{ID: 4, Kind: trace.KindWrite, File: "db/data", Handle: 1, Data: []byte("abcd"), Len: 4},
+	}
+	view, err := graph.Build(events)
+	if err != nil {
+		t.Fatalf("graph.Build: %v", err)
+	}
+	if view.IsVertex(2) {
+		t.Fatal("zero-size Preallocate must not be a vertex")
+	}
+	if !view.IsVertex(3) {
+		t.Fatal("failed Preallocate(Size>0) must be a vertex matching IsMutation()")
+	}
+	if view.Cuts[3].Desc == 0 || view.Cuts[3].Semantic == 0 {
+		t.Fatalf("failed Preallocate(Size>0) anchor dropped Desc/Semantic: %+v", view.Cuts[3])
+	}
+}
+
+func TestDeadUnlinkedClosedResourceClearsDirty(t *testing.T) {
+	events := []trace.Event{
+		{ID: 1, Kind: trace.KindMkdirAll, File: "db", Mode: 0755},
+		{ID: 2, Kind: trace.KindOpenDir, File: "db", Handle: 1, Dir: true},
+		{ID: 3, Kind: trace.KindSync, File: "db", Handle: 1, Dir: true},
+		{ID: 4, Kind: trace.KindCreate, File: "db/tmp.log", Cat: "pebble-wal", Handle: 2},
+		{ID: 5, Kind: trace.KindWrite, File: "db/tmp.log", Handle: 2, Data: []byte("123456"), Len: 6},
+		{ID: 6, Kind: trace.KindRemove, File: "db/tmp.log"},
+		{ID: 7, Kind: trace.KindClose, File: "db/tmp.log", Handle: 2},
+		{ID: 8, Kind: trace.KindSync, File: "db", Handle: 1, Dir: true},
+	}
+	view, err := graph.Build(events)
+	if err != nil {
+		t.Fatalf("graph.Build: %v", err)
+	}
+	// While open handle 2 remains alive after Remove, dirty bytes remain.
+	if view.Cuts[6].DirtyBytes != 6 {
+		t.Fatalf("cut 6 (unlinked while still open): DirtyBytes=%d, want 6", view.Cuts[6].DirtyBytes)
+	}
+	// Once handle 2 closes on an unlinked resource, dirty bytes and categories must clear.
+	if view.Cuts[7].DirtyBytes != 0 {
+		t.Fatalf("cut 7 (unlinked and closed): DirtyBytes=%d, want 0", view.Cuts[7].DirtyBytes)
+	}
+	if len(view.Cuts[8].Categories) != 0 || view.Cuts[8].RiskScore != 6.0 {
+		t.Fatalf("cut 8 after dir sync leaked dead resource categories/risk: cats=%v risk=%.2f",
+			view.Cuts[8].Categories, view.Cuts[8].RiskScore)
+	}
+}
+
+func TestWriteDOTNewlinesAndOpLabels(t *testing.T) {
+	events := []trace.Event{
+		{ID: 1, Kind: trace.KindCreate, File: "db/000001.log", Cat: "pebble-wal", Handle: 1},
+		{ID: 2, Kind: trace.KindOpBegin, Op: 7, OpKind: "set"},
+		{ID: 3, Kind: trace.KindWrite, File: "db/000001.log", Handle: 1, Data: []byte("abc"), Len: 3},
+		{ID: 4, Kind: trace.KindOpEnd, Op: 7, OpKind: "set"},
+		{ID: 5, Kind: trace.KindClose, File: "db/000001.log", Handle: 1},
+		{ID: 6, Kind: trace.KindRename, File: "db/000001.log", File2: "db/000002.log"},
+	}
+	view, err := graph.Build(events)
+	if err != nil {
+		t.Fatalf("graph.Build: %v", err)
+	}
+	var buf bytes.Buffer
+	if err := view.WriteDOT(&buf); err != nil {
+		t.Fatalf("WriteDOT: %v", err)
+	}
+	out := buf.String()
+	if strings.Contains(out, `\\n`) {
+		t.Fatalf("WriteDOT double-escaped newline:\n%s", out)
+	}
+	if !strings.Contains(out, `op=7`) {
+		t.Fatalf("WriteDOT omitted op=7 label:\n%s", out)
+	}
+	if !strings.Contains(out, `db/000001.log -> db/000002.log`) {
+		t.Fatalf("WriteDOT omitted Rename File2 label:\n%s", out)
+	}
+}
+
+func TestUncommittedSyncOpsIgnoresUnrelatedBarriers(t *testing.T) {
+	events := []trace.Event{
+		{ID: 1, Kind: trace.KindCreate, File: "db/000001.log", Cat: "pebble-wal", Handle: 1},
+		{ID: 2, Kind: trace.KindCreate, File: "db/000005.sst", Cat: "pebble-compaction", Handle: 2},
+		{ID: 3, Kind: trace.KindOpBegin, Op: 1, OpKind: "set"},
+		{ID: 4, Kind: trace.KindWrite, File: "db/000001.log", Handle: 1, Data: []byte("abc"), Len: 3},
+		{ID: 5, Kind: trace.KindOpEnd, Op: 1, OpKind: "set"},
+		{ID: 6, Kind: trace.KindWrite, File: "db/000005.sst", Handle: 2, Data: []byte("sst"), Len: 3},
+		{ID: 7, Kind: trace.KindSyncData, File: "db/000005.sst", Handle: 2},
+		{ID: 8, Kind: trace.KindSyncData, File: "db/000001.log", Handle: 1},
+	}
+	view, err := graph.Build(events)
+	if err != nil {
+		t.Fatalf("graph.Build: %v", err)
+	}
+	if view.Cuts[7].UncommittedSyncOps != 1 {
+		t.Fatalf("cut 7 (compaction SST SyncData) wiped UncommittedSyncOps to %d, want 1", view.Cuts[7].UncommittedSyncOps)
+	}
+	if view.Cuts[8].UncommittedSyncOps != 0 {
+		t.Fatalf("cut 8 (WAL SyncData) should clear UncommittedSyncOps, got %d", view.Cuts[8].UncommittedSyncOps)
 	}
 }

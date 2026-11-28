@@ -62,12 +62,12 @@ works as follows:
 
 #### Intermediate Retention Determinism via `deterministicPartialClone`
 
-While raw upstream `MemFS.CrashClone` provides fast in-memory snapshots, Go's randomized map iteration order over `f.children` causes `CrashClone` to consume pseudo-random numbers in an unstable order whenever `1 <= UnsyncedDataPercent <= 99`. Consequently, invoking raw `MemFS.CrashClone` repeatedly with the exact same seed produces multiple distinct filesystem images (demonstrated in `internal/trace/event_test.go:TestCrashCloneSeedReproducibility`).
+While raw upstream `MemFS.CrashClone` provides fast in-memory snapshots, Go's randomized map iteration order over `f.children` causes `CrashClone` to consume pseudo-random numbers in an unstable order whenever `1 <= UnsyncedDataPercent <= 99`. Consequently, invoking raw `MemFS.CrashClone` repeatedly with the exact same seed can produce multiple distinct filesystem images (logged diagnostically in `internal/trace/event_test.go:TestCrashCloneSeedReproducibility`).
 
 To eliminate this nondeterminism and guarantee bit-for-bit reproducibility across all retention policies, CraConTest wraps replay snapshots in `replay.State.Clone(percent, seed)` (`internal/replay/replay.go:93-111`), which explicitly handles all three retention regimes:
 - **`percent == 0`**: delegates directly to `MemFS.CrashClone` with `UnsyncedDataPercent: 0` (RNG-free).
 - **`percent == 100`**: delegates directly to `MemFS.CrashClone` with `UnsyncedDataPercent: 100` and `rand.New(rand.NewPCG(0, seed))` (seed-invariant because every `IntN(100) < 100` check succeeds unconditionally).
-- **`1 <= percent <= 99`**: constructs `base0` (`UnsyncedDataPercent: 0`) and `full100` (`UnsyncedDataPercent: 100` with `rand.New(rand.NewPCG(0, 0))`), then runs `deterministicPartialClone` using `rng := rand.New(rand.NewPCG(0, seed))`, ensuring every intermediate state is bounded between `base0` and `full100` (`TestReplayEndpointEquivalenceAndBoundaryContainment`). Note that while `0%` and `100%` bound every intermediate policy `p%`, two distinct intermediate percentages `p1 < p2` are not guaranteed to be bitwise subsets at every offset because retaining an unsynced directory at `p2` that was skipped at `p1` consumes additional RNG draws for its children.
+- **`1 <= percent <= 99`**: constructs `base0` (`UnsyncedDataPercent: 0`) and passes the live `s.memFS` directly to `deterministicPartialCloneWithLinks` using `rng := rand.New(rand.NewPCG(0, seed))`, ensuring every intermediate state is bounded between `base0` and `100%` (`TestReplayEndpointEquivalenceAndBoundaryContainment`), preserving hard-link aliasing via `s.linkGroups()` and sampling shorter in-place rewrites (`len(currBytes) < len(syncedBytes)`) atomically as a whole truncation decision. Note that while `0%` and `100%` bound every intermediate policy `p%`, two distinct intermediate percentages `p1 < p2` are not guaranteed to be bitwise subsets at every offset because retaining an unsynced directory at `p2` that was skipped at `p1` consumes additional RNG draws for its children.
 
 In this model, `State.Clone` captures exact `fileSyncedBytes` snapshots at each file's latest `Sync`/`SyncData` (or `SyncTo` with `FullSync=true`). For intermediate retention policies (`1..99%`), for files whose directory entry is synced (`syncedSet[name] == true`), `deterministicPartialClone` reads `syncedBytes` from `base0` (`CrashClone(0)`), and consults `fileSyncedBytes` for unsynced directory entries. `deterministicPartialClone` partitions each file into 4KB blocks. Any 4KB block where the live file contents differ from the synced snapshot (`syncedBytes`) is sampled sequentially from the candidate's PCG PRNG stream (`rand.New(rand.NewPCG(0, seed))`) as directory entries are traversed in sorted lexicographical order (`sort.Strings`) and differing 4KB blocks are traversed in ascending offset order, deciding whether that block retains the unsynced live dirty bytes or reverts to the durable snapshot (`syncedBytes`). Unsynced directory entries are similarly sampled independently in sorted lexicographical order, as verified in `TestDeterministicPartialCloneStatisticalFidelity` and `TestReplayPartialCloneInPlaceOverwriteAfterSync`. This ensures 100% seed determinism for any retention policy from 0% to 100% (`TestReplayClonePartialRetentionSeedDeterminism`) while preserving high statistical retention fidelity across seeds.
 
@@ -117,7 +117,7 @@ Formally: let operations be ordered by their commit sequence number. The oracle 
 - **Rule 1 (`durably_committed`)**: If the recovered database state is strictly older than lower bound $L$ ($S < L$), an acknowledged synchronous write has been lost, violating Rule 1.
 - **Rule 2 (`atomic_batch`)**: Multi-key client transactions must commit atomically. A batch operation is either fully present or fully absent in the recovered database; observing an interior state containing only a subset of the batch's keys violates Rule 2.
 - **Rule 3 (`prefix`)**: An unsynced commit-order hole exists where a later write is present while an earlier one is absent ($S \notin [L, U]$).
-- **No resurrection**: if an operation was never acknowledged, it must not appear in the recovered state.
+- **No resurrection**: if an operation never began before the crash cutoff (`BeginEvent > cut`), or was overwritten/deleted before a later durable state, it must not appear in the recovered state (in-flight operations with `BeginEvent <= cut` are permitted in `states[lower:]` as valid prefix states).
 
 ### Why the Independent Rule is Wrong
 
@@ -180,10 +180,10 @@ The oracle classifies each crash-recovery outcome into exactly one class:
 |-------|-----------|
 | **valid** | Recovered state matches some prefix of the commit order that includes all synced operations. |
 | **violation** | A specific rule is violated: a synced write is missing, a hole exists, a batch is partial, or a never-written key appears. |
-| **open-error** | `pebble.Open()` returns an error. Under the VFS crash model (only unsynced data is lost), an open failure is itself a violation. |
-| **panic** | Recovery triggers a panic or fatal log (Pebble's default logger calls `os.Exit(1)`). |
-| **hang** | Recovery does not complete within the configured timeout. |
-| **oracle-error** | The oracle itself cannot determine the outcome (internal error). |
+| `open_error` | `pebble.Open()` returns an error (or returns a `nil` `*pebble.DB` without error). Recorded separately from `violation` outcomes. |
+| `panic` | Recovery triggers a panic or fatal log (Pebble's default logger calls `os.Exit(1)`). |
+| `hang` | Recovery does not complete within the configured timeout. |
+| `oracle_error` | The oracle itself cannot determine the outcome (internal error). |
 
 ### Violation Sub-Types
 
@@ -193,17 +193,11 @@ The oracle classifies each crash-recovery outcome into exactly one class:
 | Hole in commit order | A later unsynced write is present but an earlier one is absent. |
 | Partial batch | Some but not all keys from an atomic batch are present. |
 | Unexpected resurrection | A key that was never written, or was deleted and synced, appears after recovery. |
-| Structural inconsistency | `DB.CheckLevels()` fails, or forward and backward iteration disagree. |
+| Structural inconsistency (`Rule: "structural"`) | Post-open `DB.CheckLevels()` fails (`recovery.CheckIntegrity`), or forward and backward iteration disagree / `DumpContents()` fails. Recorded as `violation` by `exp.RunExplore`. |
 
-## Durability Classes for the Reference Model
+## Prefix Reference Model
 
-The oracle's reference model tracks three durability classes for each operation:
-
-| Class | Meaning | After crash |
-|-------|---------|-------------|
-| `durably_committed` | Written and synced | **Must** survive |
-| `pending` | Written to WAL, not synced | **May** survive, but only as part of a prefix |
-| `volatile` | In memtable only, no WAL write | **Must not** survive |
+`oracle.Check` does not track per-operation `pending` or `volatile` residency classes; instead, it constructs the sequence of legal prefix states `states[lower:]` for all operations whose `BeginEvent <= cut` (plus atomic batch interiors for Rule 2), anchored at `lower` (the last acknowledged synchronous mutation at or before `cut`), and checks whether the recovered database state equals any prefix state in `states[lower:]`.
 
 ## DiskWriteCategory Labels
 
@@ -247,25 +241,27 @@ To thoroughly evaluate crash-consistency ranking strategies across diverse failu
 | Fault Model | Target Barrier | Scope | Expected Recovery Symptom |
 |---|---|---|---|
 | `MUT-0` | None (null control) | Null pass-through | No failures observed in the evaluated endpoint controls |
-| `MUT-1` | WAL `SyncData` / `Sync` | Dense (all WAL syncs dropped) | Durability violation: lost acknowledged writes (`v1:violation:durably_committed:lost_writes`) |
+| `MUT-1` | WAL `SyncData` / `Sync` | Dense (all WAL syncs dropped) | Durability violation: lost acknowledged writes (`v1:<sha256>`) |
 | `MUT-2` | Manifest `Sync` | Dense (all manifest syncs dropped) | Open error: corrupted or unparseable manifest (`v1:open_error:manifest_corrupt`) |
-| `MUT-3` | Directory `Sync` (`OpenDir`) | Dense (all directory syncs dropped) | Durability violation: lost acknowledged files / unlinked SSTs (`v1:violation:durably_committed:lost_files`) |
+| `MUT-3` | Directory `Sync` (`OpenDir`) | Dense (all directory syncs dropped) | Durability violation: lost acknowledged files / unlinked SSTs (`v1:<sha256>`) |
 | `MUT-4` | Memtable flush SST `SyncData` | Dense (all flush SST syncs dropped) | Open error: table size mismatch or corrupted SST (`v1:open_error:table_corrupt`) |
-| `MUT-5` | WAL `SyncData` | Sparse (single $k$-th WAL sync dropped, $k=1$) | Durability violation: lost acknowledged writes from targeted sync (`v1:violation:durably_committed:lost_writes`) |
-| `MUT-6` | Second manifest `Sync` (first post-open manifest sync) | Sparse (~0.8% density) | Open error or violation: second manifest sync drop causes manifest rotation inconsistency (`v1:open_error:manifest_rotation`) |
+| `MUT-5` | WAL `SyncData` | Sparse (single $k$-th WAL sync dropped, $k=1$) | Durability violation: lost acknowledged writes from targeted sync (`v1:<sha256>`) |
+| `MUT-6` | Second manifest `Sync` (first post-open manifest sync) | Sparse (~0.8% density) | Durability violation: manifest sync drop causes lost committed state (`v1:<sha256>`) |
 | `MUT-7` | Directory `Sync` after `CURRENT`/`OPTIONS` rename | No-op control on Pebble v2.1.7 (0.0% density; Pebble v2 creates `CURRENT` once during `Open` and recovers cleanly if `OPTIONS` is lost) | None (clean recovery on Pebble v2.1.7) |
-| `MUT-8` | Compaction/flush SST `SyncData` after `CompactionBegin` | Windowed (~15.2% density; RocksDB #10460 compaction sync drop) | Open error: compaction state / missing table referenced by manifest (`v1:open_error:compaction_state`) |
-| `MUT-9` | Directory `Sync` (`OpenDir`) | Dense ($k=1$, ~41.4% density) / Sparse ($k \in \{7,9,10,12\}$, 0.8%–12.4% density; flush/compaction directory syncs). Directory-entry tracking was added after inspecting MUT-9, so MUT-9 evaluates parameterized $k$-generalization within the directory-sync family. | Durability violation: lost unpersisted directory entry (`v1:violation:durably_committed:lost_files`) |
+| `MUT-8` | Compaction/flush SST `SyncData` after `CompactionBegin` | Windowed (~15.2% density; RocksDB #10460 compaction sync drop) | Open error: missing or corrupted compacted SST (`v1:open_error:table_corrupt`) |
+| `MUT-9` | Directory `Sync` (`OpenDir`) | Dense ($k=1$, ~41.4% density) / Sparse ($k \in \{7,9,10,12\}$, 0.8%–12.4% density; flush/compaction directory syncs). Directory-entry tracking was added after inspecting MUT-9, so MUT-9 evaluates parameterized $k$-generalization within the directory-sync family. | Durability violation: lost unpersisted directory entry (`v1:<sha256>`) |
+
+> **Dense vs. Sparse Taxonomy Note:** In the benchmark taxonomy above, `MUT-1` through `MUT-4` are grouped as dense class-wide barrier drops (29.8%–47.3% failure density). Note that `faults.IsSparse` (`internal/faults/faults.go`) returns `false` for `MUT-0..2` and `true` for non-WAL or selective barriers (`MUT-3..9`, `MUT-X1..X6`) relative to WAL write frequency.
 
 ### Structural Tracking of POSIX Durability Contracts
 
 Storage engine crash-consistency contracts require coordinated persistence across three distinct filesystem boundaries. In `internal/graph/features.go`, CraConTest causally tracks each invariant in a single forward pass over recorded `trace.Event` records without inspecting recovery outcomes:
 
 1. **WAL Write Persistence Before Client Acknowledgment (`AckSyncMissing`):**
-  Under the project's durability model, a synchronous client write is committed only after the relevant WAL byte spans are covered by `SyncData()`. The tracker records dirty spans per WAL handle and file. At client acknowledgment, an uncovered WAL write increments `UnpersistedAckOps` and sets `AckSyncMissing = true`. This flag identifies a potential durability violation at 0% retention; the recovery oracle still determines whether logical no-ops, overwrites, or later persistence make the recovered state legal.
+   Because `OpBegin`/`OpEnd` markers do not carry a `Sync` bit, `ackOps` records every error-free acknowledged mutating client operation (`trace.MutatingOperation(event.OpKind) && event.Err == ""`, including `NoSync` writes). At each cutoff, the tracker recomputes `UnpersistedAckOps` across `ackOps` and sets `AckSyncMissing = true` whenever any acknowledged operation's recorded WAL write span still overlaps uncovered `dirtySpans` **or** the WAL file's parent directory entry remains unsynced (`!fi.dirEntrySynced || unsyncedDirs[fi.parentDir]`), clearing once a subsequent WAL + directory sync covers those bytes and entries. This flag identifies a potential durability violation at 0% retention; the recovery oracle still determines whether logical no-ops, overwrites, or later persistence make the recovered state legal.
 
 2. **SSTable Data and Directory Entry Durability Prior to Manifest Commitment (`committedInManifest` / `DanglingTableCount`):**
-   When Pebble flushes a memtable or executes a compaction, newly written SSTable files must be durably persisted before the version edit referencing them is committed in the `MANIFEST`. Durability of an SSTable requires both conditions: (a) all dirty byte spans of the table file are synced via `SyncData()` (`dirtyBytes == 0`), and (b) the directory entry referencing the table filename in its parent directory is synced via `File.Sync()` on the directory handle (`dirEntrySynced == true`). If a manifest version edit commits (`stagedInManifest` transitions to `committedInManifest`) while any referenced SSTable has unsynced data or an unsynced parent directory entry, `DanglingTableCount` is incremented. A crash cutoff at this point leaves the manifest pointing to a missing or truncated table, causing recovery open errors (`manifest_corrupt` or `table_corrupt`).
+   When Pebble flushes a memtable or executes a compaction, newly written SSTable files must be durably persisted before the version edit referencing them is committed in the `MANIFEST`. Durability of an SSTable requires both conditions: (a) all dirty byte spans of the table file are synced via `SyncData()` (`dirtyBytes == 0`), and (b) the directory entry referencing the table filename in its parent directory is synced via `File.Sync()` on the directory handle (`dirEntrySynced == true`). If a manifest version edit commits (`stagedInManifest` transitions to `committedInManifest`) while any referenced SSTable has unsynced data or an unsynced parent directory entry—or if a `MANIFEST` file itself remains dirty/uncommitted (`manifestDirtyUncommitted`)—`DanglingTableCount` is incremented. A crash cutoff at this point leaves the manifest pointing to a missing or truncated table, causing recovery open errors (`manifest_corrupt` or `table_corrupt`).
 
 3. **Parent Directory Durability Across Namespace Lineage (`UnsyncedDirectoryRename`):**
-   Under POSIX semantics, filesystem metadata operations—including `Create`, `ReuseForWrite`, `Rename`, `Link`, and `MkdirAll`—modify the containing directory. The file's directory entry remains volatile until `File.Sync()` is explicitly invoked on the parent directory handle (`OpenDir`). In `internal/graph/features.go`, file nodes track `parentDir` and `dirEntrySynced`, while directory creations populate `unsyncedDirs`. Directory sync events (`trace.KindSync` with `Dir: true`) clear pending records strictly for matching directory paths. If critical namespace renames (targeting `CURRENT` or `MANIFEST`) or active files written post-acknowledgment remain uncommitted in the directory namespace, `UnsyncedDirectoryRename` is asserted.
+   Under POSIX semantics, filesystem metadata operations—including `Create`, `OpenReadWrite(Created=true)`, `ReuseForWrite`, `Rename`, `Link`, and `MkdirAll`—modify the containing directory (`unsyncedDirs` / `dirEntrySynced`). Directory sync events (`trace.KindSync` with `Dir: true`) clear pending records strictly for matching directory paths. Separately, `UnsyncedDirectoryRename` inspects `pendingRenames` from `KindRename` operations that remain unsynced across lifecycle boundaries: `isCrit` flags critical metadata/manifest paths (`MANIFEST*`, `CURRENT.*`, `marker.manifest.*`, and `OPTIONS*`), while `pendingCount` counts all violating renames—gating only `OPTIONS*` and `.log` renames on `len(ackSyncOps) > 0`.

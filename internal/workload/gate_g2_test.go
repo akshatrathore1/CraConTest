@@ -49,6 +49,12 @@ func TestGateG2(t *testing.T) {
 	if err != nil {
 		t.Fatalf("pebble.Open: %v", err)
 	}
+	closed := false
+	defer func() {
+		if !closed {
+			_ = db.Close()
+		}
+	}()
 
 	cfg := workload.DefaultConfig()
 	rawHistory, err := workload.Run(db, rec, cfg)
@@ -56,6 +62,7 @@ func TestGateG2(t *testing.T) {
 		t.Fatalf("workload.Run: %v", err)
 	}
 
+	closed = true
 	if err := db.Close(); err != nil {
 		t.Fatalf("db.Close: %v", err)
 	}
@@ -101,7 +108,11 @@ func TestGateG2(t *testing.T) {
 	if err != nil {
 		t.Fatalf("replay.Build: %v", err)
 	}
-	defer replayer.Close()
+	defer func() {
+		if err := replayer.Close(); err != nil {
+			t.Errorf("replayer.Close: %v", err)
+		}
+	}()
 
 	var currentCut uint64
 	var validCount, violationCount, openErrCount, panicCount, hangCount, oracleErrCount int

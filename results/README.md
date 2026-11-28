@@ -20,7 +20,7 @@ Stage 1 contains full trace, execution history, candidate universe, crash explor
    - Workload: 1,000 operations, Seed 42, 64 keys, 128-byte values (`experiments/configs/main.json`).
    - Faults: `MUT-0` (null control), `MUT-1` (dense WAL sync drop), `MUT-2` (dense manifest sync drop), `MUT-3` (dense directory sync drop), `MUT-4` (dense SST flush sync drop).
    - Failure densities: 28.0% to 49.6% across `MUT-1..4` (0 violations on `MUT-0`).
-   - Artifacts: Full trace, candidate universe (~2,000 candidates), complete explore journal, outcomes, ranking permutations (`ranking_dcg.json`, `ranking_r2.json`, `ranking_b0.json`, etc.), `positions.csv`.
+   - Artifacts: Full trace, candidate universe (~2,000 candidates), complete explore journal, outcomes, canonical ranking permutations (`ranking_b0.json`, `ranking_b4.json`, `ranking_b5.json`, `ranking_b6.json`), `curves.csv`, `positions.csv`.
    - Discovery curve tables and plots: `discovery_main_mut0..4.csv`, `plot_main_mut0..4.svg`.
 
 > **Note on Naming & Invariants:** Directory names `results/main_mut0..4` and `results/smoke_mut0..1` are canonical and must not be altered, ensuring `TestGateG4` and `TestMainRunArtifactsMatchStoredTables` continuously pass.
@@ -31,12 +31,12 @@ Stage 1 contains full trace, execution history, candidate universe, crash explor
 
 Stage 2 stores aggregated 95%-confidence-interval summaries and unaggregated per-seed discovery tables across multi-seed benchmark evaluations (120 operations/seed, 32 deterministic seeds: `42, 100..900, 1001..1022`). These tables enable full statistical reproduction and hypothesis testing via `analysis/paired_stats.py` without requiring the repository to commit hundreds of megabytes of raw per-run trace and universe JSONs.
 
-Within each workload seed (`RunSingleSeedFault` in `internal/exp/benchmark.go`), under `v1.1.2-evaluation-freeze`, `R1`, `R2`, `DCG-FlagOnly`, and `B0` all compute true per-seed shuffle means across 100 shuffles (matching $E[K_1] = (N+1)/(m+1)$, e.g., $2.73$ on `MUT-1`), while `B0` also records percentile bounds across those shuffles.
+Under `v1.1.2-evaluation-freeze`, the main benchmark records per-seed means over 100 shuffles for `R1`, `R2`, `DCG-FlagOnly`, and `B0`; B0 also records medians and percentiles. Only uniform B0 permutations have the theoretical expectation $E[K_1]=(N+1)/(m+1)$ for $m>0$. Finite shuffle means estimate their respective ranking distributions; the uniform expectation does not apply to guided or partitioned strategies. Descriptive means and paired single-ranking tests are separate estimands in `analysis/paired_stats.py`.
 
 1. **In-Sample Multi-Seed Benchmark (`results/benchmark_summary.csv`, `results/benchmark_per_seed.csv`):**
-   - Scope: 10 in-sample fault models (`MUT-0` through `MUT-9`, 320 runs total).
-   - `benchmark_summary.csv`: Aggregated summary statistics across 32 seeds for each strategy (`dcg`, `dcg-flag-only`, `r2`, `r1`, `b6`, `b0`, `b7`, `b5`, `b4`, `b1`, `b2`, `b3`), including median and mean $k_1$ with 95% bootstrap confidence intervals, $S_{25}$, $S_{100}$, normalized AUC, and theoretical random expectation.
-   - `benchmark_per_seed.csv`: Unaggregated per-seed, per-strategy discovery metrics across all 320 individual runs (`fault_id`, `seed`, `universe_size`, `total_failures`, `total_violations`, `strategy_code`, `k1_single`, `s25_single`, `s100_single`, etc.).
+   - Scope: nine exported fault models (`MUT-1` through `MUT-9`, 288 seed/fault runs), plus a separate 32-seed `MUT-0` control. The control is not included in these two CSVs.
+   - `benchmark_summary.csv`: Aggregated summary statistics across 32 seeds for each of the 13 strategies (`dcg`, `dcg-pr`, `dcg-flag-only`, `r2`, `r1`, `b6`, `b0`, `b7`, `b5`, `b4`, `b1`, `b2`, `b3`), including median and mean $k_1$ with 95% bootstrap confidence intervals, $S_{25}$, $S_{100}$, normalized AUC, and theoretical random expectation.
+   - `benchmark_per_seed.csv`: 3,744 rows of per-seed, per-strategy discovery metrics for the 288 exported runs, including `fault_id`, `seed`, `universe_size`, `total_failures`, `strategy_code`, `k1_single`, `s25_single`, and shuffle-mean discovery columns.
 
 2. **Holdout & Out-of-Contract Benchmark (`results/holdout_summary.csv`, `results/holdout_per_seed.csv`):**
    - Scope: 17 holdout and out-of-contract fault settings across 32 seeds (544 runs total).
@@ -74,7 +74,7 @@ Within each workload seed (`RunSingleSeedFault` in `internal/exp/benchmark.go`),
 
 7. **Pebble Subsystem Discovery Benchmark (`results/subsystem_discovery.csv`):**
    - Scope: Systematic empirical discovery across Pebble v2.1.7 subsystems performing multi-file and directory-marker mutations (Workload A: External SSTable Ingestion, Workload B: Live Format-Version Ratcheting, Workload C: Combined Lifecycle Stress) under unfaulted `MUT-0` across intermediate retention policies `[0, 50, 100]` and seeds `42, 100, 777` (5,415 candidate states evaluated).
-   - `subsystem_discovery.csv`: 9 data rows recording workload, seed, ops, maintenance parameters (`ingest_every`, `ratchet_at`, `checkpoint_at`, `max_manifest_file_size`), policies, universe size, violations, durably committed violations, prefix violations, structural violations, open errors, panics, hangs, and git commit hash.
+   - `subsystem_discovery.csv`: 9 data rows recording workload, seed, operations, maintenance parameters (`ingest_every`, `ratchet_at`, `checkpoint_at`, `max_manifest_file_size`), policies, universe size, violations, durably committed violations, prefix violations, structural violations, open errors, panics, hangs, and git commit hash.
     - Findings & Empirical Crash-Consistency Evaluation:
        - **0 lost durably-committed keys** across all 9 runs. No durably-committed data loss is observed in the evaluated workloads and crash states.
      - **0 engine recovery panics or hangs**.
@@ -120,11 +120,13 @@ python3 analysis/paired_stats.py results/casestudy_checkpoint_per_seed.csv "Pebb
 
 ## Provenance and Cross-Validation Contract
 
-`results/` contains 23 CSV files in total. Each CSV's own schema/provenance is authoritative.
+`results/` contains 37 CSV files in total (23 top-level summary, per-seed, discovery, and scaling CSVs plus 14 per-run `curves.csv` and `positions.csv` files across `main_mut0..4` and `smoke_mut0..1`). Each CSV's own schema/provenance is authoritative.
 
 - **14 accounting-corrected CSVs carrying `git_commit = f9202dfca579`:** all Stage 2 benchmark, holdout, case-study, workload-diversity, null-control, and subsystem-discovery CSVs. B0 `*_mean` fields are true shuffle means under `v1.1.2-evaluation-freeze`.
 
-- **All 14 Stage 2 CSVs carrying a `git_commit` column identify `f9202dfca579`**, the accounting-corrected `v1.1.2-evaluation-freeze`. Earlier artifacts remain reachable through Git history and their immutable tags; they are not mixed into current tables.
+- **All 14 Stage 2 CSVs carrying a `git_commit` column identify `f9202dfca579`**, the accounting-corrected `v1.1.2-evaluation-freeze`. All 14 source-stamped Stage 2 CSVs were generated from `v1.1.2-evaluation-freeze` (`f9202dfca579`, exported in `28cfc62..90b1ffe` with zero code changes under `internal/`, `cmd/`, or `analysis/`); `git_commit = f9202dfca579` names the generating source commit rather than the export commit containing the CSV file. Earlier artifacts remain reachable through Git history and their immutable tags; they are not mixed into current tables.
+
+- **Subsequent Release Maintenance on `main`:** Following `28cfc62..90b1ffe`, final release maintenance on `main` (including the final release commit, after which the repository is frozen) includes non-ranking/hardening refactors across `internal/` (including code hygiene/helper extraction in `internal/strategy/dcg.go` and `internal/graph/features.go`), strategy-code label normalization (`c1` -> `b6`) in `casestudy_ingest_per_seed.csv` and `workload_diversity_per_seed.csv`, 95% CI lower-bound clamping (`>= 1.00`) in `holdout_summary.csv` and `casestudy_pebble5825_summary.csv`, refreshed `discovery_main_mut1.csv` / `discovery_main_mut4.csv` and `plot_main_mut1.svg`, removal of redundant `results/plots/discovery_main_mut2.svg` and `results/plots/discovery_main_mut4.svg`, and the Go `1.27.4` pin in `go.mod` and CI.
 
 - **9 Fixed-Schema Regression CSVs Without a `git_commit` Column:**
   - **7 Stage 1 Single-Run Discovery Curve Tables:** `discovery_mut0.csv` and `discovery_mut1.csv` guarded byte-for-byte by `TestGateG4` (`internal/exp/gate_g4_test.go:20-95`); `discovery_main_mut0.csv` through `discovery_main_mut4.csv` guarded byte-for-byte by `TestMainRunArtifactsMatchStoredTables` (`internal/exp/main_artifacts_test.go:15-56`).

@@ -1,7 +1,6 @@
 package strategy
 
 import (
-	"fmt"
 	"math"
 	"math/rand/v2"
 	"sort"
@@ -20,14 +19,12 @@ type dcg struct {
 	weights DCGWeights
 }
 
-// NewDCG creates a new Durability-Contract Guided ranking strategy.
-// Optional custom weights can be supplied.
-func NewDCG(weights ...DCGWeights) Strategy {
-	w := DefaultDCGWeights()
+func sanitizeDCGWeights(weights ...DCGWeights) DCGWeights {
+	def := DefaultDCGWeights()
+	w := def
 	if len(weights) > 0 {
 		w = weights[0]
 	}
-	def := DefaultDCGWeights()
 	if math.IsNaN(w.WALWeight) || math.IsInf(w.WALWeight, 0) || w.WALWeight < 0 {
 		w.WALWeight = def.WALWeight
 	}
@@ -37,7 +34,13 @@ func NewDCG(weights ...DCGWeights) Strategy {
 	if math.IsNaN(w.RenameWeight) || math.IsInf(w.RenameWeight, 0) || w.RenameWeight < 0 {
 		w.RenameWeight = def.RenameWeight
 	}
-	return dcg{weights: w}
+	return w
+}
+
+// NewDCG creates a new Durability-Contract Guided ranking strategy.
+// Optional custom weights can be supplied.
+func NewDCG(weights ...DCGWeights) Strategy {
+	return dcg{weights: sanitizeDCGWeights(weights...)}
 }
 
 func (dcg) Name() string { return "dcg" }
@@ -45,152 +48,134 @@ func (dcg) Name() string { return "dcg" }
 // Rank implements Durability-Contract Guided candidate ranking:
 //  1. Partitions candidate universe by (StateKey, Percent).
 //  2. Isolates 0% retention canonical state representatives.
-//  3. Tier 1: 0% retention state representatives with contract violations (ContractScore > 0),
-//     ranked by contractTierLevel, BarrierProximity, ContractScore.
-//  4. Tier 2: 0% retention state representatives without contract violations (ContractScore == 0),
-//     ranked by BarrierProximity and reverse risk horizon (RiskScore) with semantic barrier interleaving.
-//  5. Tier 3A: Remaining 0% retention violating non-representatives (ContractScore > 0).
-//  6. Tier 3B: Remaining 0% retention clean non-representatives (ContractScore == 0).
-//  7. Tier 4: 100% retention candidates in canonical order.
+//  3. Tier 1: 0% retention state representatives with contract violations
+//     (ContractViolationMask != 0 || ContractScore > 0), ranked by
+//     contractTierLevel, BarrierProximity, ContractScore.
+//  4. Tier 2: 0% retention state representatives without contract violations,
+//     ranked by BarrierProximity and reverse risk horizon (RiskScore) with
+//     semantic barrier interleaving.
+//  5. Tier 3A: Remaining 0% retention violating non-representatives.
+//  6. Tier 3B: Remaining 0% retention clean non-representatives.
+//  7. Tier 4: Non-zero retention candidates sorted by retention percent ascending,
+//     then in canonical order.
 //
 // Strictly validates that the returned slice is a bijection of universe (ValidatePermutation).
 func (s dcg) Rank(view *graph.View, universe []candidate.Candidate) []candidate.Candidate {
 	ordered := canonical(universe)
-	if len(ordered) <= 1 {
-		return ordered
-	}
-	if view == nil {
+	if len(ordered) == 0 {
 		return ordered
 	}
 	labels, ok := features(view, ordered)
 	if !ok {
 		return nil
 	}
-
-	// 1. Compute contract features if trace events are available in view.
-	var contractMap map[uint64]graph.ContractFeatures
-	if len(view.Events) > 0 {
-		contractMap = graph.ComputeContractFeaturesWithWeights(view.Events, s.weights)
+	if len(ordered) == 1 {
+		return ordered
 	}
 
-	// 2. Separate into 0% retention pool (u0) and non-zero retention pool (uNonZero).
-	// Note: uNonZero holds ALL non-zero candidates (e.g. 50% partial retention as well as 100%).
-	var u0 []candidate.Candidate
-	var u0Labels []graph.Features
-	var u0Contract []graph.ContractFeatures
+	contractMap := contractFeaturesForView(view, s.weights)
+
+	// Separate into 0% retention pool (u0) and non-zero retention pool (uNonZero).
+	var u0 []dcgCandidate
 	var uNonZero []candidate.Candidate
 
 	for i, c := range ordered {
 		if c.Percent == 0 {
-			u0 = append(u0, c)
-			u0Labels = append(u0Labels, labels[i])
+			var cf graph.ContractFeatures
 			if contractMap != nil {
-				u0Contract = append(u0Contract, contractMap[c.Event])
-			} else {
-				u0Contract = append(u0Contract, graph.ContractFeatures{})
+				cf = contractMap[c.Event]
 			}
+			u0 = append(u0, dcgCandidate{cand: c, feat: labels[i], contract: cf})
 		} else {
 			uNonZero = append(uNonZero, c)
 		}
 	}
 
-	// 3. Group U_0 by StateKey.
-	type stateGroup struct {
-		key        string
-		candidates []candidate.Candidate
-		feats      []graph.Features
-		contracts  []graph.ContractFeatures
-	}
+	repsRanked, nonRepsRanked := rankDCGZeroPool(u0)
 
-	groupIndex := make(map[string]int)
-	var groups []stateGroup
-
-	for i, c := range u0 {
-		key := u0Labels[i].StateKey
-		idx, found := groupIndex[key]
-		if !found {
-			idx = len(groups)
-			groupIndex[key] = idx
-			groups = append(groups, stateGroup{key: key})
+	// Tier 4: Non-zero retention candidates (uNonZero) sorted by retention percent ascending, then canonically.
+	sort.Slice(uNonZero, func(i, j int) bool {
+		if uNonZero[i].Percent != uNonZero[j].Percent {
+			return uNonZero[i].Percent < uNonZero[j].Percent
 		}
-		groups[idx].candidates = append(groups[idx].candidates, c)
-		groups[idx].feats = append(groups[idx].feats, u0Labels[i])
-		groups[idx].contracts = append(groups[idx].contracts, u0Contract[i])
+		return candidate.Less(uNonZero[i], uNonZero[j])
+	})
+
+	ranking := make([]candidate.Candidate, 0, len(ordered))
+	ranking = append(ranking, repsRanked...)
+	ranking = append(ranking, nonRepsRanked...)
+	ranking = append(ranking, uNonZero...)
+
+	if err := ValidatePermutation(universe, ranking); err != nil {
+		return nil
 	}
+	return ranking
+}
 
-	// 4. For each distinct StateKey in U_0, select exactly ONE canonical representative.
-	type repInfo struct {
-		cand     candidate.Candidate
-		feat     graph.Features
-		contract graph.ContractFeatures
+type dcgCandidate struct {
+	cand     candidate.Candidate
+	feat     graph.Features
+	contract graph.ContractFeatures
+}
+
+func contractFeaturesForView(view *graph.View, weights DCGWeights) map[uint64]graph.ContractFeatures {
+	if view == nil || len(view.Events) == 0 {
+		return nil
 	}
+	if weights == DefaultDCGWeights() {
+		return view.AllContractFeatures()
+	}
+	return graph.ComputeContractFeaturesWithWeights(view.Events, weights)
+}
 
-	var zeroReps []repInfo
-	var zeroNonReps []repInfo
+func hasContractViolation(c graph.ContractFeatures) bool {
+	return c.ContractViolationMask != 0 || c.ContractScore > 0
+}
 
-	for _, g := range groups {
-		bestIdx := 0
-		for j := 1; j < len(g.candidates); j++ {
-			if isDCGBetterRep(g.feats[j], g.feats[bestIdx], g.contracts[j], g.contracts[bestIdx], g.candidates[j], g.candidates[bestIdx]) {
-				bestIdx = j
-			}
+func sortDCGViolating(items []dcgCandidate) {
+	sort.Slice(items, func(i, j int) bool {
+		li, lj := contractTierLevel(items[i].contract), contractTierLevel(items[j].contract)
+		if li != lj {
+			return li < lj
 		}
-		zeroReps = append(zeroReps, repInfo{
-			cand:     g.candidates[bestIdx],
-			feat:     g.feats[bestIdx],
-			contract: g.contracts[bestIdx],
-		})
-		for j := 0; j < len(g.candidates); j++ {
-			if j != bestIdx {
-				zeroNonReps = append(zeroNonReps, repInfo{
-					cand:     g.candidates[j],
-					feat:     g.feats[j],
-					contract: g.contracts[j],
-				})
-			}
+		if dec, gt := cmpFloatDesc(items[i].feat.BarrierProximity, items[j].feat.BarrierProximity); dec {
+			return gt
 		}
-	}
+		if dec, gt := cmpFloatDesc(items[i].contract.ContractScore, items[j].contract.ContractScore); dec {
+			return gt
+		}
+		return candidate.Less(items[i].cand, items[j].cand)
+	})
+}
 
-	// 5. Partition representatives into Tier 1 and Tier 2.
-	// Tier 1: Contract violations (ContractScore > 0).
-	// Tier 2: Non-violating state representatives (ContractScore == 0).
-	var tier1 []repInfo
-	var tier2 []repInfo
+func sortDCGClean(items []dcgCandidate) {
+	sort.Slice(items, func(i, j int) bool {
+		if dec, gt := cmpFloatDesc(items[i].feat.BarrierProximity, items[j].feat.BarrierProximity); dec {
+			return gt
+		}
+		if dec, gt := cmpFloatDesc(items[i].feat.RiskScore, items[j].feat.RiskScore); dec {
+			return gt
+		}
+		return candidate.Less(items[i].cand, items[j].cand)
+	})
+}
 
-	for _, rep := range zeroReps {
-		if rep.contract.ContractScore > 0 {
+func rankDCGRepresentatives(reps []dcgCandidate) []candidate.Candidate {
+	var tier1 []dcgCandidate
+	var tier2 []dcgCandidate
+
+	for _, rep := range reps {
+		if hasContractViolation(rep.contract) {
 			tier1 = append(tier1, rep)
 		} else {
 			tier2 = append(tier2, rep)
 		}
 	}
 
-	// Sort Tier 1:
-	// Level 1: Dangling SST / Unpersisted Manifest (MUT-4, MUT-2, MUT-6, MUT-8)
-	// Level 2: Unsynced Directory Rename (MUT-3, MUT-7)
-	// Level 3: AckSyncMissing (MUT-5, MUT-1)
-	// Then: Descending BarrierProximity
-	// Then: Descending ContractScore
-	// Deterministic tie-breaker: candidate.Less
-	sort.Slice(tier1, func(i, j int) bool {
-		li, lj := contractTierLevel(tier1[i].contract), contractTierLevel(tier1[j].contract)
-		if li != lj {
-			return li < lj
-		}
-		if tier1[i].feat.BarrierProximity != tier1[j].feat.BarrierProximity {
-			return tier1[i].feat.BarrierProximity > tier1[j].feat.BarrierProximity
-		}
-		if tier1[i].contract.ContractScore != tier1[j].contract.ContractScore {
-			return tier1[i].contract.ContractScore > tier1[j].contract.ContractScore
-		}
-		return candidate.Less(tier1[i].cand, tier1[j].cand)
-	})
+	sortDCGViolating(tier1)
 
-	// In Tier 2 (ContractScore == 0), separate boundary-adjacent representatives (BarrierProximity >= 1.0 or BeforeBoundary)
-	// from non-boundary representatives.
-	var tier2Barrier []repInfo
-	var tier2NonBarrier []repInfo
-
+	var tier2Barrier []dcgCandidate
+	var tier2NonBarrier []dcgCandidate
 	for _, rep := range tier2 {
 		if rep.feat.BarrierProximity >= 1.0 || rep.feat.BeforeBoundary {
 			tier2Barrier = append(tier2Barrier, rep)
@@ -202,46 +187,37 @@ func (s dcg) Rank(view *graph.View, universe []candidate.Candidate) []candidate.
 	// Diversity-aware interleaving across distinct barrier categories:
 	// Manifest (Tier 4), Dir (Tier 2), Flush (Tier 1), WAL (Tier 3), Data (Tier 0).
 	categoryOrder := []int{graph.TierManifest, graph.TierDir, graph.TierFlush, graph.TierWAL, graph.TierData}
-	buckets := make(map[int][]repInfo)
+	buckets := make(map[int][]dcgCandidate)
 	for _, rep := range tier2Barrier {
-		tier := rep.feat.SemanticTier
-		buckets[tier] = append(buckets[tier], rep)
+		buckets[rep.feat.SemanticTier] = append(buckets[rep.feat.SemanticTier], rep)
 	}
-
-	// Sort inside each bucket by BarrierProximity DESC, RiskScore DESC, then candidate.Less
-	for tier := range buckets {
-		b := buckets[tier]
-		sort.Slice(b, func(i, j int) bool {
-			if b[i].feat.BarrierProximity != b[j].feat.BarrierProximity {
-				return b[i].feat.BarrierProximity > b[j].feat.BarrierProximity
-			}
-			if b[i].feat.RiskScore != b[j].feat.RiskScore {
-				return b[i].feat.RiskScore > b[j].feat.RiskScore
-			}
-			return candidate.Less(b[i].cand, b[j].cand)
-		})
+	for tier, b := range buckets {
+		sortDCGClean(b)
 		buckets[tier] = b
 	}
 
-	bucketIndices := make(map[int]int)
-	var tier2Interleaved []repInfo
-	remaining := len(tier2Barrier)
-
-	// Build a set of tiers that are in categoryOrder for fast lookup.
 	categorySet := make(map[int]bool, len(categoryOrder))
 	for _, cat := range categoryOrder {
 		categorySet[cat] = true
 	}
 
-	// Drain any candidates whose SemanticTier is not in categoryOrder first,
-	// to prevent an infinite loop when unclassified tiers are present.
-	for tier, b := range buckets {
+	var unclassifiedTiers []int
+	for tier := range buckets {
 		if !categorySet[tier] {
-			tier2Interleaved = append(tier2Interleaved, b...)
-			remaining -= len(b)
+			unclassifiedTiers = append(unclassifiedTiers, tier)
 		}
 	}
+	sort.Ints(unclassifiedTiers)
 
+	tier2Interleaved := make([]dcgCandidate, 0, len(tier2Barrier))
+	remaining := len(tier2Barrier)
+	for _, tier := range unclassifiedTiers {
+		b := buckets[tier]
+		tier2Interleaved = append(tier2Interleaved, b...)
+		remaining -= len(b)
+	}
+
+	bucketIndices := make(map[int]int, len(categoryOrder))
 	for remaining > 0 {
 		progress := false
 		for _, cat := range categoryOrder {
@@ -254,96 +230,85 @@ func (s dcg) Rank(view *graph.View, universe []candidate.Candidate) []candidate.
 				progress = true
 			}
 		}
-		// Safety: if no progress was made in a full pass, break to avoid
-		// an infinite loop (should not happen after draining unclassified tiers).
 		if !progress {
 			break
 		}
 	}
 
-	// Sort non-boundary Tier 2 representatives by BarrierProximity DESC, then RiskScore DESC, then candidate.Less
-	sort.Slice(tier2NonBarrier, func(i, j int) bool {
-		if tier2NonBarrier[i].feat.BarrierProximity != tier2NonBarrier[j].feat.BarrierProximity {
-			return tier2NonBarrier[i].feat.BarrierProximity > tier2NonBarrier[j].feat.BarrierProximity
+	sortDCGClean(tier2NonBarrier)
+
+	ranked := make([]candidate.Candidate, 0, len(reps))
+	for _, r := range tier1 {
+		ranked = append(ranked, r.cand)
+	}
+	for _, r := range tier2Interleaved {
+		ranked = append(ranked, r.cand)
+	}
+	for _, r := range tier2NonBarrier {
+		ranked = append(ranked, r.cand)
+	}
+	return ranked
+}
+
+func rankDCGZeroPool(u0 []dcgCandidate) (repsRanked []candidate.Candidate, nonRepsRanked []candidate.Candidate) {
+	if len(u0) == 0 {
+		return nil, nil
+	}
+
+	groupIndex := make(map[string]int)
+	var groups [][]dcgCandidate
+
+	for _, item := range u0 {
+		key := item.feat.StateKey
+		idx, found := groupIndex[key]
+		if !found {
+			idx = len(groups)
+			groupIndex[key] = idx
+			groups = append(groups, nil)
 		}
-		if tier2NonBarrier[i].feat.RiskScore != tier2NonBarrier[j].feat.RiskScore {
-			return tier2NonBarrier[i].feat.RiskScore > tier2NonBarrier[j].feat.RiskScore
+		groups[idx] = append(groups[idx], item)
+	}
+
+	zeroReps := make([]dcgCandidate, 0, len(groups))
+	var zeroNonReps []dcgCandidate
+
+	for _, g := range groups {
+		bestIdx := 0
+		for j := 1; j < len(g); j++ {
+			if isDCGBetterRep(g[j].feat, g[bestIdx].feat, g[j].contract, g[bestIdx].contract, g[j].cand, g[bestIdx].cand) {
+				bestIdx = j
+			}
 		}
-		return candidate.Less(tier2NonBarrier[i].cand, tier2NonBarrier[j].cand)
-	})
+		zeroReps = append(zeroReps, g[bestIdx])
+		for j := 0; j < len(g); j++ {
+			if j != bestIdx {
+				zeroNonReps = append(zeroNonReps, g[j])
+			}
+		}
+	}
 
-	var tier2Sorted []repInfo
-	tier2Sorted = append(tier2Sorted, tier2Interleaved...)
-	tier2Sorted = append(tier2Sorted, tier2NonBarrier...)
+	repsRanked = rankDCGRepresentatives(zeroReps)
 
-	// Tier 3: Partition non-representatives into Tier 3A (violating) and Tier 3B (clean).
-	var tier3Violating []repInfo
-	var tier3Clean []repInfo
-
+	var tier3Violating []dcgCandidate
+	var tier3Clean []dcgCandidate
 	for _, nonRep := range zeroNonReps {
-		if nonRep.contract.ContractScore > 0 {
+		if hasContractViolation(nonRep.contract) {
 			tier3Violating = append(tier3Violating, nonRep)
 		} else {
 			tier3Clean = append(tier3Clean, nonRep)
 		}
 	}
+	sortDCGViolating(tier3Violating)
+	sortDCGClean(tier3Clean)
 
-	// Sort Tier 3 Violating: contractTierLevel ASC, BarrierProximity DESC, ContractScore DESC, candidate.Less
-	sort.Slice(tier3Violating, func(i, j int) bool {
-		li, lj := contractTierLevel(tier3Violating[i].contract), contractTierLevel(tier3Violating[j].contract)
-		if li != lj {
-			return li < lj
-		}
-		if tier3Violating[i].feat.BarrierProximity != tier3Violating[j].feat.BarrierProximity {
-			return tier3Violating[i].feat.BarrierProximity > tier3Violating[j].feat.BarrierProximity
-		}
-		if tier3Violating[i].contract.ContractScore != tier3Violating[j].contract.ContractScore {
-			return tier3Violating[i].contract.ContractScore > tier3Violating[j].contract.ContractScore
-		}
-		return candidate.Less(tier3Violating[i].cand, tier3Violating[j].cand)
-	})
-
-	// Sort Tier 3 Clean: BarrierProximity DESC, RiskScore DESC, candidate.Less
-	sort.Slice(tier3Clean, func(i, j int) bool {
-		if tier3Clean[i].feat.BarrierProximity != tier3Clean[j].feat.BarrierProximity {
-			return tier3Clean[i].feat.BarrierProximity > tier3Clean[j].feat.BarrierProximity
-		}
-		if tier3Clean[i].feat.RiskScore != tier3Clean[j].feat.RiskScore {
-			return tier3Clean[i].feat.RiskScore > tier3Clean[j].feat.RiskScore
-		}
-		return candidate.Less(tier3Clean[i].cand, tier3Clean[j].cand)
-	})
-
-	// Tier 4: Non-zero retention candidates (uNonZero) sorted by retention percent ascending, then canonically.
-	sort.Slice(uNonZero, func(i, j int) bool {
-		if uNonZero[i].Percent != uNonZero[j].Percent {
-			return uNonZero[i].Percent < uNonZero[j].Percent
-		}
-		return candidate.Less(uNonZero[i], uNonZero[j])
-	})
-
-	// 6. Concatenate tiers:
-	ranking := make([]candidate.Candidate, 0, len(ordered))
-	for _, r := range tier1 {
-		ranking = append(ranking, r.cand)
-	}
-	for _, r := range tier2Sorted {
-		ranking = append(ranking, r.cand)
-	}
+	nonRepsRanked = make([]candidate.Candidate, 0, len(zeroNonReps))
 	for _, r := range tier3Violating {
-		ranking = append(ranking, r.cand)
+		nonRepsRanked = append(nonRepsRanked, r.cand)
 	}
 	for _, r := range tier3Clean {
-		ranking = append(ranking, r.cand)
+		nonRepsRanked = append(nonRepsRanked, r.cand)
 	}
-	ranking = append(ranking, uNonZero...)
-
-	// 7. Strictly validate permutation bijection.
-	if err := ValidatePermutation(universe, ranking); err != nil {
-		return canonical(universe)
-	}
-
-	return ranking
+	return repsRanked, nonRepsRanked
 }
 
 func contractTierLevel(c graph.ContractFeatures) int {
@@ -364,17 +329,17 @@ func isDCGBetterRep(fA, fB graph.Features, cA, cB graph.ContractFeatures, candA,
 	if lA != lB {
 		return lA < lB
 	}
-	if cA.ContractScore != cB.ContractScore {
-		return cA.ContractScore > cB.ContractScore
+	if dec, gt := cmpFloatDesc(cA.ContractScore, cB.ContractScore); dec {
+		return gt
 	}
 	if fA.BeforeBoundary != fB.BeforeBoundary {
 		return fA.BeforeBoundary
 	}
-	if fA.BarrierProximity != fB.BarrierProximity {
-		return fA.BarrierProximity > fB.BarrierProximity
+	if dec, gt := cmpFloatDesc(fA.BarrierProximity, fB.BarrierProximity); dec {
+		return gt
 	}
-	if fA.RiskScore != fB.RiskScore {
-		return fA.RiskScore > fB.RiskScore
+	if dec, gt := cmpFloatDesc(fA.RiskScore, fB.RiskScore); dec {
+		return gt
 	}
 	return candidate.Less(candA, candB)
 }
@@ -387,13 +352,14 @@ type dcgFlagOnly struct {
 
 // NewDCGFlagOnly creates the DCG-FlagOnly ablation strategy:
 // It collapses the U_0 candidate universe into canonical persistence state representatives,
-// partitions representatives into Tier 1 (ContractScore > 0) and Tier 2 (ContractScore == 0),
+// partitions representatives into Tier 1 (contract violation) and Tier 2 (clean),
 // and shuffles randomly within tiers using independent deterministic PCG generators:
 // - Tier 1 reps shuffled with rand.NewPCG(0, s.seed)
 // - Tier 2 reps shuffled with rand.NewPCG(1, s.seed)
 // - Non-reps (Tier 3) shuffled with rand.NewPCG(2, s.seed)
-// - 100% retention (Tier 4) shuffled with rand.NewPCG(3, s.seed)
-// Concatenates Tier 1 + Tier 2 + Tier 3 + Tier 4 and validates permutation bijection.
+// - Partial retention (0 < Percent < 100, Tier 4A) shuffled with rand.NewPCG(4, s.seed)
+// - Remaining non-zero / 100% retention (Tier 4B) shuffled with rand.NewPCG(3, s.seed)
+// Concatenates Tier 1 + Tier 2 + Tier 3 + Tier 4A + Tier 4B and validates permutation bijection.
 func NewDCGFlagOnly(seed uint64) Strategy {
 	return dcgFlagOnly{seed: seed}
 }
@@ -402,61 +368,49 @@ func (dcgFlagOnly) Name() string { return "dcg-flag-only" }
 
 func (s dcgFlagOnly) Rank(view *graph.View, universe []candidate.Candidate) []candidate.Candidate {
 	ordered := canonical(universe)
-	if len(ordered) <= 1 {
-		return ordered
-	}
-	if view == nil {
+	if len(ordered) == 0 {
 		return ordered
 	}
 	labels, ok := features(view, ordered)
 	if !ok {
 		return nil
 	}
-
-	var contractMap map[uint64]graph.ContractFeatures
-	if len(view.Events) > 0 {
-		contractMap = graph.ComputeContractFeaturesWithWeights(view.Events, DefaultDCGWeights())
+	if len(ordered) == 1 {
+		return ordered
 	}
 
-	var u0 []candidate.Candidate
-	var u0Labels []graph.Features
-	var u0Contract []graph.ContractFeatures
-	// uNonZero holds all non-zero retention candidates (e.g. 50% partial retention and 100%).
-	var uNonZero []candidate.Candidate
+	contractMap := contractFeaturesForView(view, DefaultDCGWeights())
+
+	var u0 []dcgCandidate
+	var uMid []candidate.Candidate
+	var u100 []candidate.Candidate
 
 	for i, c := range ordered {
 		if c.Percent == 0 {
-			u0 = append(u0, c)
-			u0Labels = append(u0Labels, labels[i])
+			var cf graph.ContractFeatures
 			if contractMap != nil {
-				u0Contract = append(u0Contract, contractMap[c.Event])
-			} else {
-				u0Contract = append(u0Contract, graph.ContractFeatures{})
+				cf = contractMap[c.Event]
 			}
+			u0 = append(u0, dcgCandidate{cand: c, feat: labels[i], contract: cf})
+		} else if c.Percent > 0 && c.Percent < 100 {
+			uMid = append(uMid, c)
 		} else {
-			uNonZero = append(uNonZero, c)
+			u100 = append(u100, c)
 		}
 	}
 
-	type stateGroup struct {
-		candidates []candidate.Candidate
-		feats      []graph.Features
-		contracts  []graph.ContractFeatures
-	}
 	groupIndex := make(map[string]int)
-	var groups []stateGroup
+	var groups [][]dcgCandidate
 
-	for i, c := range u0 {
-		key := u0Labels[i].StateKey
+	for _, item := range u0 {
+		key := item.feat.StateKey
 		idx, found := groupIndex[key]
 		if !found {
 			idx = len(groups)
 			groupIndex[key] = idx
-			groups = append(groups, stateGroup{})
+			groups = append(groups, nil)
 		}
-		groups[idx].candidates = append(groups[idx].candidates, c)
-		groups[idx].feats = append(groups[idx].feats, u0Labels[i])
-		groups[idx].contracts = append(groups[idx].contracts, u0Contract[i])
+		groups[idx] = append(groups[idx], item)
 	}
 
 	var tier1Reps []candidate.Candidate
@@ -465,29 +419,29 @@ func (s dcgFlagOnly) Rank(view *graph.View, universe []candidate.Candidate) []ca
 
 	for _, g := range groups {
 		bestIdx := 0
-		for j := 1; j < len(g.candidates); j++ {
-			if isDCGBetterRep(g.feats[j], g.feats[bestIdx], g.contracts[j], g.contracts[bestIdx], g.candidates[j], g.candidates[bestIdx]) {
+		for j := 1; j < len(g); j++ {
+			if isDCGBetterRep(g[j].feat, g[bestIdx].feat, g[j].contract, g[bestIdx].contract, g[j].cand, g[bestIdx].cand) {
 				bestIdx = j
 			}
 		}
-		repCand := g.candidates[bestIdx]
-		if g.contracts[bestIdx].ContractScore > 0 {
-			tier1Reps = append(tier1Reps, repCand)
+		rep := g[bestIdx]
+		if hasContractViolation(rep.contract) {
+			tier1Reps = append(tier1Reps, rep.cand)
 		} else {
-			tier2Reps = append(tier2Reps, repCand)
+			tier2Reps = append(tier2Reps, rep.cand)
 		}
-		for j := 0; j < len(g.candidates); j++ {
+		for j := 0; j < len(g); j++ {
 			if j != bestIdx {
-				zeroNonReps = append(zeroNonReps, g.candidates[j])
+				zeroNonReps = append(zeroNonReps, g[j].cand)
 			}
 		}
 	}
 
-	// Ensure canonical sorting before shuffling for determinism
+	// Ensure canonical sorting before shuffling for determinism.
+	// uMid and u100 were appended from ordered (canonical) and are already sorted.
 	candidate.Sort(tier1Reps)
 	candidate.Sort(tier2Reps)
 	candidate.Sort(zeroNonReps)
-	candidate.Sort(uNonZero)
 
 	rng0 := rand.New(rand.NewPCG(0, s.seed))
 	rng0.Shuffle(len(tier1Reps), func(i, j int) { tier1Reps[i], tier1Reps[j] = tier1Reps[j], tier1Reps[i] })
@@ -498,17 +452,23 @@ func (s dcgFlagOnly) Rank(view *graph.View, universe []candidate.Candidate) []ca
 	rng2 := rand.New(rand.NewPCG(2, s.seed))
 	rng2.Shuffle(len(zeroNonReps), func(i, j int) { zeroNonReps[i], zeroNonReps[j] = zeroNonReps[j], zeroNonReps[i] })
 
+	if len(uMid) > 0 {
+		rngMid := rand.New(rand.NewPCG(4, s.seed))
+		rngMid.Shuffle(len(uMid), func(i, j int) { uMid[i], uMid[j] = uMid[j], uMid[i] })
+	}
+
 	rng3 := rand.New(rand.NewPCG(3, s.seed))
-	rng3.Shuffle(len(uNonZero), func(i, j int) { uNonZero[i], uNonZero[j] = uNonZero[j], uNonZero[i] })
+	rng3.Shuffle(len(u100), func(i, j int) { u100[i], u100[j] = u100[j], u100[i] })
 
 	result := make([]candidate.Candidate, 0, len(ordered))
 	result = append(result, tier1Reps...)
 	result = append(result, tier2Reps...)
 	result = append(result, zeroNonReps...)
-	result = append(result, uNonZero...)
+	result = append(result, uMid...)
+	result = append(result, u100...)
 
 	if err := ValidatePermutation(universe, result); err != nil {
-		return canonical(universe)
+		return nil
 	}
 	return result
 }
@@ -524,151 +484,131 @@ type dcgPartial struct {
 // ranking as dcg. When intermediate-retention candidates (0 < Percent < 100) are
 // present, it places representatives whose cutoff has UnsyncedDirEntryCount >= 2
 // at the front of Tier 1, followed by standard dcg 0% Tier 1, then 0% Tier 2,
-// then remaining intermediate-retention candidates, then non-representatives, then
-// 100% candidates.
+// then remaining intermediate-retention representatives (ranked by contract
+// tier/proximity/risk), then non-representatives, then 100% candidates.
 func NewDCGPartial(weights ...DCGWeights) Strategy {
-	w := DefaultDCGWeights()
-	if len(weights) > 0 {
-		w = weights[0]
-	}
-	return dcgPartial{weights: w}
+	return dcgPartial{weights: sanitizeDCGWeights(weights...)}
 }
 
 func (dcgPartial) Name() string { return "dcg-pr" }
 
 func (s dcgPartial) Rank(view *graph.View, universe []candidate.Candidate) []candidate.Candidate {
 	ordered := canonical(universe)
-	if len(ordered) <= 1 {
-		return ordered
-	}
-	if view == nil {
+	if len(ordered) == 0 {
 		return ordered
 	}
 	labels, ok := features(view, ordered)
 	if !ok {
 		return nil
 	}
-
-	// Compute contract features.
-	var contractMap map[uint64]graph.ContractFeatures
-	if len(view.Events) > 0 {
-		contractMap = graph.ComputeContractFeaturesWithWeights(view.Events, s.weights)
+	if len(ordered) == 1 {
+		return ordered
 	}
 
-	// Separate by retention policy.
-	var u0 []candidate.Candidate
-	var u0Labels []graph.Features
-	var u0Contract []graph.ContractFeatures
-	var uMid []candidate.Candidate
-	var uMidLabels []graph.Features
-	var uMidContract []graph.ContractFeatures
+	contractMap := contractFeaturesForView(view, s.weights)
+
+	var u0 []dcgCandidate
+	var uMid []dcgCandidate
 	var u100 []candidate.Candidate
 
 	for i, c := range ordered {
-		cf := graph.ContractFeatures{}
+		var cf graph.ContractFeatures
 		if contractMap != nil {
 			cf = contractMap[c.Event]
 		}
 		if c.Percent == 0 {
-			u0 = append(u0, c)
-			u0Labels = append(u0Labels, labels[i])
-			u0Contract = append(u0Contract, cf)
-		} else if c.Percent == 100 {
-			u100 = append(u100, c)
+			u0 = append(u0, dcgCandidate{cand: c, feat: labels[i], contract: cf})
+		} else if c.Percent > 0 && c.Percent < 100 {
+			uMid = append(uMid, dcgCandidate{cand: c, feat: labels[i], contract: cf})
 		} else {
-			uMid = append(uMid, c)
-			uMidLabels = append(uMidLabels, labels[i])
-			uMidContract = append(uMidContract, cf)
+			u100 = append(u100, c)
 		}
 	}
 
-	// If no intermediate candidates, fall back to exact dcg ranking.
-	if len(uMid) == 0 {
-		base := dcg{weights: s.weights}
-		return base.Rank(view, universe)
-	}
+	dcg0Reps, dcg0NonReps := rankDCGZeroPool(u0)
+	sort.Slice(u100, func(i, j int) bool {
+		if u100[i].Percent != u100[j].Percent {
+			return u100[i].Percent < u100[j].Percent
+		}
+		return candidate.Less(u100[i], u100[j])
+	})
 
-	// Build the standard dcg ranking for 0% candidates (for Tier 1 and Tier 2).
-	// We reuse dcg.Rank on a sub-universe of just 0% and 100% to get the ordering.
-	// Then we prepend intermediate-retention representatives with UnsyncedDirEntryCount >= 2.
+	// If no intermediate candidates, match standard dcg ranking without recomputing contracts.
+	if len(uMid) == 0 {
+		ranking := make([]candidate.Candidate, 0, len(ordered))
+		ranking = append(ranking, dcg0Reps...)
+		ranking = append(ranking, dcg0NonReps...)
+		ranking = append(ranking, u100...)
+		if err := ValidatePermutation(universe, ranking); err != nil {
+			return nil
+		}
+		return ranking
+	}
 
 	// Group intermediate-retention candidates by (StateKey, Percent) and select one
-	// canonical representative per group using isDCGBetterRep (preferring cutoffs with
-	// UnsyncedDirEntryCount >= 2).
-	type midGroup struct {
-		key        string
-		candidates []candidate.Candidate
-		feats      []graph.Features
-		contracts  []graph.ContractFeatures
-	}
-	midGroupIndex := make(map[string]int)
-	var midGroups []midGroup
+	// canonical representative per group (preferring higher UnsyncedDirEntryCount when >= 2,
+	// then isDCGBetterRep).
+	midGroupIndex := make(map[statePercentKey]int)
+	var midGroups [][]dcgCandidate
 
-	for i, c := range uMid {
-		key := fmt.Sprintf("%s|%d", uMidLabels[i].StateKey, c.Percent)
+	for _, item := range uMid {
+		key := statePercentKey{state: item.feat.StateKey, percent: item.cand.Percent}
 		idx, found := midGroupIndex[key]
 		if !found {
 			idx = len(midGroups)
 			midGroupIndex[key] = idx
-			midGroups = append(midGroups, midGroup{key: key})
+			midGroups = append(midGroups, nil)
 		}
-		midGroups[idx].candidates = append(midGroups[idx].candidates, c)
-		midGroups[idx].feats = append(midGroups[idx].feats, uMidLabels[i])
-		midGroups[idx].contracts = append(midGroups[idx].contracts, uMidContract[i])
+		midGroups[idx] = append(midGroups[idx], item)
 	}
 
-	type midRepInfo struct {
-		cand     candidate.Candidate
-		feat     graph.Features
-		contract graph.ContractFeatures
-	}
-
-	var midRepsHighUnsynced []midRepInfo // UnsyncedDirEntryCount >= 2
-	var midRepsOther []midRepInfo        // other intermediate reps
+	var midRepsHighUnsynced []dcgCandidate // UnsyncedDirEntryCount >= 2
+	var midRepsOther []dcgCandidate        // other intermediate reps
 	var midNonReps []candidate.Candidate
 
 	for _, g := range midGroups {
 		bestIdx := 0
-		for j := 1; j < len(g.candidates); j++ {
-			// Prefer UnsyncedDirEntryCount >= 2, then isDCGBetterRep.
-			aHigh := g.contracts[j].UnsyncedDirEntryCount >= 2
-			bHigh := g.contracts[bestIdx].UnsyncedDirEntryCount >= 2
-			if aHigh && !bHigh {
-				bestIdx = j
+		for j := 1; j < len(g); j++ {
+			aHigh := g[j].contract.UnsyncedDirEntryCount >= 2
+			bHigh := g[bestIdx].contract.UnsyncedDirEntryCount >= 2
+			if aHigh != bHigh {
+				if aHigh {
+					bestIdx = j
+				}
 				continue
 			}
-			if bHigh && !aHigh {
+			if aHigh && bHigh && g[j].contract.UnsyncedDirEntryCount != g[bestIdx].contract.UnsyncedDirEntryCount {
+				if g[j].contract.UnsyncedDirEntryCount > g[bestIdx].contract.UnsyncedDirEntryCount {
+					bestIdx = j
+				}
 				continue
 			}
-			if isDCGBetterRep(g.feats[j], g.feats[bestIdx], g.contracts[j], g.contracts[bestIdx], g.candidates[j], g.candidates[bestIdx]) {
+			if isDCGBetterRep(g[j].feat, g[bestIdx].feat, g[j].contract, g[bestIdx].contract, g[j].cand, g[bestIdx].cand) {
 				bestIdx = j
 			}
 		}
-		rep := midRepInfo{
-			cand:     g.candidates[bestIdx],
-			feat:     g.feats[bestIdx],
-			contract: g.contracts[bestIdx],
-		}
+		rep := g[bestIdx]
 		if rep.contract.UnsyncedDirEntryCount >= 2 {
 			midRepsHighUnsynced = append(midRepsHighUnsynced, rep)
 		} else {
 			midRepsOther = append(midRepsOther, rep)
 		}
-		for j := 0; j < len(g.candidates); j++ {
+		for j := 0; j < len(g); j++ {
 			if j != bestIdx {
-				midNonReps = append(midNonReps, g.candidates[j])
+				midNonReps = append(midNonReps, g[j].cand)
 			}
 		}
 	}
 
-	// Sort midRepsHighUnsynced: BeforeBoundary DESC, BarrierProximity DESC, UnsyncedDirEntryCount DESC, SemanticTier DESC, RiskScore DESC, candidate.Less.
+	// Sort midRepsHighUnsynced: BeforeBoundary DESC, BarrierProximity DESC,
+	// UnsyncedDirEntryCount DESC, SemanticTier DESC, RiskScore DESC, candidate.Less.
 	sort.Slice(midRepsHighUnsynced, func(i, j int) bool {
 		a, b := midRepsHighUnsynced[i], midRepsHighUnsynced[j]
 		if a.feat.BeforeBoundary != b.feat.BeforeBoundary {
 			return a.feat.BeforeBoundary
 		}
-		if a.feat.BarrierProximity != b.feat.BarrierProximity {
-			return a.feat.BarrierProximity > b.feat.BarrierProximity
+		if dec, gt := cmpFloatDesc(a.feat.BarrierProximity, b.feat.BarrierProximity); dec {
+			return gt
 		}
 		if a.contract.UnsyncedDirEntryCount != b.contract.UnsyncedDirEntryCount {
 			return a.contract.UnsyncedDirEntryCount > b.contract.UnsyncedDirEntryCount
@@ -676,50 +616,14 @@ func (s dcgPartial) Rank(view *graph.View, universe []candidate.Candidate) []can
 		if a.feat.SemanticTier != b.feat.SemanticTier {
 			return a.feat.SemanticTier > b.feat.SemanticTier
 		}
-		if a.feat.RiskScore != b.feat.RiskScore {
-			return a.feat.RiskScore > b.feat.RiskScore
+		if dec, gt := cmpFloatDesc(a.feat.RiskScore, b.feat.RiskScore); dec {
+			return gt
 		}
 		return candidate.Less(a.cand, b.cand)
 	})
 
-	// Get the standard dcg ordering for the 0% + 100% sub-universe.
-	subUniverse := make([]candidate.Candidate, 0, len(u0)+len(u100))
-	subUniverse = append(subUniverse, u0...)
-	subUniverse = append(subUniverse, u100...)
-
-	base := dcg{weights: s.weights}
-	dcgSubRanked := base.Rank(view, subUniverse)
-
-	// Split dcgSubRanked into 0% part (Tier 1+2 reps + Tier 3 non-reps) and 100% part.
-	var dcg0Ranked []candidate.Candidate
-	var dcg100Ranked []candidate.Candidate
-	for _, c := range dcgSubRanked {
-		if c.Percent == 0 {
-			dcg0Ranked = append(dcg0Ranked, c)
-		} else {
-			dcg100Ranked = append(dcg100Ranked, c)
-		}
-	}
-
-	// In dcg.Rank, 0% state representatives (Tier 1 + Tier 2) precede 0% non-representatives
-	// (Tier 3). Count distinct StateKeys in u0 to separate Tier 1+2 reps from Tier 3 non-reps.
-	u0Keys := make(map[string]bool, len(u0))
-	for _, l := range u0Labels {
-		u0Keys[l.StateKey] = true
-	}
-	num0Reps := len(u0Keys)
-	if num0Reps > len(dcg0Ranked) {
-		num0Reps = len(dcg0Ranked)
-	}
-	dcg0Reps := dcg0Ranked[:num0Reps]
-	dcg0NonReps := dcg0Ranked[num0Reps:]
-
-	// Sort midRepsOther canonically.
-	sort.Slice(midRepsOther, func(i, j int) bool {
-		return candidate.Less(midRepsOther[i].cand, midRepsOther[j].cand)
-	})
+	midRepsOtherRanked := rankDCGRepresentatives(midRepsOther)
 	candidate.Sort(midNonReps)
-	candidate.Sort(dcg100Ranked)
 
 	// Assemble final ranking:
 	// 1. Intermediate reps with UnsyncedDirEntryCount >= 2 (front of Tier 1)
@@ -732,15 +636,13 @@ func (s dcgPartial) Rank(view *graph.View, universe []candidate.Candidate) []can
 		ranking = append(ranking, r.cand)
 	}
 	ranking = append(ranking, dcg0Reps...)
-	for _, r := range midRepsOther {
-		ranking = append(ranking, r.cand)
-	}
+	ranking = append(ranking, midRepsOtherRanked...)
 	ranking = append(ranking, dcg0NonReps...)
 	ranking = append(ranking, midNonReps...)
-	ranking = append(ranking, dcg100Ranked...)
+	ranking = append(ranking, u100...)
 
 	if err := ValidatePermutation(universe, ranking); err != nil {
-		return canonical(universe)
+		return nil
 	}
 	return ranking
 }

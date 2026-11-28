@@ -2,6 +2,7 @@ package history_test
 
 import (
 	"bytes"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -89,11 +90,33 @@ func TestHistoryEncodeDecode(t *testing.T) {
 		t.Fatalf("Decode: %v", err)
 	}
 
-	if len(decoded) != len(entries) {
-		t.Fatalf("decoded len %d != %d", len(decoded), len(entries))
+	if !reflect.DeepEqual(decoded, entries) {
+		t.Fatalf("decoded ledger mismatch:\ngot:  %+v\nwant: %+v", decoded, entries)
 	}
-	if string(decoded[0].Mutations[0].Key) != "k1" {
-		t.Fatalf("decoded key mismatch: %q", string(decoded[0].Mutations[0].Key))
+
+	for _, emptyCase := range []struct {
+		name    string
+		entries []history.Entry
+	}{
+		{name: "nil", entries: nil},
+		{name: "empty", entries: []history.Entry{}},
+	} {
+		t.Run(emptyCase.name, func(t *testing.T) {
+			buf.Reset()
+			if err := history.Encode(&buf, emptyCase.entries); err != nil {
+				t.Fatalf("Encode(%s): %v", emptyCase.name, err)
+			}
+			if !strings.Contains(buf.String(), `"entries":[]`) {
+				t.Fatalf("Encode(%s) must serialize non-null array, got: %s", emptyCase.name, buf.String())
+			}
+			dec, err := history.Decode(&buf)
+			if err != nil {
+				t.Fatalf("Decode(%s): %v", emptyCase.name, err)
+			}
+			if dec == nil || len(dec) != 0 {
+				t.Fatalf("Decode(%s) = %#v, want non-nil empty slice", emptyCase.name, dec)
+			}
+		})
 	}
 }
 
@@ -114,6 +137,16 @@ func TestHistoryDecodeStrictness(t *testing.T) {
 	jsonTrailing := `{"schema_version":1,"entries":[]} trailing`
 	if _, err := history.Decode(strings.NewReader(jsonTrailing)); err == nil {
 		t.Fatalf("expected error for trailing data, got nil")
+	}
+
+	// 4. Null or missing entries array.
+	for _, doc := range []string{
+		`{"schema_version":1,"entries":null}`,
+		`{"schema_version":1}`,
+	} {
+		if _, err := history.Decode(strings.NewReader(doc)); err == nil {
+			t.Fatalf("expected error for %s, got nil", doc)
+		}
 	}
 }
 
@@ -152,6 +185,42 @@ func TestHistoryMalformedCases(t *testing.T) {
 		},
 		"set with end": func(e *history.Entry) {
 			e.Mutations[0].End = []byte("end")
+		},
+		"range_delete with value": func(e *history.Entry) {
+			e.Kind = "range_delete"
+			e.Mutations[0] = history.Mutation{Kind: "range_delete", Key: []byte("a"), Value: []byte("v"), End: []byte("z")}
+		},
+		"batch unknown mutation kind": func(e *history.Entry) {
+			e.Kind = "batch"
+			e.Mutations = []history.Mutation{{Kind: "merge", Key: []byte("a"), Value: []byte("v")}}
+		},
+		"batch set with end": func(e *history.Entry) {
+			e.Kind = "batch"
+			e.Mutations = []history.Mutation{{Kind: "set", Key: []byte("a"), Value: []byte("v"), End: []byte("z")}}
+		},
+		"batch delete with value": func(e *history.Entry) {
+			e.Kind = "batch"
+			e.Mutations = []history.Mutation{{Kind: "delete", Key: []byte("a"), Value: []byte("v")}}
+		},
+		"batch delete with end": func(e *history.Entry) {
+			e.Kind = "batch"
+			e.Mutations = []history.Mutation{{Kind: "delete", Key: []byte("a"), End: []byte("z")}}
+		},
+		"batch range_delete with value": func(e *history.Entry) {
+			e.Kind = "batch"
+			e.Mutations = []history.Mutation{{Kind: "range_delete", Key: []byte("a"), Value: []byte("v"), End: []byte("z")}}
+		},
+		"batch range_delete key >= end": func(e *history.Entry) {
+			e.Kind = "batch"
+			e.Mutations = []history.Mutation{{Kind: "range_delete", Key: []byte("z"), End: []byte("a")}}
+		},
+		"ingest non-set mutation": func(e *history.Entry) {
+			e.Kind = "ingest"
+			e.Mutations = []history.Mutation{{Kind: "delete", Key: []byte("a")}}
+		},
+		"ingest set with end": func(e *history.Entry) {
+			e.Kind = "ingest"
+			e.Mutations = []history.Mutation{{Kind: "set", Key: []byte("a"), Value: []byte("v"), End: []byte("z")}}
 		},
 	}
 

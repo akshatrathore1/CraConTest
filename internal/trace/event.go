@@ -1,8 +1,9 @@
 // Package trace defines the event schema for VFS operation traces.
 //
-// A trace is a sequence of events recording every mutating filesystem
-// call made by Pebble during a workload run. Events are the primary
-// input to the dependency graph builder and the replay engine.
+// A trace is a sequence of filesystem VFS call events (mutations, opens,
+// reads, closes, locks) and operation/engine annotation events recorded during
+// a workload run. Events are the primary input to the dependency graph
+// builder and the replay engine.
 package trace
 
 // Kind identifies the type of a VFS operation or annotation event.
@@ -55,7 +56,7 @@ type Event struct {
 	// File2 is the destination path for Rename, Link and ReuseForWrite.
 	File2 string `json:"file2,omitempty"`
 
-	// Off is the input offset for Read, Write and WriteAt.
+	// Off is the input offset for Read, Write, WriteAt and Preallocate.
 	Off int64 `json:"off,omitempty"`
 
 	// Len is the returned byte count for Read, Write and WriteAt.
@@ -88,10 +89,10 @@ type Event struct {
 	// Dir indicates whether the resource handle refers to a directory.
 	Dir bool `json:"dir,omitempty"`
 
-	// Created indicates whether an OpenReadWrite or Create call newly created the file.
+	// Created indicates whether a successful OpenReadWrite call newly created the file.
 	Created bool `json:"created,omitempty"`
 
-	// Size records the requested length on SyncTo or requested byte count on Read.
+	// Size records the requested length on SyncTo or Preallocate, or requested byte count on Read.
 	Size int64 `json:"size,omitempty"`
 
 	// Mode records file permission mode bits on MkdirAll.
@@ -100,7 +101,9 @@ type Event struct {
 	// FullSync indicates whether a SyncTo call achieved a full barrier synchronization.
 	FullSync bool `json:"full_sync,omitempty"`
 
-	// OpKind describes the operation type (e.g., "set", "get", "batch", "flush").
+	// OpKind describes the operation type on OpBegin and OpEnd (e.g., "set", "delete",
+	// "range_delete", "batch", "ingest", "get", "iterate", "flush", "compact",
+	// "checkpoint", "ratchet").
 	OpKind string `json:"op_kind,omitempty"`
 
 	// Job identifies the Pebble background worker job ID for EngineEvents.

@@ -1,2 +1,2 @@
-numpy==2.5.4
-scipy==1.18.1
+# Python analysis dependencies for paired_stats.py (NumPy is resolved transitively by SciPy).
+scipy==1.18.1; python_version >= "3.12"

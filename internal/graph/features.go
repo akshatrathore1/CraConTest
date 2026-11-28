@@ -1,14 +1,50 @@
 package graph
 
 import (
+	"maps"
 	"math"
+	"path"
 	"sort"
 	"strings"
 	"sync"
-	"unsafe"
 
 	"github.com/akshatrathore1/CraConTest/internal/trace"
 )
+
+func pathBase(p string) string {
+	if p == "" {
+		return ""
+	}
+	return path.Base(p)
+}
+
+func isManifestBase(base string) bool {
+	return strings.HasPrefix(base, "MANIFEST") || base == "CURRENT" || strings.HasPrefix(base, "CURRENT.") || strings.HasPrefix(base, "marker.manifest.")
+}
+
+func isManifestDataBase(base string) bool {
+	return strings.HasPrefix(base, "MANIFEST") || base == "CURRENT"
+}
+
+func isWALFile(cat, p string) bool {
+	return cat == "pebble-wal" || strings.HasSuffix(p, ".log")
+}
+
+func isSSTFile(cat, p string) bool {
+	return cat == "pebble-compaction" || cat == "pebble-memtable-flush" || strings.HasSuffix(p, ".sst")
+}
+
+func isManifestDataFile(cat, p string) bool {
+	base := pathBase(p)
+	if strings.HasPrefix(base, "marker.manifest.") {
+		return false
+	}
+	return cat == "pebble-manifest" || isManifestDataBase(base)
+}
+
+func isOptionsPath(p string) bool {
+	return strings.HasPrefix(pathBase(p), "OPTIONS")
+}
 
 // Tier constants for 5-tier discriminative semantic weighting.
 const (
@@ -44,10 +80,8 @@ func TierWeight(tier int) float64 {
 func EventTier(event trace.Event) (int, float64) {
 	// Tier 4 (Manifest VersionEdits): 10.0
 	if event.Cat == "pebble-manifest" ||
-		strings.Contains(event.File, "MANIFEST") ||
-		strings.Contains(event.File, "CURRENT") ||
-		strings.Contains(event.File2, "MANIFEST") ||
-		strings.Contains(event.File2, "CURRENT") ||
+		isManifestBase(pathBase(event.File)) ||
+		isManifestBase(pathBase(event.File2)) ||
 		event.Note == "ManifestCreated" {
 		return TierManifest, 10.0
 	}
@@ -89,11 +123,7 @@ func ResourceTier(categories map[string]bool, aliases map[string]bool, directory
 		return TierManifest, 10.0
 	}
 	for alias := range aliases {
-		base := alias
-		if slash := strings.LastIndexByte(alias, '/'); slash >= 0 {
-			base = alias[slash+1:]
-		}
-		if base == "CURRENT" || strings.HasPrefix(base, "MANIFEST") {
+		if isManifestBase(pathBase(alias)) {
 			return TierManifest, 10.0
 		}
 	}
@@ -114,10 +144,22 @@ func ResourceTier(categories map[string]bool, aliases map[string]bool, directory
 	return TierData, 0.0
 }
 
-// CutoffTier computes the effective semantic tier and weight for a cutoff.
-// If the cutoff immediately precedes a barrier, the tier of that enclosing
-// barrier promotes the cutoff's tier if higher.
-func CutoffTier(events []trace.Event, cut uint64, anchor uint64, nextBarrier uint64, r *resource) (int, float64) {
+func isWALResource(r *resource) bool {
+	if r == nil || r.directory {
+		return false
+	}
+	if r.categories["pebble-wal"] {
+		return true
+	}
+	for alias := range r.aliases {
+		if strings.HasSuffix(alias, ".log") {
+			return true
+		}
+	}
+	return false
+}
+
+func cutoffTierFromCausal(events []trace.Event, cut uint64, anchor uint64, nextBarrier uint64, anchorTier int, anchorWeight float64, barrierTier int, barrierWeight float64) (int, float64) {
 	bestTier := TierData
 	bestWeight := 0.0
 
@@ -130,25 +172,38 @@ func CutoffTier(events []trace.Event, cut uint64, anchor uint64, nextBarrier uin
 		}
 	}
 
-	// Check resource categories if present.
-	if r != nil {
-		t, w := ResourceTier(r.categories, r.aliases, r.directory)
-		if w > bestWeight {
-			bestTier = t
-			bestWeight = w
-		}
+	// Check causal resource state at cutoff.
+	if anchorWeight > bestWeight {
+		bestTier = anchorTier
+		bestWeight = anchorWeight
 	}
 
-	// If cutoff immediately precedes a barrier, that barrier determines the omission target.
+	// If cutoff immediately precedes a barrier, that barrier (and its resource) promotes the tier if higher.
 	if nextBarrier > 0 && cut == nextBarrier-1 && int(nextBarrier) <= len(events) {
 		t, w := EventTier(events[nextBarrier-1])
 		if w > bestWeight {
 			bestTier = t
 			bestWeight = w
 		}
+		if barrierWeight > bestWeight {
+			bestTier = barrierTier
+			bestWeight = barrierWeight
+		}
 	}
 
 	return bestTier, bestWeight
+}
+
+// CutoffTier computes the effective semantic tier and weight for a cutoff.
+// If the cutoff immediately precedes a barrier, the tier of that enclosing
+// barrier promotes the cutoff's tier if higher.
+func CutoffTier(events []trace.Event, cut uint64, anchor uint64, nextBarrier uint64, r *resource) (int, float64) {
+	var anchorTier int
+	var anchorWeight float64
+	if r != nil {
+		anchorTier, anchorWeight = ResourceTier(r.categories, r.aliases, r.directory)
+	}
+	return cutoffTierFromCausal(events, cut, anchor, nextBarrier, anchorTier, anchorWeight, TierData, 0.0)
 }
 
 // extractBarriers finds all barrier and rename event IDs in the trace in ascending order.
@@ -166,24 +221,19 @@ func extractBarriers(events []trace.Event) []uint64 {
 // to the nearest enclosing subsequent barrier, and returns that barrier's event ID.
 // When cut == barrier - 1 (immediately before the barrier), delta is 0 and proximity is 1.0.
 func computeBarrierProximity(cut uint64, barriers []uint64) (float64, uint64) {
-	// Binary search or linear scan for the smallest barrier > cut
-	for _, b := range barriers {
-		if b > cut {
-			delta := (b - 1) - cut
-			proximity := 1.0 / (1.0 + float64(delta))
-			return proximity, b
-		}
+	idx := sort.Search(len(barriers), func(i int) bool { return barriers[i] > cut })
+	if idx < len(barriers) {
+		b := barriers[idx]
+		delta := (b - 1) - cut
+		proximity := 1.0 / (1.0 + float64(delta))
+		return proximity, b
 	}
 	return 0.0, 0
 }
 
-// computeResourceDirtyBytes calculates the unpersisted dirty byte count on a resource.
-func computeResourceDirtyBytes(r *resource) uint64 {
-	if r.directory {
-		return 0
-	}
+func sumIntervals(spans []interval) uint64 {
 	var total uint64
-	for _, span := range r.dirty {
+	for _, span := range spans {
 		if span.end > span.start {
 			total += uint64(span.end - span.start)
 		}
@@ -191,35 +241,52 @@ func computeResourceDirtyBytes(r *resource) uint64 {
 	return total
 }
 
+// computeResourceDirtyBytes calculates the unpersisted dirty byte count on a resource.
+func computeResourceDirtyBytes(r *resource) uint64 {
+	if r.directory {
+		return 0
+	}
+	return sumIntervals(r.dirty)
+}
+
 // resourceCategoryWeight returns the discriminative weight for dirty byte volume on a resource.
 func resourceCategoryWeight(r *resource) float64 {
-	if r.categories["pebble-manifest"] {
-		return 10.0
+	tier, w := ResourceTier(r.categories, r.aliases, r.directory)
+	if tier == TierData {
+		return 1.0
 	}
-	for alias := range r.aliases {
-		base := alias
-		if slash := strings.LastIndexByte(alias, '/'); slash >= 0 {
-			base = alias[slash+1:]
+	return w
+}
+
+// computeRiskHorizonParts calculates the dirty bytes, dirty byte risk, and pending risk
+// components over only active dirty resources and pending entries.
+func computeRiskHorizonParts(resources map[uint64]*resource, dirtyResources map[uint64]bool, pending []pendingEntry) (uint64, float64, float64) {
+	var totalDirtyBytes uint64
+	var dirtyRisk float64
+
+	if len(dirtyResources) > 0 {
+		ids := make([]uint64, 0, len(dirtyResources))
+		for id := range dirtyResources {
+			ids = append(ids, id)
 		}
-		if base == "CURRENT" || strings.HasPrefix(base, "MANIFEST") {
-			return 10.0
+		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+
+		for _, id := range ids {
+			r := resources[id]
+			if r == nil || r.directory {
+				continue
+			}
+			bytes := computeResourceDirtyBytes(r)
+			if bytes > 0 {
+				totalDirtyBytes += bytes
+				w := resourceCategoryWeight(r)
+				dirtyRisk += w * math.Log1p(float64(bytes))
+			}
 		}
 	}
-	if r.categories["pebble-wal"] {
-		return 8.0
-	}
-	for alias := range r.aliases {
-		if strings.HasSuffix(alias, ".log") {
-			return 8.0
-		}
-	}
-	if r.directory {
-		return 6.0
-	}
-	if r.categories["pebble-memtable-flush"] {
-		return 2.0
-	}
-	return 1.0
+
+	pendingRisk := 6.0 * float64(len(pending))
+	return totalDirtyBytes, dirtyRisk, pendingRisk
 }
 
 // computeRiskHorizon calculates the backward unpersisted dirty byte volume,
@@ -228,33 +295,14 @@ func resourceCategoryWeight(r *resource) float64 {
 //
 //	RiskScore = sum_{r in dirty} w_cat(r) * ln(1 + DirtyBytes(r)) + 6.0 * len(pending) + 4.0 * uncommittedMutatingOps
 func computeRiskHorizon(resources map[uint64]*resource, pending []pendingEntry, uncommittedMutatingOps uint64) (uint64, float64) {
-	var totalDirtyBytes uint64
-	var dirtyRisk float64
-
-	ids := make([]uint64, 0, len(resources))
-	for id := range resources {
-		ids = append(ids, id)
-	}
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-
-	for _, id := range ids {
-		r := resources[id]
-		if r.directory {
-			continue
-		}
-		bytes := computeResourceDirtyBytes(r)
-		if bytes > 0 {
-			totalDirtyBytes += bytes
-			w := resourceCategoryWeight(r)
-			dirtyRisk += w * math.Log1p(float64(bytes))
+	dirtySet := make(map[uint64]bool)
+	for id, r := range resources {
+		if len(r.dirty) > 0 {
+			dirtySet[id] = true
 		}
 	}
-
-	pendingRisk := 6.0 * float64(len(pending))
-	syncRisk := 4.0 * float64(uncommittedMutatingOps)
-
-	riskScore := dirtyRisk + pendingRisk + syncRisk
-	return totalDirtyBytes, riskScore
+	totalDirtyBytes, dirtyRisk, pendingRisk := computeRiskHorizonParts(resources, dirtySet, pending)
+	return totalDirtyBytes, dirtyRisk + pendingRisk + 4.0*float64(uncommittedMutatingOps)
 }
 
 // Durability Contract Violation bitmask flags.
@@ -318,33 +366,44 @@ type ContractFeatures struct {
 	UnsyncedDirEntryCount int `json:"unsynced_dir_entry_count"`
 }
 
-type writeSpan struct {
-	off int64
-	end int64
+type trackInode struct {
+	size             int64
+	isWAL            bool
+	isSST            bool
+	isCompactionSST  bool
+	isFlushSST       bool
+	isManifest       bool
+	isDir            bool
+	hasSyncedData    bool
+	dirtySpans       []interval
+	dirtyBytes       uint64
+	openHandles      int
+	createdEvent     uint64
+	closedEvent      uint64
+	closedWhileDirty bool
+	flushJob         uint64
+	entries          map[*trackFileInfo]bool
 }
 
 type trackFileInfo struct {
 	path                string
 	parentDir           string
 	dirEntrySynced      bool
-	size                int64
-	isWAL               bool
-	isSST               bool
-	isCompactionSST     bool
-	isFlushSST          bool
-	isManifest          bool
-	isDir               bool
-	dirtySpans          []writeSpan
-	dirtyBytes          uint64
-	createdEvent        uint64
-	closedWhileDirty    bool
 	stagedInManifest    bool
 	committedInManifest bool
+	removed             bool
+	inode               *trackInode
+}
+
+type trackHandle struct {
+	inode *trackInode
+	entry *trackFileInfo
 }
 
 type opWalWrite struct {
-	file string
-	span writeSpan
+	entry *trackFileInfo
+	inode *trackInode
+	spans []interval
 }
 
 type renameRecord struct {
@@ -352,14 +411,17 @@ type renameRecord struct {
 	to         string
 	isCritical bool
 	dir        string
+	srcDir     string
+	dstSynced  bool
+	srcSynced  bool
 	eventID    uint64
 	violating  bool
 }
 
 type contractCacheEntry struct {
-	ptr     uintptr
 	length  int
-	hash    uint64
+	hash1   uint64
+	hash2   uint64
 	weights DCGWeights
 	cuts    map[uint64]ContractFeatures
 }
@@ -369,64 +431,71 @@ var (
 	contractCache   = make([]contractCacheEntry, 0, 16)
 )
 
-func traceFingerprint(events []trace.Event) uint64 {
-	h := uint64(14695981039346656037)
-	const prime = 1099511628211
-	for i := range events {
-		h ^= uint64(events[i].ID)
-		h *= prime
-		for j := 0; j < len(events[i].Kind); j++ {
-			h ^= uint64(events[i].Kind[j])
-			h *= prime
-		}
-		for j := 0; j < len(events[i].File); j++ {
-			h ^= uint64(events[i].File[j])
-			h *= prime
-		}
-		for j := 0; j < len(events[i].File2); j++ {
-			h ^= uint64(events[i].File2[j])
-			h *= prime
-		}
-		for j := 0; j < len(events[i].Cat); j++ {
-			h ^= uint64(events[i].Cat[j])
-			h *= prime
-		}
-		for j := 0; j < len(events[i].Err); j++ {
-			h ^= uint64(events[i].Err[j])
-			h *= prime
-		}
-		for j := 0; j < len(events[i].Note); j++ {
-			h ^= uint64(events[i].Note[j])
-			h *= prime
-		}
-		for j := 0; j < len(events[i].OpKind); j++ {
-			h ^= uint64(events[i].OpKind[j])
-			h *= prime
-		}
-		h ^= uint64(events[i].Mode)
-		h *= prime
-		h ^= uint64(events[i].Off)
-		h *= prime
-		h ^= uint64(events[i].Len)
-		h *= prime
-		h ^= events[i].Handle
-		h *= prime
-		h ^= events[i].Op
-		h *= prime
-		h ^= events[i].Job
-		h *= prime
-		h ^= uint64(events[i].Size)
-		h *= prime
-		if events[i].Dir {
-			h ^= 1
-			h *= prime
-		}
-		if events[i].FullSync {
-			h ^= 2
-			h *= prime
+func traceFingerprint(events []trace.Event) (uint64, uint64) {
+	h1 := uint64(14695981039346656037)
+	h2 := uint64(0x9e3779b97f4a7c15)
+	const prime1 = 1099511628211
+	const prime2 = 0xbf58476d1ce4e5b9
+	mixU64 := func(v uint64) {
+		for k := 0; k < 8; k++ {
+			b := v & 0xff
+			h1 ^= b
+			h1 *= prime1
+			h2 ^= b ^ uint64(k+1)
+			h2 *= prime2
+			v >>= 8
 		}
 	}
-	return h
+	mixStr := func(s string) {
+		mixU64(uint64(len(s)))
+		for j := 0; j < len(s); j++ {
+			b := uint64(s[j])
+			h1 ^= b
+			h1 *= prime1
+			h2 ^= b
+			h2 *= prime2
+		}
+	}
+	mixU64(uint64(len(events)))
+	for i := range events {
+		ev := &events[i]
+		mixU64(ev.ID)
+		mixStr(string(ev.Kind))
+		mixStr(ev.File)
+		mixStr(ev.File2)
+		mixStr(ev.Cat)
+		mixStr(ev.Err)
+		mixStr(ev.Note)
+		mixStr(ev.OpKind)
+		mixU64(uint64(len(ev.Data)))
+		mixU64(uint64(len(ev.Inputs)))
+		for _, in := range ev.Inputs {
+			mixStr(in)
+		}
+		mixU64(uint64(len(ev.Outputs)))
+		for _, out := range ev.Outputs {
+			mixStr(out)
+		}
+		mixU64(uint64(ev.Mode))
+		mixU64(uint64(ev.Off))
+		mixU64(uint64(ev.Len))
+		mixU64(ev.Handle)
+		mixU64(ev.Op)
+		mixU64(ev.Job)
+		mixU64(uint64(ev.Size))
+		var flags uint64
+		if ev.Dir {
+			flags |= 1
+		}
+		if ev.FullSync {
+			flags |= 2
+		}
+		if ev.Created {
+			flags |= 4
+		}
+		mixU64(flags)
+	}
+	return h1, h2
 }
 
 // ComputeContractFeatures computes ContractFeatures for every cutoff 0..len(events) using DefaultDCGWeights.
@@ -440,14 +509,13 @@ func ComputeContractFeaturesWithWeights(events []trace.Event, weights DCGWeights
 		return computeContractFeaturesWithWeightsUncached(events, weights)
 	}
 
-	ptr := uintptr(unsafe.Pointer(&events[0]))
 	length := len(events)
-	fp := traceFingerprint(events)
+	fp1, fp2 := traceFingerprint(events)
 
 	contractCacheMu.Lock()
 	for i, entry := range contractCache {
-		if entry.length == length && entry.hash == fp && entry.weights == weights {
-			res := entry.cuts
+		if entry.length == length && entry.hash1 == fp1 && entry.hash2 == fp2 && entry.weights == weights {
+			res := maps.Clone(entry.cuts)
 			if i > 0 {
 				copy(contractCache[1:i+1], contractCache[0:i])
 				contractCache[0] = entry
@@ -461,12 +529,22 @@ func ComputeContractFeaturesWithWeights(events []trace.Event, weights DCGWeights
 	cuts := computeContractFeaturesWithWeightsUncached(events, weights)
 
 	contractCacheMu.Lock()
+	for i, existing := range contractCache {
+		if existing.length == length && existing.hash1 == fp1 && existing.hash2 == fp2 && existing.weights == weights {
+			if i > 0 {
+				copy(contractCache[1:i+1], contractCache[0:i])
+				contractCache[0] = existing
+			}
+			contractCacheMu.Unlock()
+			return cuts
+		}
+	}
 	newEntry := contractCacheEntry{
-		ptr:     ptr,
 		length:  length,
-		hash:    fp,
+		hash1:   fp1,
+		hash2:   fp2,
 		weights: weights,
-		cuts:    cuts,
+		cuts:    maps.Clone(cuts),
 	}
 	if len(contractCache) < 16 {
 		contractCache = append([]contractCacheEntry{newEntry}, contractCache...)
@@ -479,47 +557,150 @@ func ComputeContractFeaturesWithWeights(events []trace.Event, weights DCGWeights
 	return cuts
 }
 
+func newTrackInode(cat, p string, isDir bool, createdEvent uint64) *trackInode {
+	return &trackInode{
+		isWAL:           !isDir && isWALFile(cat, p),
+		isSST:           !isDir && isSSTFile(cat, p),
+		isCompactionSST: !isDir && cat == "pebble-compaction",
+		isFlushSST:      !isDir && cat == "pebble-memtable-flush",
+		isManifest:      !isDir && isManifestDataFile(cat, p),
+		isDir:           isDir,
+		createdEvent:    createdEvent,
+		entries:         make(map[*trackFileInfo]bool),
+	}
+}
+
+func applyFileClassification(inode *trackInode, cat, p string) {
+	if inode == nil || inode.isDir {
+		return
+	}
+	if isWALFile(cat, p) {
+		inode.isWAL = true
+	}
+	if cat == "pebble-compaction" {
+		inode.isCompactionSST = true
+	}
+	if cat == "pebble-memtable-flush" {
+		inode.isFlushSST = true
+	}
+	if isSSTFile(cat, p) {
+		inode.isSST = true
+	}
+	if isManifestDataFile(cat, p) {
+		inode.isManifest = true
+	}
+}
+
 func computeContractFeaturesWithWeightsUncached(events []trace.Event, weights DCGWeights) map[uint64]ContractFeatures {
 	cuts := make(map[uint64]ContractFeatures, len(events)+1)
 	cuts[0] = ContractFeatures{}
 
 	files := make(map[string]*trackFileInfo)
-	handles := make(map[uint64]*trackFileInfo)
+	handles := make(map[uint64]*trackHandle)
 	opWrites := make(map[uint64][]opWalWrite)
 	ackOps := make(map[uint64]bool)
-	ackSyncOps := make(map[uint64]bool)
+	var hasAckSyncOp bool
 	var currentOp uint64
 	var currentOpHadSync bool
 	var manifestDirtyUncommitted bool
 	var fileRetiredWhileManifestDirty bool
 	var walSyncedWhileManifestDirty bool
 	var pendingRenames []renameRecord
-	var activeFlush bool
-	var activeCompaction bool
-	unsyncedDirs := make(map[string]string) // dirPath -> parentDir
+	activeFlushes := make(map[uint64][]uint64) // job -> stack of FlushBegin event IDs
+	activeCompactions := make(map[uint64]int)  // job -> active compaction count
+	unsyncedDirs := make(map[string]string)    // dirPath -> parentDir
 
-	// healClosedWALsIfFlushDurable clears durability-violation markers on closed
-	// WAL files when a complete memtable-flush sequence has made their records
-	// durable: the L0 SST has no dirty bytes or dirty spans and its directory
-	// entry is synced, and the MANIFEST has no dirty bytes or dirty spans (its
-	// data is synced), guaranteeing that every record in any previously closed
-	// WAL is persisted in the new L0 SST and referenced by the updated MANIFEST.
-	healClosedWALsIfFlushDurable := func() {
-		for _, f := range files {
-			if (f.isSST || f.isManifest) && (f.dirtyBytes > 0 || len(f.dirtySpans) > 0 || !f.dirEntrySynced) {
-				return
-			}
+	detachEntry := func(entry *trackFileInfo) {
+		if entry == nil {
+			return
 		}
-		for _, f := range files {
-			if f.isWAL && f.closedWhileDirty {
-				f.dirtySpans = nil
-				f.dirtyBytes = 0
-				f.closedWhileDirty = false
+		entry.removed = true
+		if entry.inode != nil {
+			delete(entry.inode.entries, entry)
+		}
+		if cur, ok := files[entry.path]; ok && cur == entry {
+			delete(files, entry.path)
+		}
+	}
+
+	attachNewEntry := func(p string, inode *trackInode, dirEntrySynced bool) *trackFileInfo {
+		if old := files[p]; old != nil {
+			detachEntry(old)
+		}
+		entry := &trackFileInfo{
+			path:           p,
+			parentDir:      parent(p),
+			dirEntrySynced: dirEntrySynced,
+			inode:          inode,
+		}
+		inode.entries[entry] = true
+		files[p] = entry
+		return entry
+	}
+
+	bindHandle := func(handle uint64, entry *trackFileInfo, inode *trackInode) {
+		if handle == 0 || inode == nil {
+			return
+		}
+		inode.openHandles++
+		handles[handle] = &trackHandle{inode: inode, entry: entry}
+	}
+
+	syncInode := func(inode *trackInode) {
+		if inode == nil {
+			return
+		}
+		inode.dirtySpans = nil
+		inode.dirtyBytes = 0
+		inode.closedWhileDirty = false
+		if inode.size > 0 {
+			inode.hasSyncedData = true
+		}
+		if inode.isSST {
+			for entry := range inode.entries {
+				if entry.removed {
+					continue
+				}
+				_, parentUnsynced := unsyncedDirs[entry.parentDir]
+				if entry.dirEntrySynced && !parentUnsynced {
+					entry.stagedInManifest = false
+					entry.committedInManifest = false
+				}
 			}
 		}
 	}
 
-	for _, event := range events {
+	// healClosedWALsIfFlushDurable clears durability-violation markers on closed
+	// WAL files covered by a completed/synced memtable flush (closedEvent < maxClosedEvent).
+	healClosedWALsIfFlushDurable := func(job uint64, maxClosedEvent uint64) {
+		for _, f := range files {
+			in := f.inode
+			isRelevantFlushSST := in.isSST && !in.isCompactionSST && (job == 0 || in.flushJob == 0 || in.flushJob == job)
+			if isRelevantFlushSST || in.isManifest {
+				_, parentUnsynced := unsyncedDirs[f.parentDir]
+				if in.dirtyBytes > 0 || len(in.dirtySpans) > 0 || !f.dirEntrySynced || parentUnsynced {
+					return
+				}
+			}
+		}
+		for _, f := range files {
+			in := f.inode
+			if in.isWAL && in.closedWhileDirty && in.closedEvent < maxClosedEvent {
+				in.dirtySpans = nil
+				in.dirtyBytes = 0
+				in.closedWhileDirty = false
+			}
+		}
+	}
+
+	prevCut := uint64(0)
+	for idx, event := range events {
+		cutID := event.ID
+		if cutID == 0 || cutID != uint64(idx+1) {
+			cutID = uint64(idx + 1)
+		}
+
+		noOp := false
 		switch event.Kind {
 		case trace.KindOpBegin:
 			if trace.MutatingOperation(event.OpKind) {
@@ -527,354 +708,480 @@ func computeContractFeaturesWithWeightsUncached(events []trace.Event, weights DC
 				currentOpHadSync = false
 			}
 		case trace.KindCreate:
-			isWAL := event.Cat == "pebble-wal" || strings.HasSuffix(event.File, ".log") || strings.Contains(event.File, ".log") || event.Note == "WALCreated"
-			isCompactionSST := event.Cat == "pebble-compaction"
-			isFlushSST := event.Cat == "pebble-memtable-flush" || event.Note == "FlushBegin"
-			isSST := isCompactionSST || isFlushSST || strings.HasSuffix(event.File, ".sst") || strings.Contains(event.File, ".sst") || event.Note == "TableCreated"
-			isManifest := event.Cat == "pebble-manifest" || strings.Contains(event.File, "MANIFEST") || strings.Contains(event.File, "CURRENT") || event.Note == "ManifestCreated"
-			fi := &trackFileInfo{
-				path:            event.File,
-				parentDir:       parent(event.File),
-				dirEntrySynced:  false,
-				isWAL:           isWAL,
-				isSST:           isSST,
-				isCompactionSST: isCompactionSST,
-				isFlushSST:      isFlushSST,
-				isManifest:      isManifest,
-				isDir:           event.Dir,
-				createdEvent:    event.ID,
+			if event.Err != "" {
+				noOp = true
+				break
 			}
-			files[event.File] = fi
-			if event.Handle > 0 {
-				handles[event.Handle] = fi
-			}
+			inode := newTrackInode(event.Cat, event.File, false, event.ID)
+			fi := attachNewEntry(event.File, inode, false)
+			bindHandle(event.Handle, fi, inode)
 		case trace.KindReuseForWrite:
-			isWAL := event.Cat == "pebble-wal" || strings.HasSuffix(event.File2, ".log") || strings.Contains(event.File2, ".log") || event.Note == "WALCreated"
-			isCompactionSST := event.Cat == "pebble-compaction"
-			isFlushSST := event.Cat == "pebble-memtable-flush" || event.Note == "FlushBegin"
-			isSST := isCompactionSST || isFlushSST || strings.HasSuffix(event.File2, ".sst") || strings.Contains(event.File2, ".sst") || event.Note == "TableCreated"
-			isManifest := event.Cat == "pebble-manifest" || strings.Contains(event.File2, "MANIFEST") || strings.Contains(event.File2, "CURRENT") || event.Note == "ManifestCreated"
+			if event.Err != "" {
+				noOp = true
+				break
+			}
 			// Record if a .log or .sst file is recycled while any MANIFEST file is dirty.
 			if strings.HasSuffix(event.File, ".log") || strings.HasSuffix(event.File, ".sst") {
 				for _, mf := range files {
-					if mf.isManifest && (mf.dirtyBytes > 0 || !mf.dirEntrySynced) {
+					if mf.inode.isManifest && (mf.inode.dirtyBytes > 0 || !mf.dirEntrySynced) {
 						fileRetiredWhileManifestDirty = true
 						break
 					}
 				}
 			}
-			delete(files, event.File)
-			fi := &trackFileInfo{
-				path:            event.File2,
-				parentDir:       parent(event.File2),
-				dirEntrySynced:  false,
-				isWAL:           isWAL,
-				isSST:           isSST,
-				isCompactionSST: isCompactionSST,
-				isFlushSST:      isFlushSST,
-				isManifest:      isManifest,
-				isDir:           false,
-				createdEvent:    event.ID,
+			if oldFi := files[event.File]; oldFi != nil {
+				detachEntry(oldFi)
 			}
-			files[event.File2] = fi
-			if event.Handle > 0 {
-				handles[event.Handle] = fi
-			}
+			inode := newTrackInode(event.Cat, event.File2, false, event.ID)
+			fi := attachNewEntry(event.File2, inode, false)
+			bindHandle(event.Handle, fi, inode)
 		case trace.KindOpen, trace.KindOpenReadWrite, trace.KindOpenDir:
+			if event.Err != "" {
+				noOp = true
+				break
+			}
 			fi := files[event.File]
+			createdNew := false
 			if fi == nil {
-				isWAL := event.Cat == "pebble-wal" || strings.HasSuffix(event.File, ".log") || strings.Contains(event.File, ".log")
-				isCompactionSST := event.Cat == "pebble-compaction"
-				isFlushSST := event.Cat == "pebble-memtable-flush"
-				isSST := isCompactionSST || isFlushSST || strings.HasSuffix(event.File, ".sst") || strings.Contains(event.File, ".sst")
-				isManifest := event.Cat == "pebble-manifest" || strings.Contains(event.File, "MANIFEST") || strings.Contains(event.File, "CURRENT")
-				dirEntrySynced := true
-				if event.Created {
-					dirEntrySynced = false
-				}
-				fi = &trackFileInfo{
-					path:            event.File,
-					parentDir:       parent(event.File),
-					dirEntrySynced:  dirEntrySynced,
-					isWAL:           isWAL,
-					isSST:           isSST,
-					isCompactionSST: isCompactionSST,
-					isFlushSST:      isFlushSST,
-					isManifest:      isManifest,
-					isDir:           event.Dir || event.Kind == trace.KindOpenDir,
-					createdEvent:    event.ID,
-				}
-				files[event.File] = fi
+				createdNew = true
+				inode := newTrackInode(event.Cat, event.File, event.Dir || event.Kind == trace.KindOpenDir, event.ID)
+				fi = attachNewEntry(event.File, inode, !event.Created)
 			} else {
 				if event.Created {
+					createdNew = true
 					fi.dirEntrySynced = false
 				}
+				if event.Kind == trace.KindOpenReadWrite && event.Cat != "" {
+					applyFileClassification(fi.inode, event.Cat, event.File)
+				}
 			}
-			if event.Handle > 0 {
-				handles[event.Handle] = fi
+			bindHandle(event.Handle, fi, fi.inode)
+			if !createdNew && (event.Kind == trace.KindOpen || event.Kind == trace.KindOpenDir) {
+				noOp = true
 			}
+		case trace.KindLock, trace.KindUnlock, trace.KindPreallocate, trace.KindRead:
+			noOp = true
 		case trace.KindWrite, trace.KindWriteAt:
-			fi := handles[event.Handle]
-			if fi == nil && event.File != "" {
-				fi = files[event.File]
+			if event.Len <= 0 || event.Off < 0 || event.Off > math.MaxInt64-int64(event.Len) {
+				noOp = true
+				break
 			}
-			if fi == nil && event.File != "" {
-				isWAL := event.Cat == "pebble-wal" || strings.HasSuffix(event.File, ".log") || strings.Contains(event.File, ".log")
-				isCompactionSST := event.Cat == "pebble-compaction"
-				isFlushSST := event.Cat == "pebble-memtable-flush"
-				isSST := isCompactionSST || isFlushSST || strings.HasSuffix(event.File, ".sst") || strings.Contains(event.File, ".sst")
-				isManifest := event.Cat == "pebble-manifest" || strings.Contains(event.File, "MANIFEST") || strings.Contains(event.File, "CURRENT")
-				fi = &trackFileInfo{
-					path:            event.File,
-					parentDir:       parent(event.File),
-					dirEntrySynced:  true,
-					isWAL:           isWAL,
-					isSST:           isSST,
-					isCompactionSST: isCompactionSST,
-					isFlushSST:      isFlushSST,
-					isManifest:      isManifest,
-					isDir:           event.Dir,
-					createdEvent:    event.ID,
-				}
-				files[event.File] = fi
+			var fi *trackFileInfo
+			var inode *trackInode
+			if h := handles[event.Handle]; h != nil {
+				fi = h.entry
+				inode = h.inode
 			}
-			if fi != nil && event.Len > 0 {
-				span := writeSpan{off: event.Off, end: event.Off + int64(event.Len)}
-				fi.dirtySpans = append(fi.dirtySpans, span)
-				fi.dirtyBytes += uint64(event.Len)
-				if span.end > fi.size {
-					fi.size = span.end
+			if inode == nil && event.File != "" {
+				if fi = files[event.File]; fi != nil {
+					inode = fi.inode
 				}
-				if fi.isWAL && currentOp > 0 {
-					opWrites[currentOp] = append(opWrites[currentOp], opWalWrite{file: fi.path, span: span})
+			}
+			if inode == nil && event.File != "" {
+				inode = newTrackInode(event.Cat, event.File, false, event.ID)
+				fi = attachNewEntry(event.File, inode, true)
+			}
+			if inode != nil {
+				span := interval{start: event.Off, end: event.Off + int64(event.Len)}
+				inode.dirtySpans = addInterval(inode.dirtySpans, span)
+				inode.dirtyBytes = sumIntervals(inode.dirtySpans)
+				if span.end > inode.size {
+					inode.size = span.end
 				}
-				isMan := fi.isManifest || event.Cat == "pebble-manifest" || strings.Contains(event.File, "MANIFEST")
+				if inode.isWAL && currentOp > 0 {
+					merged := false
+					writes := opWrites[currentOp]
+					for i := range writes {
+						if writes[i].entry == fi && writes[i].inode == inode {
+							writes[i].spans = addInterval(writes[i].spans, span)
+							merged = true
+							break
+						}
+					}
+					if !merged {
+						opWrites[currentOp] = append(writes, opWalWrite{
+							entry: fi,
+							inode: inode,
+							spans: []interval{span},
+						})
+					}
+				}
+				isMan := inode.isManifest || isManifestDataFile(event.Cat, event.File)
 				if isMan {
 					for _, sst := range files {
-						if sst.isSST && (sst.dirtyBytes > 0 || len(sst.dirtySpans) > 0 || !sst.dirEntrySynced) {
+						_, parentUnsynced := unsyncedDirs[sst.parentDir]
+						if sst.inode.isSST && (sst.inode.dirtyBytes > 0 || len(sst.inode.dirtySpans) > 0 || !sst.dirEntrySynced || parentUnsynced) {
 							sst.stagedInManifest = true
 						}
 					}
 				}
 			}
 		case trace.KindSync, trace.KindSyncData, trace.KindSyncTo:
-			if event.IsBarrier() {
-				if currentOp > 0 {
+			if event.Err != "" || !event.IsBarrier() {
+				noOp = true
+				break
+			}
+			if event.Dir {
+				syncedDir := event.File
+				if h := handles[event.Handle]; h != nil && h.entry != nil && h.entry.path != "" {
+					syncedDir = h.entry.path
+				}
+				if syncedDir == "." || syncedDir == "/" {
+					syncedDir = ""
+				}
+				var keptRenames []renameRecord
+				for _, r := range pendingRenames {
+					if r.dir == syncedDir {
+						r.dstSynced = true
+					}
+					if r.srcDir == syncedDir {
+						r.srcSynced = true
+					}
+					if !(r.dstSynced && r.srcSynced) {
+						keptRenames = append(keptRenames, r)
+					}
+				}
+				pendingRenames = keptRenames
+
+				var newlySyncedDirs map[string]bool
+				for dirPath, pdir := range unsyncedDirs {
+					if pdir == syncedDir {
+						delete(unsyncedDirs, dirPath)
+						if newlySyncedDirs == nil {
+							newlySyncedDirs = make(map[string]bool)
+						}
+						newlySyncedDirs[dirPath] = true
+					}
+				}
+
+				for _, f := range files {
+					if f.parentDir == syncedDir {
+						f.dirEntrySynced = true
+					}
+					if f.parentDir == syncedDir || newlySyncedDirs[f.parentDir] {
+						_, parentUnsynced := unsyncedDirs[f.parentDir]
+						if f.inode.isSST && f.dirEntrySynced && !parentUnsynced && f.inode.dirtyBytes == 0 && len(f.inode.dirtySpans) == 0 {
+							f.stagedInManifest = false
+							f.committedInManifest = false
+						}
+					}
+				}
+			} else {
+				var fi *trackFileInfo
+				var inode *trackInode
+				if h := handles[event.Handle]; h != nil {
+					fi = h.entry
+					inode = h.inode
+				}
+				if inode == nil && event.File != "" {
+					if fi = files[event.File]; fi != nil {
+						inode = fi.inode
+					}
+				}
+				if currentOp > 0 && inode != nil && inode.isWAL {
 					currentOpHadSync = true
 				}
-				if event.Dir {
-					syncedDir := event.File
-					if hFi := handles[event.Handle]; hFi != nil && hFi.path != "" {
-						syncedDir = hFi.path
-					}
-					if syncedDir == "." || syncedDir == "/" {
-						syncedDir = ""
-					}
-					var keptRenames []renameRecord
-					for _, r := range pendingRenames {
-						if r.dir != syncedDir {
-							keptRenames = append(keptRenames, r)
-						}
-					}
-					pendingRenames = keptRenames
-
-					for dirPath, pdir := range unsyncedDirs {
-						if pdir == syncedDir {
-							delete(unsyncedDirs, dirPath)
-						}
-					}
-
-					for _, f := range files {
-						if f.parentDir == syncedDir {
-							f.dirEntrySynced = true
-							if f.isSST && f.dirtyBytes == 0 && len(f.dirtySpans) == 0 {
-								f.stagedInManifest = false
-								f.committedInManifest = false
-							}
-						}
-					}
-				} else {
-					fi := handles[event.Handle]
-					if fi == nil && event.File != "" {
-						fi = files[event.File]
-					}
-					isMan := (fi != nil && fi.isManifest) || event.Cat == "pebble-manifest" || strings.Contains(event.File, "MANIFEST")
-					if isMan {
-						for _, sst := range files {
-							if sst.isSST && sst.stagedInManifest {
-								if activeFlush && !activeCompaction {
-									if sst.isFlushSST || (!sst.isCompactionSST && !sst.isFlushSST) {
-										sst.committedInManifest = true
-									}
-								} else if activeCompaction && !activeFlush {
-									if sst.isCompactionSST || (!sst.isCompactionSST && !sst.isFlushSST) {
-										sst.committedInManifest = true
-									}
-								} else {
+				isMan := (inode != nil && inode.isManifest) || isManifestDataFile(event.Cat, event.File)
+				if isMan {
+					hasFlush := len(activeFlushes) > 0
+					hasCompaction := len(activeCompactions) > 0
+					for _, sst := range files {
+						if sst.inode.isSST && sst.stagedInManifest {
+							if hasFlush && !hasCompaction {
+								if sst.inode.isFlushSST || (!sst.inode.isCompactionSST && !sst.inode.isFlushSST) {
 									sst.committedInManifest = true
 								}
+							} else if hasCompaction && !hasFlush {
+								if sst.inode.isCompactionSST || (!sst.inode.isCompactionSST && !sst.inode.isFlushSST) {
+									sst.committedInManifest = true
+								}
+							} else {
+								sst.committedInManifest = true
 							}
 						}
 					}
-					if fi != nil {
-						fi.dirtySpans = nil
-						fi.dirtyBytes = 0
-						fi.closedWhileDirty = false
-						if fi.isSST && fi.dirEntrySynced {
-							fi.stagedInManifest = false
-							fi.committedInManifest = false
+				}
+				syncInode(inode)
+				if isMan && len(activeFlushes) > 0 {
+					for job, starts := range activeFlushes {
+						if len(starts) > 0 {
+							healClosedWALsIfFlushDurable(job, starts[0])
 						}
 					}
-					if isMan && activeFlush {
-						healClosedWALsIfFlushDurable()
-					}
-					// Record if a WAL file is synced while any MANIFEST file has dirty bytes.
-					if fi != nil && fi.isWAL {
-						for _, mf := range files {
-							if mf.isManifest && mf.dirtyBytes > 0 {
-								walSyncedWhileManifestDirty = true
-								break
-							}
+				}
+				// Record if a WAL file is synced while any MANIFEST file has dirty bytes.
+				if inode != nil && inode.isWAL {
+					for _, mf := range files {
+						if mf.inode.isManifest && mf.inode.dirtyBytes > 0 {
+							walSyncedWhileManifestDirty = true
+							break
 						}
 					}
 				}
 			}
 		case trace.KindEngineEvent:
-			if event.Note == "FlushBegin" {
-				activeFlush = true
-			} else if event.Note == "FlushEnd" {
-				activeFlush = false
+			switch event.Note {
+			case "FlushBegin":
+				activeFlushes[event.Job] = append(activeFlushes[event.Job], event.ID)
+			case "TableCreated":
+				for _, out := range event.Outputs {
+					if fi := files[out]; fi != nil && fi.inode != nil {
+						fi.inode.flushJob = event.Job
+					}
+				}
+			case "FlushEnd":
+				flushStart := event.ID
+				if starts := activeFlushes[event.Job]; len(starts) > 0 {
+					flushStart = starts[0]
+					if len(starts) == 1 {
+						delete(activeFlushes, event.Job)
+					} else {
+						activeFlushes[event.Job] = starts[1:]
+					}
+				}
 				for _, sst := range files {
-					if sst.isSST && sst.isFlushSST && sst.stagedInManifest {
+					if sst.inode.isSST && sst.inode.isFlushSST && sst.stagedInManifest &&
+						(event.Job == 0 || sst.inode.flushJob == 0 || sst.inode.flushJob == event.Job) {
 						sst.committedInManifest = true
 					}
 				}
-				healClosedWALsIfFlushDurable()
-			} else if event.Note == "CompactionBegin" {
-				activeCompaction = true
-			} else if event.Note == "CompactionEnd" {
-				activeCompaction = false
+				healClosedWALsIfFlushDurable(event.Job, flushStart)
+			case "CompactionBegin":
+				activeCompactions[event.Job]++
+			case "CompactionEnd":
+				if activeCompactions[event.Job] > 1 {
+					activeCompactions[event.Job]--
+				} else {
+					delete(activeCompactions, event.Job)
+				}
 				for _, sst := range files {
-					if sst.isSST && sst.isCompactionSST && sst.stagedInManifest {
+					if sst.inode.isSST && sst.inode.isCompactionSST && sst.stagedInManifest {
 						sst.committedInManifest = true
 					}
 				}
 			}
 		case trace.KindMkdirAll:
-			if event.Err == "" && event.File != "" {
-				pdir := parent(event.File)
+			if event.Err != "" || event.File == "" {
+				noOp = true
+				break
+			}
+			parts := strings.Split(path.Clean(event.File), "/")
+			for idx := range parts {
+				sub := strings.Join(parts[:idx+1], "/")
+				if sub == "" || sub == "." {
+					continue
+				}
+				pdir := parent(sub)
 				if pdir == "." || pdir == "/" {
 					pdir = ""
 				}
-				unsyncedDirs[event.File] = pdir
+				if _, exists := files[sub]; !exists {
+					unsyncedDirs[sub] = pdir
+				}
 			}
 		case trace.KindLink:
-			if event.Err == "" {
-				isWAL := event.Cat == "pebble-wal" || strings.HasSuffix(event.File2, ".log") || strings.Contains(event.File2, ".log")
-				isCompactionSST := event.Cat == "pebble-compaction"
-				isFlushSST := event.Cat == "pebble-memtable-flush"
-				isSST := isCompactionSST || isFlushSST || strings.HasSuffix(event.File2, ".sst") || strings.Contains(event.File2, ".sst")
-				isManifest := event.Cat == "pebble-manifest" || strings.Contains(event.File2, "MANIFEST") || strings.Contains(event.File2, "CURRENT")
-				fi := &trackFileInfo{
-					path:            event.File2,
-					parentDir:       parent(event.File2),
-					dirEntrySynced:  false,
-					isWAL:           isWAL,
-					isSST:           isSST,
-					isCompactionSST: isCompactionSST,
-					isFlushSST:      isFlushSST,
-					isManifest:      isManifest,
-					isDir:           false,
-					createdEvent:    event.ID,
-				}
-				files[event.File2] = fi
+			if event.Err != "" {
+				noOp = true
+				break
+			}
+			if src := files[event.File]; src != nil && src.inode != nil {
+				attachNewEntry(event.File2, src.inode, false)
+			} else {
+				inode := newTrackInode(event.Cat, event.File2, false, event.ID)
+				attachNewEntry(event.File2, inode, false)
 			}
 		case trace.KindRename:
-			if event.Err == "" {
-				fi := files[event.File]
-				if fi != nil {
-					delete(files, event.File)
-					fi.path = event.File2
-					fi.parentDir = parent(event.File2)
-					fi.dirEntrySynced = false
-					files[event.File2] = fi
-				} else {
-					isWAL := event.Cat == "pebble-wal" || strings.HasSuffix(event.File2, ".log") || strings.Contains(event.File2, ".log")
-					isCompactionSST := event.Cat == "pebble-compaction"
-					isFlushSST := event.Cat == "pebble-memtable-flush"
-					isSST := isCompactionSST || isFlushSST || strings.HasSuffix(event.File2, ".sst") || strings.Contains(event.File2, ".sst")
-					isManifest := event.Cat == "pebble-manifest" || strings.Contains(event.File2, "MANIFEST") || strings.Contains(event.File2, "CURRENT")
-					fi := &trackFileInfo{
-						path:            event.File2,
-						parentDir:       parent(event.File2),
-						dirEntrySynced:  false,
-						isWAL:           isWAL,
-						isSST:           isSST,
-						isCompactionSST: isCompactionSST,
-						isFlushSST:      isFlushSST,
-						isManifest:      isManifest,
-						createdEvent:    event.ID,
-					}
-					files[event.File2] = fi
-				}
-				isCrit := strings.Contains(event.File2, "CURRENT") || strings.Contains(event.File2, "MANIFEST") || strings.Contains(event.File2, "OPTIONS")
-				pendingRenames = append(pendingRenames, renameRecord{
-					from:       event.File,
-					to:         event.File2,
-					isCritical: isCrit,
-					dir:        parent(event.File2),
-					eventID:    event.ID,
-					violating:  false,
-				})
+			if event.Err != "" {
+				noOp = true
+				break
 			}
+			srcPrefix := event.File + "/"
+			type fileMove struct {
+				oldPath string
+				newPath string
+				entry   *trackFileInfo
+			}
+			var childMoves []fileMove
+			for p, entry := range files {
+				if strings.HasPrefix(p, srcPrefix) {
+					childMoves = append(childMoves, fileMove{
+						oldPath: p,
+						newPath: event.File2 + strings.TrimPrefix(p, event.File),
+						entry:   entry,
+					})
+				}
+			}
+			type dirMove struct {
+				oldDir string
+				newDir string
+			}
+			var childDirMoves []dirMove
+			for d := range unsyncedDirs {
+				if strings.HasPrefix(d, srcPrefix) {
+					childDirMoves = append(childDirMoves, dirMove{
+						oldDir: d,
+						newDir: event.File2 + strings.TrimPrefix(d, event.File),
+					})
+				}
+			}
+
+			_, wasUnsyncedDir := unsyncedDirs[event.File]
+			delete(unsyncedDirs, event.File)
+			delete(unsyncedDirs, event.File2)
+			for _, dm := range childDirMoves {
+				delete(unsyncedDirs, dm.oldDir)
+			}
+			for _, dm := range childDirMoves {
+				unsyncedDirs[dm.newDir] = parent(dm.newDir)
+			}
+
+			srcFi := files[event.File]
+			if dstFi := files[event.File2]; dstFi != nil && dstFi != srcFi {
+				detachEntry(dstFi)
+			}
+			for _, cm := range childMoves {
+				delete(files, cm.oldPath)
+			}
+			for _, cm := range childMoves {
+				if existing := files[cm.newPath]; existing != nil && existing != cm.entry {
+					detachEntry(existing)
+				}
+				cm.entry.path = cm.newPath
+				cm.entry.parentDir = parent(cm.newPath)
+				files[cm.newPath] = cm.entry
+			}
+
+			isDir := wasUnsyncedDir || len(childMoves) > 0 || len(childDirMoves) > 0
+			if srcFi != nil {
+				delete(files, event.File)
+				srcFi.path = event.File2
+				srcFi.parentDir = parent(event.File2)
+				srcFi.dirEntrySynced = false
+				if isDir {
+					srcFi.inode.isDir = true
+				}
+				applyFileClassification(srcFi.inode, event.Cat, event.File2)
+				files[event.File2] = srcFi
+			} else {
+				inode := newTrackInode(event.Cat, event.File2, isDir, event.ID)
+				attachNewEntry(event.File2, inode, false)
+			}
+
+			for i := range pendingRenames {
+				if pendingRenames[i].dir == event.File || strings.HasPrefix(pendingRenames[i].dir, srcPrefix) {
+					pendingRenames[i].dir = event.File2 + strings.TrimPrefix(pendingRenames[i].dir, event.File)
+				}
+				if pendingRenames[i].srcDir == event.File || strings.HasPrefix(pendingRenames[i].srcDir, srcPrefix) {
+					pendingRenames[i].srcDir = event.File2 + strings.TrimPrefix(pendingRenames[i].srcDir, event.File)
+				}
+			}
+
+			srcDir := parent(event.File)
+			dstDir := parent(event.File2)
+			isCrit := isManifestBase(pathBase(event.File2)) || isOptionsPath(event.File2)
+			pendingRenames = append(pendingRenames, renameRecord{
+				from:       event.File,
+				to:         event.File2,
+				isCritical: isCrit,
+				dir:        dstDir,
+				srcDir:     srcDir,
+				dstSynced:  false,
+				srcSynced:  srcDir == dstDir,
+				eventID:    event.ID,
+				violating:  false,
+			})
 		case trace.KindRemove, trace.KindRemoveAll:
+			if event.Err != "" {
+				noOp = true
+				break
+			}
 			// Record if a .log or .sst file is deleted while any MANIFEST file is dirty.
 			if strings.HasSuffix(event.File, ".log") || strings.HasSuffix(event.File, ".sst") {
 				for _, mf := range files {
-					if mf.isManifest && (mf.dirtyBytes > 0 || !mf.dirEntrySynced) {
+					if mf.inode.isManifest && (mf.inode.dirtyBytes > 0 || !mf.dirEntrySynced) {
 						fileRetiredWhileManifestDirty = true
 						break
 					}
 				}
 			}
-			delete(files, event.File)
+			if removedFi := files[event.File]; removedFi != nil {
+				detachEntry(removedFi)
+			}
+			delete(unsyncedDirs, event.File)
 			if event.Kind == trace.KindRemoveAll {
-				isRoot := event.File == "" || event.File == "."
-				prefix := strings.TrimSuffix(event.File, "/") + "/"
-				for childPath := range files {
-					if isRoot || strings.HasPrefix(childPath, prefix) {
+				cleanFile := path.Clean(event.File)
+				isRoot := event.File == "" || cleanFile == "."
+				prefix := strings.TrimSuffix(cleanFile, "/") + "/"
+				for childPath, childFi := range files {
+					if isRoot || childPath == cleanFile || strings.HasPrefix(childPath, prefix) {
 						if strings.HasSuffix(childPath, ".log") || strings.HasSuffix(childPath, ".sst") {
 							for _, mf := range files {
-								if mf.isManifest && (mf.dirtyBytes > 0 || !mf.dirEntrySynced) {
+								if mf.inode.isManifest && (mf.inode.dirtyBytes > 0 || !mf.dirEntrySynced) {
 									fileRetiredWhileManifestDirty = true
 									break
 								}
 							}
 						}
-						delete(files, childPath)
+						detachEntry(childFi)
 					}
 				}
+				for dirPath := range unsyncedDirs {
+					if isRoot || dirPath == cleanFile || strings.HasPrefix(dirPath, prefix) {
+						delete(unsyncedDirs, dirPath)
+					}
+				}
+				var keptRenames []renameRecord
+				for _, r := range pendingRenames {
+					if isRoot || r.dir == cleanFile || strings.HasPrefix(r.dir, prefix) {
+						r.dstSynced = true
+					}
+					if isRoot || r.srcDir == cleanFile || strings.HasPrefix(r.srcDir, prefix) {
+						r.srcSynced = true
+					}
+					if !(r.dstSynced && r.srcSynced) {
+						keptRenames = append(keptRenames, r)
+					}
+				}
+				pendingRenames = keptRenames
 			}
 		case trace.KindClose:
-			fi := handles[event.Handle]
-			if fi == nil && event.File != "" {
-				fi = files[event.File]
+			var inode *trackInode
+			if h := handles[event.Handle]; h != nil {
+				inode = h.inode
+				delete(handles, event.Handle)
+			} else if event.File != "" {
+				if fi := files[event.File]; fi != nil {
+					inode = fi.inode
+				}
 			}
-			if fi != nil && fi.dirtyBytes > 0 {
-				fi.closedWhileDirty = true
+			if inode != nil {
+				if inode.openHandles > 0 {
+					inode.openHandles--
+				}
+				if inode.openHandles == 0 && inode.dirtyBytes > 0 {
+					inode.closedWhileDirty = true
+					inode.closedEvent = event.ID
+				}
 			}
-			delete(handles, event.Handle)
 		case trace.KindOpEnd:
 			if trace.MutatingOperation(event.OpKind) && event.Err == "" {
-				ackOps[event.Op] = true
+				if len(opWrites[event.Op]) > 0 {
+					ackOps[event.Op] = true
+				}
 				if currentOpHadSync {
-					ackSyncOps[event.Op] = true
+					hasAckSyncOp = true
 				}
 			}
 			if event.Op == currentOp {
 				currentOp = 0
 				currentOpHadSync = false
 			}
+		}
+
+		if noOp {
+			cuts[cutID] = cuts[prevCut]
+			prevCut = cutID
+			continue
 		}
 
 		// Check lifecycle boundary for uncommitted renames
@@ -904,88 +1211,119 @@ func computeContractFeaturesWithWeightsUncached(events []trace.Event, weights DC
 			}
 		}
 
-		// Track unpersisted manifest across initialization and lifecycle boundaries.
+		// Single pass over files for closed dirty WALs, manifest uncommitted state,
+		// dangling SST/Manifest counts, closed WAL indicators, and unsynced dir entry counts.
 		hasClosedDirtyWAL := false
+		hasDirtyManifest := false
+		var hasClosedDirtyLog bool
+		var dirtyLogBytes uint64
+		seenClosedWALInodes := make(map[*trackInode]bool)
+		parentUnsyncedCount := make(map[string]int)
+
 		for _, f := range files {
-			if f.isWAL && f.closedWhileDirty {
+			in := f.inode
+			_, parentUnsynced := unsyncedDirs[f.parentDir]
+			if in.isWAL && in.closedWhileDirty {
 				hasClosedDirtyWAL = true
-				break
+				hasClosedDirtyLog = true
+				if !seenClosedWALInodes[in] {
+					seenClosedWALInodes[in] = true
+					dirtyLogBytes += in.dirtyBytes
+				}
+			}
+			if in.isManifest && (in.dirtyBytes > 0 || !f.dirEntrySynced || parentUnsynced) {
+				hasDirtyManifest = true
+			}
+			if !f.dirEntrySynced {
+				parentUnsyncedCount[f.parentDir]++
 			}
 		}
-		isManifestBoundary := (event.Kind == trace.KindOpBegin && !activeFlush && !activeCompaction) ||
-			(event.Kind == trace.KindEngineEvent && (event.Note == "FlushEnd" || event.Note == "CompactionEnd"))
-		for _, f := range files {
-			if !f.isManifest || (f.dirtyBytes == 0 && f.dirEntrySynced) {
-				continue
-			}
-			// Case 1: Initial MANIFEST has 0 synced bytes on disk (uint64(f.size) == f.dirtyBytes).
-			// Once its directory entry is synced (exposing a 0-byte MANIFEST to Open) or a lifecycle boundary is crossed, it is corrupt.
-			if f.dirtyBytes > 0 && uint64(f.size) == f.dirtyBytes && (f.dirEntrySynced || isManifestBoundary) {
-				manifestDirtyUncommitted = true
-				break
-			}
-			// Case 2: Unsynced MANIFEST directory entry across a lifecycle boundary, only when no
-			// synced data prefix exists on disk yet (uint64(f.size) <= f.dirtyBytes).
-			if !f.dirEntrySynced && isManifestBoundary && uint64(f.size) <= f.dirtyBytes {
-				manifestDirtyUncommitted = true
-				break
-			}
-			// Case 3: Subsequent MANIFEST append where a valid synced prefix already exists on disk (uint64(f.size) > f.dirtyBytes).
-			// Reverting MANIFEST to its synced prefix is safe until an old WAL/SST is retired (ReuseForWrite/Remove),
-			// or a closed dirty WAL is followed by a subsequent WAL sync advancing the durability frontier, or MANIFEST is closed dirty.
-			if f.dirtyBytes > 0 && uint64(f.size) > f.dirtyBytes {
-				if fileRetiredWhileManifestDirty || (hasClosedDirtyWAL && walSyncedWhileManifestDirty) || f.closedWhileDirty {
+
+		if hasDirtyManifest {
+			isManifestBoundary := (event.Kind == trace.KindOpBegin && len(activeFlushes) == 0 && len(activeCompactions) == 0) ||
+				(event.Kind == trace.KindEngineEvent && (event.Note == "FlushEnd" || event.Note == "CompactionEnd"))
+			for _, f := range files {
+				in := f.inode
+				_, parentUnsynced := unsyncedDirs[f.parentDir]
+				dirSynced := f.dirEntrySynced && !parentUnsynced
+				if !in.isManifest || (in.dirtyBytes == 0 && dirSynced) {
+					continue
+				}
+				// Case 1: Initial MANIFEST has 0 synced bytes on disk (!in.hasSyncedData).
+				if in.dirtyBytes > 0 && !in.hasSyncedData && (dirSynced || isManifestBoundary) {
+					manifestDirtyUncommitted = true
+					break
+				}
+				// Case 2: Unsynced MANIFEST directory entry across a lifecycle boundary before any synced prefix exists.
+				if !dirSynced && isManifestBoundary && !in.hasSyncedData {
+					manifestDirtyUncommitted = true
+					break
+				}
+				// Case 3: Subsequent MANIFEST write where a valid synced prefix already exists on disk (in.hasSyncedData).
+				if in.dirtyBytes > 0 && in.hasSyncedData {
+					if fileRetiredWhileManifestDirty || (hasClosedDirtyWAL && walSyncedWhileManifestDirty) || in.closedWhileDirty {
+						manifestDirtyUncommitted = true
+						break
+					}
+				}
+				if in.closedWhileDirty {
 					manifestDirtyUncommitted = true
 					break
 				}
 			}
-			if f.closedWhileDirty {
-				manifestDirtyUncommitted = true
-				break
-			}
-		}
-		hasDirtyManifest := false
-		for _, f := range files {
-			if f.isManifest && (f.dirtyBytes > 0 || !f.dirEntrySynced) {
-				hasDirtyManifest = true
-				break
-			}
-		}
-		if !hasDirtyManifest {
+		} else {
 			manifestDirtyUncommitted = false
 			fileRetiredWhileManifestDirty = false
 			walSyncedWhileManifestDirty = false
 		}
 
-		// Calculate contract snapshot at event.ID:
+		// Calculate contract snapshot at cutID:
 		// 1. Indicator 1: AckSyncMissing
 		var unpersistedOps uint64
 		var danglingWAL uint64
 		for opID := range ackOps {
 			writes := opWrites[opID]
 			if len(writes) == 0 {
+				delete(ackOps, opID)
+				delete(opWrites, opID)
 				continue
 			}
 			opHasDirty := false
 			var opDirtyBytes uint64
+			allDoneForever := true
 			for _, w := range writes {
-				fi := files[w.file]
-				if fi != nil {
-					_, parentUnsynced := unsyncedDirs[fi.parentDir]
-					if !fi.dirEntrySynced || parentUnsynced {
-						opHasDirty = true
-						opDirtyBytes += uint64(w.span.end - w.span.off)
-					} else if len(fi.dirtySpans) > 0 {
-						for _, ds := range fi.dirtySpans {
-							overlapStart := maxInt64(w.span.off, ds.off)
-							overlapEnd := minInt64(w.span.end, ds.end)
+				entry := w.entry
+				inode := w.inode
+				if entry == nil || entry.removed || inode == nil {
+					continue
+				}
+				_, parentUnsynced := unsyncedDirs[entry.parentDir]
+				if !entry.dirEntrySynced || parentUnsynced {
+					opHasDirty = true
+					for _, ws := range w.spans {
+						opDirtyBytes += uint64(ws.end - ws.start)
+					}
+					allDoneForever = false
+				} else if len(inode.dirtySpans) > 0 {
+					allDoneForever = false
+					for _, ws := range w.spans {
+						for _, ds := range inode.dirtySpans {
+							overlapStart := maxInt64(ws.start, ds.start)
+							overlapEnd := minInt64(ws.end, ds.end)
 							if overlapEnd > overlapStart {
 								opHasDirty = true
 								opDirtyBytes += uint64(overlapEnd - overlapStart)
 							}
 						}
 					}
+				} else if inode.openHandles > 0 {
+					allDoneForever = false
 				}
+			}
+			if allDoneForever {
+				delete(ackOps, opID)
+				delete(opWrites, opID)
+				continue
 			}
 			if opHasDirty {
 				unpersistedOps++
@@ -998,21 +1336,41 @@ func computeContractFeaturesWithWeightsUncached(events []trace.Event, weights DC
 		danglingSSTCount := 0
 		var danglingSSTBytes uint64
 		for _, fi := range files {
-			if fi.isSST && (fi.dirtyBytes > 0 || len(fi.dirtySpans) > 0 || !fi.dirEntrySynced) {
+			in := fi.inode
+			_, parentUnsynced := unsyncedDirs[fi.parentDir]
+			if in.isSST && (in.dirtyBytes > 0 || len(in.dirtySpans) > 0 || !fi.dirEntrySynced || parentUnsynced) {
 				if fi.committedInManifest {
 					danglingSSTCount++
-					vol := fi.dirtyBytes
-					if vol == 0 && fi.size > 0 {
-						vol = uint64(fi.size)
+					var vol uint64
+					if !fi.dirEntrySynced || parentUnsynced {
+						if in.size > 0 {
+							vol = uint64(in.size)
+						} else {
+							vol = in.dirtyBytes
+						}
+					} else {
+						vol = in.dirtyBytes
+						if vol == 0 && in.size > 0 {
+							vol = uint64(in.size)
+						}
 					}
 					danglingSSTBytes += vol
 				}
-			} else if fi.isManifest && (fi.dirtyBytes > 0 || !fi.dirEntrySynced) {
-				if fi.closedWhileDirty || manifestDirtyUncommitted {
+			} else if in.isManifest && (in.dirtyBytes > 0 || !fi.dirEntrySynced || parentUnsynced) {
+				if in.closedWhileDirty || manifestDirtyUncommitted {
 					danglingSSTCount++
-					vol := fi.dirtyBytes
-					if vol == 0 && fi.size > 0 {
-						vol = uint64(fi.size)
+					var vol uint64
+					if !fi.dirEntrySynced || parentUnsynced {
+						if in.size > 0 {
+							vol = uint64(in.size)
+						} else {
+							vol = in.dirtyBytes
+						}
+					} else {
+						vol = in.dirtyBytes
+						if vol == 0 && in.size > 0 {
+							vol = uint64(in.size)
+						}
 					}
 					danglingSSTBytes += vol
 				}
@@ -1024,10 +1382,10 @@ func computeContractFeaturesWithWeightsUncached(events []trace.Event, weights DC
 		critCount := 0
 		for _, r := range pendingRenames {
 			if r.violating {
-				isOptionsOrWAL := strings.Contains(r.to, "OPTIONS") || strings.HasSuffix(r.to, ".log") || strings.Contains(r.to, ".log")
+				isOptionsOrWAL := isOptionsPath(r.to) || strings.HasSuffix(r.to, ".log")
 				if isOptionsOrWAL {
 					// WAL/options directory hazards require at least one acknowledged sync operation
-					if len(ackSyncOps) > 0 {
+					if hasAckSyncOp {
 						pendingCount++
 						if r.isCritical {
 							critCount++
@@ -1069,23 +1427,7 @@ func computeContractFeaturesWithWeightsUncached(events []trace.Event, weights DC
 			score += weights.WALWeight*float64(unpersistedOps) + 3.0*math.Log1p(float64(danglingWAL))
 		}
 
-		// Compute closed-WAL lifecycle indicators.
-		var hasClosedDirtyLog bool
-		var dirtyLogBytes uint64
-		for _, f := range files {
-			if f.isWAL && f.closedWhileDirty {
-				hasClosedDirtyLog = true
-				dirtyLogBytes += f.dirtyBytes
-			}
-		}
-
 		// Compute UnsyncedDirEntryCount: max unsynced dir entries in any single parentDir.
-		parentUnsyncedCount := make(map[string]int)
-		for _, f := range files {
-			if !f.dirEntrySynced {
-				parentUnsyncedCount[f.parentDir]++
-			}
-		}
 		for dirPath := range unsyncedDirs {
 			pdir := parent(dirPath)
 			parentUnsyncedCount[pdir]++
@@ -1097,7 +1439,7 @@ func computeContractFeaturesWithWeightsUncached(events []trace.Event, weights DC
 			}
 		}
 
-		cuts[event.ID] = ContractFeatures{
+		cuts[cutID] = ContractFeatures{
 			AckSyncMissing:          ackMissing,
 			UnpersistedAckOps:       unpersistedOps,
 			DanglingWALBytes:        danglingWAL,
@@ -1112,6 +1454,7 @@ func computeContractFeaturesWithWeightsUncached(events []trace.Event, weights DC
 			DirtyLogBytes:           dirtyLogBytes,
 			UnsyncedDirEntryCount:   maxUnsyncedDirEntries,
 		}
+		prevCut = cutID
 	}
 
 	return cuts
@@ -1163,13 +1506,19 @@ func UnsyncedDirectoryRename(events []trace.Event, cut uint64) (bool, int, int) 
 	return cf.UnsyncedDirectoryRename, cf.PendingRenames, cf.CriticalPendingRenames
 }
 
+func (view *View) ensureContractFeatures() map[uint64]ContractFeatures {
+	view.contractOnce.Do(func() {
+		view.contractFeat = ComputeContractFeatures(view.Events)
+	})
+	return view.contractFeat
+}
+
 // ContractFeatures returns the contract features for cutoff cut from the view.
 func (view *View) ContractFeatures(cut uint64) ContractFeatures {
-	if view == nil || len(view.Events) == 0 {
+	if view == nil {
 		return ContractFeatures{}
 	}
-	m := view.AllContractFeatures()
-	return m[cut]
+	return view.ensureContractFeatures()[cut]
 }
 
 // ContractScore returns the composite contract score for cutoff cut from the view.
@@ -1177,13 +1526,10 @@ func (view *View) ContractScore(cut uint64) float64 {
 	return view.ContractFeatures(cut).ContractScore
 }
 
-// AllContractFeatures returns contract features for all cutoffs in the view.
+// AllContractFeatures returns a cloned map of contract features for all cutoffs in the view.
 func (view *View) AllContractFeatures() map[uint64]ContractFeatures {
-	if view == nil || len(view.Events) == 0 {
+	if view == nil {
 		return nil
 	}
-	view.contractOnce.Do(func() {
-		view.contractFeat = ComputeContractFeatures(view.Events)
-	})
-	return view.contractFeat
+	return maps.Clone(view.ensureContractFeatures())
 }

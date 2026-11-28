@@ -75,3 +75,76 @@ func TestUnrepresentablePathsAreRefused(t *testing.T) {
 		}
 	}
 }
+
+func TestRootAndDotPathsAreAcceptedOnlyForOpenDir(t *testing.T) {
+	for _, rootPath := range []string{"", ".", "/", "/.", "//."} {
+		mem := vfs.NewMem()
+		rec := vfsrec.New(mem)
+
+		df, err := rec.OpenDir(rootPath)
+		if err != nil {
+			t.Fatalf("OpenDir(%q) failed: %v", rootPath, err)
+		}
+		if err := df.Sync(); err != nil {
+			t.Fatalf("OpenDir(%q).Sync() failed: %v", rootPath, err)
+		}
+		if err := df.Close(); err != nil {
+			t.Fatalf("OpenDir(%q).Close() failed: %v", rootPath, err)
+		}
+
+		events := rec.Events()
+		if err := trace.Validate(events); err != nil {
+			t.Fatalf("OpenDir(%q) produced invalid trace: %v", rootPath, err)
+		}
+		if len(events) != 3 || events[0].Kind != trace.KindOpenDir || events[0].File != "" || !events[0].Dir {
+			t.Fatalf("OpenDir(%q) unexpected events: %+v", rootPath, events)
+		}
+	}
+
+	for _, rootPath := range []string{"", ".", "/", "/."} {
+		mem := vfs.NewMem()
+		if err := mem.MkdirAll("existing", 0755); err != nil {
+			t.Fatal(err)
+		}
+		f, err := mem.Create("seed.txt", vfs.WriteCategoryUnspecified)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = f.Close()
+		rec := vfsrec.New(mem)
+
+		checkRefused := func(op string, err error) {
+			t.Helper()
+			if !errors.Is(err, vfsrec.ErrUnrepresentablePath) {
+				t.Fatalf("%s(%q): got %v, want ErrUnrepresentablePath", op, rootPath, err)
+			}
+		}
+
+		_, err = rec.Create(rootPath, vfs.WriteCategoryUnspecified)
+		checkRefused("Create", err)
+		_, err = rec.Open(rootPath)
+		checkRefused("Open", err)
+		_, err = rec.OpenReadWrite(rootPath, vfs.WriteCategoryUnspecified)
+		checkRefused("OpenReadWrite", err)
+		_, err = rec.ReuseForWrite("seed.txt", rootPath, vfs.WriteCategoryUnspecified)
+		checkRefused("ReuseForWrite(new)", err)
+		_, err = rec.ReuseForWrite(rootPath, "dst.txt", vfs.WriteCategoryUnspecified)
+		checkRefused("ReuseForWrite(old)", err)
+		_, err = rec.Lock(rootPath)
+		checkRefused("Lock", err)
+		checkRefused("Link(old)", rec.Link(rootPath, "dst.txt"))
+		checkRefused("Link(new)", rec.Link("seed.txt", rootPath))
+		checkRefused("Rename(old)", rec.Rename(rootPath, "dst.txt"))
+		checkRefused("Rename(new)", rec.Rename("seed.txt", rootPath))
+		checkRefused("Remove", rec.Remove(rootPath))
+		checkRefused("RemoveAll", rec.RemoveAll(rootPath))
+		checkRefused("MkdirAll", rec.MkdirAll(rootPath, 0755))
+
+		if evs := rec.Events(); len(evs) != 0 {
+			t.Fatalf("refused calls for %q emitted events: %+v", rootPath, evs)
+		}
+		if _, err := mem.Stat("seed.txt"); err != nil {
+			t.Fatalf("refused calls modified inner FS for %q: %v", rootPath, err)
+		}
+	}
+}

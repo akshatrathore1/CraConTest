@@ -1,4 +1,5 @@
 # Go build output
+/cracontest
 *.exe
 *.test
 *.out
@@ -21,3 +22,8 @@ Thumbs.db
 # Python
 __pycache__/
 *.pyc
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/

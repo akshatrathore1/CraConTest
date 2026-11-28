@@ -59,14 +59,6 @@ type DiscoveryRecord struct {
 	GitCommit           string
 }
 
-func discoveryResultsDir() string {
-	dir := filepath.Join("..", "..", "results")
-	if fi, err := os.Stat(dir); err == nil && fi.IsDir() {
-		return dir
-	}
-	return "results"
-}
-
 // validateSubsystemDiscoveryCSV verifies the committed discovery CSV artifact.
 func validateSubsystemDiscoveryCSV(t *testing.T, csvPath string) {
 	t.Helper()
@@ -92,9 +84,22 @@ func validateSubsystemDiscoveryCSV(t *testing.T, csvPath string) {
 		return -1
 	}
 
+	wIdx := colIdx("workload")
+	univIdx := colIdx("universe_size")
+	violIdx := colIdx("violations")
 	dcIdx := colIdx("durably_committed")
+	prefixIdx := colIdx("prefix_violations")
+	structIdx := colIdx("structural_violations")
+	oeIdx := colIdx("open_errors")
 	panicIdx := colIdx("panics")
 	hangIdx := colIdx("hangs")
+	oracleErrIdx := -1
+	for i, h := range header {
+		if h == "oracle_errors" {
+			oracleErrIdx = i
+			break
+		}
+	}
 
 	rows := 0
 	for {
@@ -106,11 +111,30 @@ func validateSubsystemDiscoveryCSV(t *testing.T, csvPath string) {
 			t.Fatalf("read row %d: %v", rows+1, err)
 		}
 		rows++
-
+		if len(rec) != len(header) {
+			t.Fatalf("row %d column count = %d, want %d", rows, len(rec), len(header))
+		}
+		if rec[wIdx] == "" {
+			t.Fatalf("row %d: empty workload name", rows)
+		}
+		univ, err := strconv.Atoi(rec[univIdx])
+		if err != nil || univ <= 0 {
+			t.Fatalf("row %d: invalid universe_size %q", rows, rec[univIdx])
+		}
+		for _, idx := range []int{violIdx, prefixIdx, structIdx, oeIdx} {
+			if v, err := strconv.Atoi(rec[idx]); err != nil || v < 0 {
+				t.Fatalf("row %d: invalid count %q=%s", rows, header[idx], rec[idx])
+			}
+		}
 		for _, idx := range []int{dcIdx, panicIdx, hangIdx} {
 			v, err := strconv.Atoi(rec[idx])
 			if err != nil || v != 0 {
 				t.Fatalf("row %d: non-zero count %q=%s in %s (expected 0)", rows, header[idx], rec[idx], csvPath)
+			}
+		}
+		if oracleErrIdx >= 0 {
+			if v, err := strconv.Atoi(rec[oracleErrIdx]); err != nil || v != 0 {
+				t.Fatalf("row %d: non-zero oracle_errors=%s (expected 0)", rows, rec[oracleErrIdx])
 			}
 		}
 	}
@@ -121,55 +145,46 @@ func validateSubsystemDiscoveryCSV(t *testing.T, csvPath string) {
 	t.Logf("Validated %d rows in %s with 0 durably_committed violations, 0 panics, 0 hangs", rows, csvPath)
 }
 
-// writeSubsystemDiscoveryCSV writes the empirical discovery records to results/subsystem_discovery.csv.
+// writeSubsystemDiscoveryCSV writes the empirical discovery records atomically.
 func writeSubsystemDiscoveryCSV(records []DiscoveryRecord, csvPath string) error {
-	if err := os.MkdirAll(filepath.Dir(csvPath), 0755); err != nil {
-		return fmt.Errorf("mkdir: %w", err)
-	}
-
-	f, err := os.Create(csvPath)
-	if err != nil {
-		return fmt.Errorf("create %s: %w", csvPath, err)
-	}
-	defer f.Close()
-
-	w := csv.NewWriter(f)
-	header := []string{
-		"workload", "seed", "operations", "ingest_every", "ratchet_at",
-		"checkpoint_at", "max_manifest_file_size", "policies", "universe_size",
-		"violations", "durably_committed", "prefix_violations", "structural_violations",
-		"open_errors", "panics", "hangs", "git_commit",
-	}
-	if err := w.Write(header); err != nil {
-		return err
-	}
-
-	for _, rec := range records {
-		row := []string{
-			rec.WorkloadName,
-			strconv.FormatUint(rec.Seed, 10),
-			strconv.Itoa(rec.Operations),
-			strconv.Itoa(rec.IngestEvery),
-			strconv.Itoa(rec.RatchetAt),
-			strconv.Itoa(rec.CheckpointAt),
-			strconv.FormatInt(rec.MaxManifestFileSize, 10),
-			rec.Policies,
-			strconv.Itoa(rec.UniverseSize),
-			strconv.Itoa(rec.Violations),
-			strconv.Itoa(rec.DurablyCommitted),
-			strconv.Itoa(rec.PrefixViolations),
-			strconv.Itoa(rec.StructuralViols),
-			strconv.Itoa(rec.OpenErrors),
-			strconv.Itoa(rec.Panics),
-			strconv.Itoa(rec.Hangs),
-			rec.GitCommit,
+	return writeCSVAtomic(csvPath, func(w *csv.Writer) error {
+		header := []string{
+			"workload", "seed", "operations", "ingest_every", "ratchet_at",
+			"checkpoint_at", "max_manifest_file_size", "policies", "universe_size",
+			"violations", "durably_committed", "prefix_violations", "structural_violations",
+			"open_errors", "panics", "hangs", "oracle_errors", "git_commit",
 		}
-		if err := w.Write(row); err != nil {
+		if err := w.Write(header); err != nil {
 			return err
 		}
-	}
-	w.Flush()
-	return w.Error()
+
+		for _, rec := range records {
+			row := []string{
+				rec.WorkloadName,
+				strconv.FormatUint(rec.Seed, 10),
+				strconv.Itoa(rec.Operations),
+				strconv.Itoa(rec.IngestEvery),
+				strconv.Itoa(rec.RatchetAt),
+				strconv.Itoa(rec.CheckpointAt),
+				strconv.FormatInt(rec.MaxManifestFileSize, 10),
+				rec.Policies,
+				strconv.Itoa(rec.UniverseSize),
+				strconv.Itoa(rec.Violations),
+				strconv.Itoa(rec.DurablyCommitted),
+				strconv.Itoa(rec.PrefixViolations),
+				strconv.Itoa(rec.StructuralViols),
+				strconv.Itoa(rec.OpenErrors),
+				strconv.Itoa(rec.Panics),
+				strconv.Itoa(rec.Hangs),
+				strconv.Itoa(rec.OracleErrors),
+				rec.GitCommit,
+			}
+			if err := w.Write(row); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 // runSubsystemTrial executes a full workload run under MUT-0 and explores all crash candidates.
@@ -224,12 +239,12 @@ func runSubsystemTrial(t *testing.T, w SubsystemDiscoveryWorkload, seed uint64) 
 
 	rawHist, err := workload.Run(db, rec, wCfg)
 	if err != nil {
-		_ = db.Close()
+		_, _ = safeCloseDB(db)
 		t.Fatalf("%s seed %d: run workload failed: %v", w.Name, seed, err)
 	}
 	db.TestOnlyWaitForCleaning()
-	if err := db.Close(); err != nil {
-		t.Fatalf("%s seed %d: close pebble failed: %v", w.Name, seed, err)
+	if panicked, closeErr := safeCloseDB(db); panicked || closeErr != nil {
+		t.Fatalf("%s seed %d: close pebble failed (panic=%v): %v", w.Name, seed, panicked, closeErr)
 	}
 
 	traceEvents := rec.Events()
@@ -261,6 +276,12 @@ func runSubsystemTrial(t *testing.T, w SubsystemDiscoveryWorkload, seed uint64) 
 	})
 	if err != nil {
 		t.Fatalf("%s seed %d: run explore failed: %v", w.Name, seed, err)
+	}
+	if expRes.Summary.OracleErrors != 0 {
+		t.Fatalf("%s seed %d: expected 0 oracle_errors, got %d", w.Name, seed, expRes.Summary.OracleErrors)
+	}
+	if err := ValidateTable(universe, NormalizeTable(expRes.Outcomes)); err != nil {
+		t.Fatalf("%s seed %d: ValidateTable failed: %v", w.Name, seed, err)
 	}
 
 	var durablyCommitted, prefixViols, structuralViols int
@@ -310,19 +331,18 @@ func runSubsystemTrial(t *testing.T, w SubsystemDiscoveryWorkload, seed uint64) 
 	}
 
 	// Verification Assertions for Requirement R3:
-	// 1. Ingested data is never lost once db.Ingest returns nil (0 durably_committed violations).
 	if durablyCommitted != 0 {
 		t.Errorf("%s seed %d: expected 0 durably_committed violations, got %d", w.Name, seed, durablyCommitted)
 	}
-
-	// 2. Zero crashes cause pebble.Open to panic across all workloads and recovery states.
 	if expRes.Summary.Panics != 0 {
 		t.Errorf("%s seed %d: expected 0 panics during recovery, got %d", w.Name, seed, expRes.Summary.Panics)
 	}
+	if expRes.Summary.Hangs != 0 {
+		t.Errorf("%s seed %d: expected 0 hangs during recovery, got %d", w.Name, seed, expRes.Summary.Hangs)
+	}
 
-	// 3. For Workload B (Format Ratchet): verify whether crashes during or after db.RatchetFormatMajorVersion
-	// cause open_error or panic due to marker or manifest synchronization.
-	if w.Name == "Workload B: Live Format-Version Ratcheting" {
+	// Verify ratchet-triggering workloads actually recorded ratchet ops and suffered 0 post-ratchet open/panic failures.
+	if w.RatchetAt > 0 {
 		var ratchetBegin uint64
 		for _, entry := range correlated {
 			if entry.Kind == "ratchet" {
@@ -330,7 +350,13 @@ func runSubsystemTrial(t *testing.T, w SubsystemDiscoveryWorkload, seed uint64) 
 				break
 			}
 		}
-		if ratchetBegin > 0 {
+		if ratchetBegin == 0 {
+			t.Fatalf("%s seed %d: expected ratchet operation in correlated history", w.Name, seed)
+		}
+		if w.Name == "Workload B: Live Format-Version Ratcheting" {
+			if expRes.Summary.OpenErrors != 0 {
+				t.Errorf("%s seed %d: expected 0 open_errors in live ratchet run, got %d", w.Name, seed, expRes.Summary.OpenErrors)
+			}
 			for _, outcome := range expRes.Outcomes {
 				if outcome.Candidate.Event >= ratchetBegin {
 					if outcome.Class == oracle.ClassOpenError || outcome.Class == oracle.ClassPanic {
@@ -339,6 +365,19 @@ func runSubsystemTrial(t *testing.T, w SubsystemDiscoveryWorkload, seed uint64) 
 					}
 				}
 			}
+		}
+	}
+
+	if w.CheckpointAt > 0 {
+		var ckptBegin uint64
+		for _, entry := range correlated {
+			if entry.Kind == "checkpoint" {
+				ckptBegin = entry.BeginEvent
+				break
+			}
+		}
+		if ckptBegin == 0 {
+			t.Fatalf("%s seed %d: expected checkpoint operation in correlated history", w.Name, seed)
 		}
 	}
 
@@ -352,11 +391,51 @@ func runSubsystemTrial(t *testing.T, w SubsystemDiscoveryWorkload, seed uint64) 
 // Across representative seeds (42, 100, 777).
 // Generation of results/subsystem_discovery.csv is guarded by the package-level *updateArtifacts flag.
 func TestSubsystemDiscovery(t *testing.T) {
-	resultsDir := discoveryResultsDir()
+	resultsDir := findResultsDirInternal(t)
 	csvPath := filepath.Join(resultsDir, "subsystem_discovery.csv")
 
 	if !*updateArtifacts {
 		validateSubsystemDiscoveryCSV(t, csvPath)
+		if !testing.Short() {
+			liveWorkloads := []SubsystemDiscoveryWorkload{
+				{
+					Name:        "Workload A: External SSTable Ingestion",
+					Operations:  45,
+					KeyCount:    32,
+					ValueBytes:  64,
+					SyncEvery:   5,
+					FlushEvery:  20,
+					IngestEvery: 15,
+					Policies:    []int{0, 50, 100},
+				},
+				{
+					Name:       "Workload B: Live Format-Version Ratcheting",
+					Operations: 55,
+					KeyCount:   32,
+					ValueBytes: 64,
+					SyncEvery:  8,
+					FlushEvery: 20,
+					RatchetAt:  30,
+					Policies:   []int{0, 50, 100},
+				},
+				{
+					Name:                "Workload C: Combined Lifecycle Stress",
+					Operations:          55,
+					KeyCount:            32,
+					ValueBytes:          64,
+					SyncEvery:           8,
+					FlushEvery:          20,
+					IngestEvery:         20,
+					RatchetAt:           25,
+					CheckpointAt:        35,
+					MaxManifestFileSize: 1,
+					Policies:            []int{0, 50, 100},
+				},
+			}
+			for _, lw := range liveWorkloads {
+				_ = runSubsystemTrial(t, lw, 42)
+			}
+		}
 		return
 	}
 

@@ -3,6 +3,7 @@ package workload_test
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 	"sort"
@@ -109,6 +110,12 @@ func TestWorkloadExecutionWithPebble(t *testing.T) {
 	if err != nil {
 		t.Fatalf("pebble.Open: %v", err)
 	}
+	closed := false
+	defer func() {
+		if !closed {
+			_ = db.Close()
+		}
+	}()
 
 	cfg := workload.Config{
 		Seed:       42,
@@ -123,6 +130,7 @@ func TestWorkloadExecutionWithPebble(t *testing.T) {
 	if err != nil {
 		t.Fatalf("workload.Run: %v", err)
 	}
+	closed = true
 	if err := db.Close(); err != nil {
 		t.Fatalf("db.Close: %v", err)
 	}
@@ -271,6 +279,20 @@ func TestWorkloadValidateAndPlanInvalidConfig(t *testing.T) {
 		{"negative flush every", func() workload.Config { c := valid; c.FlushEvery = -1; return c }()},
 		{"negative ingest every", func() workload.Config { c := valid; c.IngestEvery = -1; return c }()},
 		{"negative ratchet at", func() workload.Config { c := valid; c.RatchetAt = -1; return c }()},
+		{"negative compact at", func() workload.Config { c := valid; c.CompactAt = -1; return c }()},
+		{"negative checkpoint at", func() workload.Config { c := valid; c.CheckpointAt = -1; return c }()},
+		{"negative max manifest file size", func() workload.Config { c := valid; c.MaxManifestFileSize = -1; return c }()},
+		{"key count 1 default", func() workload.Config { c := valid; c.KeyCount = 1; return c }()},
+		{"key count 1 delete heavy", func() workload.Config { c := valid; c.Preset = workload.PresetDeleteHeavy; c.KeyCount = 1; return c }()},
+		{"key count 1 with ingest", func() workload.Config {
+			c := valid
+			c.Preset = workload.PresetYCSBA
+			c.KeyCount = 1
+			c.IngestEvery = 5
+			return c
+		}()},
+		{"negative key count preset", func() workload.Config { c := valid; c.Preset = workload.PresetYCSBA; c.KeyCount = -1; return c }()},
+		{"negative value bytes preset", func() workload.Config { c := valid; c.Preset = workload.PresetYCSBA; c.ValueBytes = -1; return c }()},
 		{"unknown preset", func() workload.Config { c := valid; c.Preset = "unknown-xyz"; return c }()},
 	}
 
@@ -928,6 +950,21 @@ func TestWorkloadPresets(t *testing.T) {
 			if err := history.Validate(entries); err != nil {
 				t.Fatalf("history.Validate: %v", err)
 			}
+			checkpointsSeen := 0
+			for _, e := range entries {
+				if e.Kind == "checkpoint" {
+					checkpointsSeen++
+					if preset == workload.PresetDeleteHeavy && checkpointsSeen > 1 {
+						if !strings.Contains(e.Err, "file already exists") {
+							t.Fatalf("expected subsequent default checkpoint to report existing dir error, got: %q", e.Err)
+						}
+						continue
+					}
+				}
+				if e.Err != "" {
+					t.Fatalf("preset %s op %d (%s): unexpected error %q", preset, e.Op, e.Kind, e.Err)
+				}
+			}
 
 			traceEvents := rec.Events()
 			if err := trace.Validate(traceEvents); err != nil {
@@ -1045,16 +1082,7 @@ func normalizeEngineEventOrder(events []trace.Event) []trace.Event {
 			if isFlushOrWALEvent(out[i]) && isIngestEvent(out[i+1]) {
 				out[i], out[i+1] = out[i+1], out[i]
 				changed = true
-			} else if out[i].Kind == trace.KindEngineEvent && out[i].Note == "FlushBegin" &&
-				out[i+1].Kind == trace.KindRemove && strings.Contains(out[i+1].File, "MANIFEST") {
-				out[i], out[i+1] = out[i+1], out[i]
-				changed = true
-			} else if out[i].Kind == trace.KindEngineEvent && !out[i].IsMutation() &&
-				out[i+1].Kind == trace.KindRemove && out[i].Op == out[i+1].Op {
-				out[i], out[i+1] = out[i+1], out[i]
-				changed = true
-			} else if (out[i].Kind == trace.KindEngineEvent && (out[i].Note == "TableIngested" || out[i].Note == "TableCreated")) &&
-				(out[i+1].Kind == trace.KindRemove && (strings.Contains(out[i+1].File, "ingest_staging") || strings.Contains(out[i+1].File, "ingest_"))) {
+			} else if out[i].Kind == trace.KindEngineEvent && out[i+1].Kind == trace.KindRemove {
 				out[i], out[i+1] = out[i+1], out[i]
 				changed = true
 			}
@@ -1089,6 +1117,16 @@ func normalizeEngineEventOrder(events []trace.Event) []trace.Event {
 	return out
 }
 
+func sameNormalizedEvent(e1, e2 trace.Event) bool {
+	return e1.Kind == e2.Kind && e1.File == e2.File && e1.File2 == e2.File2 &&
+		e1.Off == e2.Off && e1.Len == e2.Len && e1.Cat == e2.Cat &&
+		e1.Dir == e2.Dir && e1.Op == e2.Op && e1.OpKind == e2.OpKind &&
+		e1.Note == e2.Note && e1.Created == e2.Created &&
+		e1.Size == e2.Size && e1.Mode == e2.Mode &&
+		e1.FullSync == e2.FullSync && e1.Err == e2.Err &&
+		reflect.DeepEqual(e1.Inputs, e2.Inputs) && reflect.DeepEqual(e1.Outputs, e2.Outputs)
+}
+
 func sameEventSequence(a, b []trace.Event) bool {
 	if len(a) != len(b) {
 		return false
@@ -1096,12 +1134,7 @@ func sameEventSequence(a, b []trace.Event) bool {
 	na := normalizeEngineEventOrder(a)
 	nb := normalizeEngineEventOrder(b)
 	for i := range na {
-		e1, e2 := na[i], nb[i]
-		if e1.Kind != e2.Kind || e1.File != e2.File || e1.File2 != e2.File2 ||
-			e1.Off != e2.Off || e1.Len != e2.Len || e1.Cat != e2.Cat ||
-			e1.Dir != e2.Dir || e1.Op != e2.Op || e1.OpKind != e2.OpKind ||
-			e1.Note != e2.Note || e1.Created != e2.Created ||
-			!reflect.DeepEqual(e1.Inputs, e2.Inputs) || !reflect.DeepEqual(e1.Outputs, e2.Outputs) {
+		if !sameNormalizedEvent(na[i], nb[i]) {
 			return false
 		}
 	}
@@ -1179,12 +1212,7 @@ func TestWorkloadIngestAndCheckpointTraceDeterminism(t *testing.T) {
 						}
 						diffIdx := -1
 						for idx := 0; idx < minLen; idx++ {
-							e1, e2 := events[idx], baseEvents[idx]
-							if e1.Kind != e2.Kind || e1.File != e2.File || e1.File2 != e2.File2 ||
-								e1.Off != e2.Off || e1.Len != e2.Len || e1.Cat != e2.Cat ||
-								e1.Dir != e2.Dir || e1.Op != e2.Op || e1.OpKind != e2.OpKind ||
-								e1.Note != e2.Note || e1.Created != e2.Created ||
-								!reflect.DeepEqual(e1.Inputs, e2.Inputs) || !reflect.DeepEqual(e1.Outputs, e2.Outputs) {
+							if !sameNormalizedEvent(events[idx], baseEvents[idx]) {
 								diffIdx = idx
 								break
 							}
@@ -1316,7 +1344,7 @@ func TestWorkloadEvaluatedShapeTraceDeterminism(t *testing.T) {
 					previousEvents := normalizeEngineEventOrder(baseline)
 					firstDifference := 0
 					for firstDifference < len(currentEvents) && firstDifference < len(previousEvents) {
-						if !sameEventSequence(currentEvents[firstDifference:firstDifference+1], previousEvents[firstDifference:firstDifference+1]) {
+						if !sameNormalizedEvent(currentEvents[firstDifference], previousEvents[firstDifference]) {
 							break
 						}
 						firstDifference++
@@ -1344,5 +1372,390 @@ func TestWorkloadEvaluatedShapeTraceDeterminism(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestWorkloadCustomPrimaryDBDir(t *testing.T) {
+	t.Run("CustomDirWithFaultAndRecorder", func(t *testing.T) {
+		mem := vfs.NewCrashableMem()
+		rec := vfsrec.New(mem)
+		faultFS, err := faults.New("MUT-1", rec)
+		if err != nil {
+			t.Fatalf("faults.New: %v", err)
+		}
+		listener := rec.EventListener()
+		opts := &pebble.Options{
+			FS:            faultFS,
+			Logger:        recovery.PanicLogger{},
+			MemTableSize:  64 * 1024,
+			EventListener: &listener,
+		}
+		db, err := pebble.Open("custom_db", opts)
+		if err != nil {
+			t.Fatalf("pebble.Open: %v", err)
+		}
+		defer func() {
+			_ = db.Close()
+		}()
+
+		cfg := workload.Config{
+			Dir:        "custom_db",
+			Seed:       42,
+			Operations: 10,
+			KeyCount:   16,
+			ValueBytes: 64,
+			SyncEvery:  1,
+			FlushEvery: 50,
+			FS:         faultFS,
+		}
+
+		entries, err := workload.Run(db, rec, cfg)
+		if err != nil {
+			t.Fatalf("workload.Run: %v", err)
+		}
+		if len(entries) == 0 {
+			t.Fatalf("expected entries, got 0")
+		}
+		if rec.WALWriteCount() == 0 {
+			t.Fatalf("expected WALWriteCount > 0, got %d", rec.WALWriteCount())
+		}
+	})
+
+	t.Run("CustomDirWithoutRecorderErrors", func(t *testing.T) {
+		mem := vfs.NewMem()
+		opts := &pebble.Options{
+			FS:     mem,
+			Logger: recovery.PanicLogger{},
+		}
+		db, err := pebble.Open("custom_db", opts)
+		if err != nil {
+			t.Fatalf("pebble.Open: %v", err)
+		}
+		defer func() {
+			_ = db.Close()
+		}()
+
+		cfg := workload.Config{
+			Dir:        "custom_db",
+			Seed:       42,
+			Operations: 10,
+			KeyCount:   16,
+			ValueBytes: 64,
+			SyncEvery:  1,
+			FlushEvery: 50,
+			FS:         mem,
+		}
+
+		_, err = workload.Run(db, nil, cfg)
+		if err == nil {
+			t.Fatalf("expected error when Dir is set without recorder, got nil")
+		}
+		if !strings.Contains(err.Error(), "no recording FS") {
+			t.Fatalf("expected error mentioning 'no recording FS', got: %v", err)
+		}
+	})
+}
+
+func TestWorkloadValidatePresetYCSBF(t *testing.T) {
+	if err := workload.Validate(workload.Config{
+		Preset:     workload.PresetYCSBF,
+		Operations: 20,
+		Seed:       1,
+	}); err != nil {
+		t.Fatalf("Validate(PresetYCSBF with default KeyCount) failed: %v", err)
+	}
+	if err := workload.Validate(workload.Config{
+		Preset:     workload.PresetYCSBF,
+		Operations: 20,
+		KeyCount:   1,
+		Seed:       1,
+	}); err == nil {
+		t.Fatal("Validate(PresetYCSBF with KeyCount=1) unexpectedly succeeded")
+	}
+}
+
+func TestWorkloadLargeKeyCountOrderingAndSmallValues(t *testing.T) {
+	cfg := workload.Config{
+		Seed:        7,
+		Operations:  500,
+		KeyCount:    15000,
+		ValueBytes:  4,
+		SyncEvery:   10,
+		FlushEvery:  100,
+		IngestEvery: 25,
+	}
+	plan := workload.Plan(cfg)
+	if len(plan) == 0 {
+		t.Fatal("Plan returned empty slice for KeyCount=15000")
+	}
+	seenVals := make(map[string]bool)
+	for _, op := range plan {
+		switch op.Kind {
+		case "set":
+			if len(op.Value) != 4 {
+				t.Fatalf("op %d value len=%d, want 4", op.Op, len(op.Value))
+			}
+			seenVals[string(op.Value)] = true
+		case "range_delete":
+			if bytes.Compare(op.Key, op.EndKey) >= 0 {
+				t.Fatalf("op %d range_delete key %q >= end %q", op.Op, op.Key, op.EndKey)
+			}
+		case "ingest":
+			for j := 1; j < len(op.Mutations); j++ {
+				if bytes.Compare(op.Mutations[j-1].Key, op.Mutations[j].Key) >= 0 {
+					t.Fatalf("op %d ingest keys out of order: %q >= %q",
+						op.Op, op.Mutations[j-1].Key, op.Mutations[j].Key)
+				}
+			}
+		}
+	}
+	if len(seenVals) < 2 {
+		t.Fatalf("expected distinct 4-byte tag values across ops, got %d unique", len(seenVals))
+	}
+}
+
+func TestWorkloadRunNilDBAndMarkerIsolation(t *testing.T) {
+	if _, err := workload.Run(nil, nil, workload.DefaultConfig()); err == nil {
+		t.Fatal("expected error from workload.Run with nil db, got nil")
+	}
+
+	mem := vfs.NewCrashableMem()
+	rec := vfsrec.New(mem)
+	faultFS, err := faults.New(faults.MUT0, rec)
+	if err != nil {
+		t.Fatalf("faults.New: %v", err)
+	}
+	listener := rec.EventListener()
+	db, err := pebble.Open("db", &pebble.Options{
+		FS:            faultFS,
+		Logger:        recovery.PanicLogger{},
+		EventListener: &listener,
+	})
+	if err != nil {
+		t.Fatalf("pebble.Open: %v", err)
+	}
+	defer func() {
+		_ = db.Close()
+	}()
+
+	custom := &testMarker{}
+	cfg := workload.Config{
+		Preset:     workload.PresetYCSBA,
+		Seed:       3,
+		Operations: 12,
+		ValueBytes: 32,
+		SyncEvery:  1,
+		FS:         faultFS,
+	}
+	entries, err := workload.Run(db, custom, cfg)
+	if err != nil {
+		t.Fatalf("Run with custom marker: %v", err)
+	}
+	if len(custom.begins) != len(entries) || len(custom.ends) != len(entries) {
+		t.Fatalf("custom marker was bypassed: begins=%d ends=%d entries=%d",
+			len(custom.begins), len(custom.ends), len(entries))
+	}
+	for _, ev := range rec.Events() {
+		if ev.Kind == trace.KindOpBegin || ev.Kind == trace.KindOpEnd {
+			t.Fatalf("Run unexpectedly emitted %s event onto cfg.FS while custom marker was used", ev.Kind)
+		}
+	}
+	if err := history.Validate(entries); err != nil {
+		t.Fatalf("history.Validate with custom marker: %v", err)
+	}
+
+	// Nil marker with cfg.FS must also not emit OpBegin/OpEnd onto cfg.FS.
+	entriesNil, err := workload.Run(db, nil, cfg)
+	if err != nil {
+		t.Fatalf("Run with nil marker: %v", err)
+	}
+	if err := history.Validate(entriesNil); err != nil {
+		t.Fatalf("history.Validate with nil marker: %v", err)
+	}
+	for _, ev := range rec.Events() {
+		if ev.Kind == trace.KindOpBegin || ev.Kind == trace.KindOpEnd {
+			t.Fatalf("Run with nil marker unexpectedly emitted %s onto cfg.FS", ev.Kind)
+		}
+	}
+}
+
+func TestWorkloadCorrelateStrictValidation(t *testing.T) {
+	baseEvents := []trace.Event{
+		{ID: 1, Kind: trace.KindOpBegin, Op: 1, OpKind: "set"},
+		{ID: 2, Kind: trace.KindOpEnd, Op: 1, OpKind: "set"},
+		{ID: 3, Kind: trace.KindOpBegin, Op: 2, OpKind: "get"},
+	}
+	baseEntries := []history.Entry{
+		{Op: 1, Kind: "set", Mutations: []history.Mutation{{Kind: "set", Key: []byte("k"), Value: []byte("v")}}, BeginEvent: 10, EndEvent: 20},
+		{Op: 2, Kind: "get", BeginEvent: 30, EndEvent: 40},
+	}
+
+	// Missing OpEnd clears stale EndEvent on last entry instead of retaining 40.
+	corr, err := workload.Correlate(baseEntries, baseEvents)
+	if err != nil {
+		t.Fatalf("Correlate inflight: %v", err)
+	}
+	if corr[0].BeginEvent != 1 || corr[0].EndEvent != 2 {
+		t.Fatalf("unexpected correlated entry 0: %+v", corr[0])
+	}
+	if corr[1].BeginEvent != 3 || corr[1].EndEvent != 0 {
+		t.Fatalf("expected stale EndEvent cleared to 0, got %+v", corr[1])
+	}
+
+	// Invalid trace rejected.
+	if _, err := workload.Correlate(baseEntries, []trace.Event{{ID: 5, Kind: trace.KindOpBegin, Op: 1, OpKind: "set"}}); err == nil {
+		t.Fatal("expected Correlate to reject invalid trace")
+	}
+
+	// Missing OpBegin rejected.
+	if _, err := workload.Correlate([]history.Entry{{Op: 99, Kind: "get", BeginEvent: 1, EndEvent: 2}}, baseEvents[:2]); err == nil {
+		t.Fatal("expected Correlate to reject entry missing OpBegin")
+	}
+
+	// OpKind mismatch rejected.
+	if _, err := workload.Correlate([]history.Entry{{Op: 1, Kind: "get", BeginEvent: 1, EndEvent: 2}}, baseEvents[:2]); err == nil {
+		t.Fatal("expected Correlate to reject OpKind mismatch")
+	}
+
+	// Err mismatch rejected.
+	errEvents := []trace.Event{
+		{ID: 1, Kind: trace.KindOpBegin, Op: 1, OpKind: "get"},
+		{ID: 2, Kind: trace.KindOpEnd, Op: 1, OpKind: "get", Err: "boom"},
+	}
+	if _, err := workload.Correlate([]history.Entry{{Op: 1, Kind: "get", BeginEvent: 1, EndEvent: 2}}, errEvents); err == nil {
+		t.Fatal("expected Correlate to reject Err mismatch")
+	}
+}
+
+type failingStagingFS struct {
+	vfs.FS
+	failWrite bool
+	failClose bool
+}
+
+func (f *failingStagingFS) Create(name string, category vfs.DiskWriteCategory) (vfs.File, error) {
+	file, err := f.FS.Create(name, category)
+	if err != nil {
+		return nil, err
+	}
+	if strings.HasPrefix(name, "ingest_staging/") {
+		return &failingStagingFile{File: file, failWrite: f.failWrite, failClose: f.failClose}, nil
+	}
+	return file, nil
+}
+
+type failingStagingFile struct {
+	vfs.File
+	failWrite bool
+	failClose bool
+}
+
+func (f *failingStagingFile) Write(p []byte) (int, error) {
+	if f.failWrite {
+		return 0, errors.New("injected staging write failure")
+	}
+	return f.File.Write(p)
+}
+
+func (f *failingStagingFile) Close() error {
+	err := f.File.Close()
+	if f.failClose {
+		return errors.Join(err, errors.New("injected staging close failure"))
+	}
+	return err
+}
+
+func TestWorkloadRunIngestCleansPartialStagingAndPreservesCloseErr(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		failWrite bool
+		failClose bool
+		wantErr   string
+	}{
+		{name: "WriteAndCloseJoin", failWrite: true, failClose: true, wantErr: "injected staging write failure\ninjected staging write failure"},
+		{name: "CloseFailureCleansStaging", failWrite: false, failClose: true, wantErr: "injected staging close failure"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mem := vfs.NewCrashableMem()
+			sfs := &failingStagingFS{FS: mem, failWrite: tc.failWrite, failClose: tc.failClose}
+			db, err := pebble.Open("db", &pebble.Options{FS: mem, Logger: recovery.PanicLogger{}})
+			if err != nil {
+				t.Fatalf("pebble.Open: %v", err)
+			}
+			defer func() {
+				_ = db.Close()
+			}()
+
+			entries, err := workload.Run(db, nil, workload.Config{
+				Seed:        1,
+				Operations:  2,
+				KeyCount:    4,
+				ValueBytes:  5000,
+				IngestEvery: 2,
+				FS:          sfs,
+			})
+			if err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			foundIngest := false
+			for _, e := range entries {
+				if e.Kind == "ingest" {
+					foundIngest = true
+					if !strings.Contains(e.Err, tc.wantErr) {
+						t.Fatalf("expected error containing %q in ingest entry, got %q", tc.wantErr, e.Err)
+					}
+				}
+			}
+			if !foundIngest {
+				t.Fatal("expected ingest entry")
+			}
+			stagingFiles, err := mem.List("ingest_staging")
+			if err != nil {
+				t.Fatalf("List ingest_staging: %v", err)
+			}
+			for _, name := range stagingFiles {
+				if strings.HasSuffix(name, ".sst") {
+					t.Fatalf("leaked partial staging file %q after failed writeSST", name)
+				}
+			}
+		})
+	}
+}
+
+func TestWorkloadUniqueCheckpoints(t *testing.T) {
+	mem := vfs.NewCrashableMem()
+	rec := vfsrec.New(mem)
+	db, err := pebble.Open("db", &pebble.Options{FS: rec, Logger: recovery.PanicLogger{}})
+	if err != nil {
+		t.Fatalf("pebble.Open: %v", err)
+	}
+	defer func() {
+		_ = db.Close()
+	}()
+
+	entries, err := workload.Run(db, rec, workload.Config{
+		Preset:            workload.PresetDeleteHeavy,
+		UniqueCheckpoints: true,
+		Seed:              42,
+		Operations:        25,
+		ValueBytes:        32,
+		SyncEvery:         5,
+		FlushEvery:        10,
+		FS:                rec,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	checkpoints := 0
+	for _, e := range entries {
+		if e.Kind == "checkpoint" {
+			checkpoints++
+		}
+		if e.Err != "" {
+			t.Fatalf("op %d (%s) failed with UniqueCheckpoints=true: %q", e.Op, e.Kind, e.Err)
+		}
+	}
+	if checkpoints < 2 {
+		t.Fatalf("expected >= 2 checkpoints, got %d", checkpoints)
 	}
 }

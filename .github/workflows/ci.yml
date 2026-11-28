@@ -6,11 +6,14 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
   test-linux:
     name: Test (Linux)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 35
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -29,6 +32,43 @@ jobs:
 
       - name: Vet
         run: go vet ./...
+
+      - name: Enforce Import Boundaries
+        run: |
+          set -euo pipefail
+          mod="github.com/akshatrathore1/CraConTest"
+          for pkg in internal/graph internal/candidate internal/strategy; do
+            deps="$(go list -deps "${mod}/${pkg}")"
+            for banned in internal/oracle internal/exp internal/recovery internal/replay internal/history internal/faults internal/vfsrec internal/workload github.com/cockroachdb/pebble; do
+              if grep -q "^${mod}/${banned}\|^${banned}" <<< "$deps"; then
+                echo "FORBIDDEN dependency in ${pkg}: ${banned}"
+                exit 1
+              fi
+            done
+          done
+          for pkg in internal/trace internal/history; do
+            deps="$(go list -deps "${mod}/${pkg}")"
+            bad="$(grep "^${mod}/internal/" <<< "$deps" | grep -v "^${mod}/${pkg}$" || true)"
+            if [ -n "$bad" ]; then
+              echo "FORBIDDEN internal dependency in ${pkg}: ${bad}"
+              exit 1
+            fi
+          done
+
+      - name: Vulnerability Check
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
+
+      - name: Build and Smoke Test CLI Binary
+        run: |
+          set -euo pipefail
+          tmp_dir="$(mktemp -d)"
+          trap 'rm -rf "$tmp_dir"' EXIT
+          go build -o "${tmp_dir}/cracontest" ./cmd/cracontest
+          "${tmp_dir}/cracontest" help >/dev/null
+          "${tmp_dir}/cracontest" record -spec experiments/configs/smoke.json -out "${tmp_dir}/run" -fault MUT-0
+          "${tmp_dir}/cracontest" plan -run "${tmp_dir}/run" -seed 42
+          "${tmp_dir}/cracontest" explore -run "${tmp_dir}/run" -timeout 5s
+          "${tmp_dir}/cracontest" evaluate -run "${tmp_dir}/run" -budgets 0,1,5,10
 
       - name: Unit and Integration Tests
         run: go test -count=1 -timeout 15m ./...
@@ -67,6 +107,64 @@ jobs:
         env:
           CGO_ENABLED: "0"
 
+      - name: Enforce Import Boundaries
+        shell: pwsh
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          $ErrorActionPreference = "Stop"
+          $mod = "github.com/akshatrathore1/CraConTest"
+          $bannedPlan = @("internal/oracle", "internal/exp", "internal/recovery", "internal/replay", "internal/history", "internal/faults", "internal/vfsrec", "internal/workload", "github.com/cockroachdb/pebble")
+          foreach ($pkg in @("internal/graph", "internal/candidate", "internal/strategy")) {
+            $deps = go list -deps "$mod/$pkg"
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            foreach ($b in $bannedPlan) {
+              if ($deps | Where-Object { $_ -like "$mod/$b*" -or $_ -like "$b*" }) {
+                throw "FORBIDDEN dependency in $pkg`: $b"
+              }
+            }
+          }
+          foreach ($pkg in @("internal/trace", "internal/history")) {
+            $deps = go list -deps "$mod/$pkg"
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            $bad = $deps | Where-Object { $_ -like "$mod/internal/*" -and $_ -ne "$mod/$pkg" }
+            if ($bad) {
+              throw "FORBIDDEN internal dependency in $pkg`: $($bad -join ', ')"
+            }
+          }
+
+      - name: Vulnerability Check
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
+        env:
+          CGO_ENABLED: "0"
+
+      - name: Build and Smoke Test CLI Binary
+        shell: pwsh
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tmpDir = Join-Path $env:RUNNER_TEMP ("cracontest-smoke-" + [guid]::NewGuid().ToString("N"))
+          New-Item -ItemType Directory -Path $tmpDir | Out-Null
+          try {
+            $bin = Join-Path $tmpDir "cracontest.exe"
+            $runDir = Join-Path $tmpDir "run"
+            go build -o $bin ./cmd/cracontest
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            & $bin help | Out-Null
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            & $bin record -spec experiments/configs/smoke.json -out $runDir -fault MUT-0
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            & $bin plan -run $runDir -seed 42
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            & $bin explore -run $runDir -timeout 5s
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            & $bin evaluate -run $runDir -budgets 0,1,5,10
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } finally {
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $tmpDir
+          }
+
       - name: Unit and Integration Tests
         # Race detector note: Go's race detector (-race) on Windows requires CGO
         # (CGO_ENABLED=1) and a C compiler (MinGW-w64 gcc). Windows CI runs with
@@ -85,7 +183,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
-        python-version: ["3.12", "3.15.2"]
+        python-version: ["3.12", "3.15"]
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -102,6 +200,7 @@ jobs:
         # Install with binary wheel preference and graceful fallback if prebuilt wheels are unavailable
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           $installed = $false
           try {
             $prev = $PSNativeCommandUseErrorActionPreference
@@ -115,19 +214,48 @@ jobs:
           if (-not $installed) {
             Write-Host "Prebuilt wheels not available for all packages; falling back to prefer-binary..."
             python -I -m pip --isolated install --prefer-binary -r analysis/requirements.txt
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
 
       - name: Verify analysis dependencies
         run: python -I -m pip --isolated check
 
       - name: Run statistical unit tests
-        run: python -I analysis/test_paired_stats.py
+        run: python -I -W error analysis/test_paired_stats.py -v
 
-      - name: Run benchmark analysis
+      - name: Run benchmark and evaluation CSV analyses
         shell: pwsh
         run: |
-          if (Test-Path results/benchmark_per_seed.csv) {
-            python -I -W error analysis/paired_stats.py results/benchmark_per_seed.csv "Benchmark Compatibility" MUT-1 MUT-2 MUT-3 MUT-4 MUT-5 MUT-6 MUT-8 MUT-9
-          } else {
-            Write-Host "results/benchmark_per_seed.csv not present; skipping analysis."
+          $ErrorActionPreference = "Stop"
+          $requiredFiles = @(
+            "results/benchmark_per_seed.csv",
+            "results/holdout_per_seed.csv",
+            "results/casestudy_pebble5825_per_seed.csv",
+            "results/casestudy_checkpoint_per_seed.csv",
+            "results/casestudy_ingest_per_seed.csv",
+            "results/workload_diversity_per_seed.csv",
+            "results/scaling_mut5_per_seed.csv"
+          )
+          foreach ($rf in $requiredFiles) {
+            if (-not (Test-Path $rf)) {
+              Write-Error "Required evaluation CSV missing: $rf"
+              exit 1
+            }
+          }
+          python -I -W error analysis/paired_stats.py results/benchmark_per_seed.csv "Benchmark Compatibility" MUT-1 MUT-2 MUT-3 MUT-4 MUT-5 MUT-6 MUT-8 MUT-9
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -I -W error analysis/paired_stats.py results/holdout_per_seed.csv "Holdout Generalization" MUT-X1_k2 MUT-X1_k3 MUT-X1_k4 MUT-X1_k6 MUT-X1_k9 MUT-X2_k1 MUT-X2_k3 MUT-X3_k1 MUT-X3_k2 MUT-X3_k3 MUT-X4_p04 MUT-X5_p12
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -I -W error analysis/paired_stats.py results/holdout_per_seed.csv "Out-of-Contract Control" MUT-X6_k2 MUT-X6_k5 MUT-X6_k9
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $csvSpecs = @(
+            @{ Path = "results/casestudy_pebble5825_per_seed.csv"; Title = "Pebble 5825 Case Study" },
+            @{ Path = "results/casestudy_checkpoint_per_seed.csv"; Title = "Checkpoint Case Study" },
+            @{ Path = "results/casestudy_ingest_per_seed.csv"; Title = "Ingest Case Study" },
+            @{ Path = "results/workload_diversity_per_seed.csv"; Title = "Workload Diversity" },
+            @{ Path = "results/scaling_mut5_per_seed.csv"; Title = "Scaling MUT-5" }
+          )
+          foreach ($spec in $csvSpecs) {
+            python -I -W error analysis/paired_stats.py $spec.Path $spec.Title
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }

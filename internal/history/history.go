@@ -107,11 +107,8 @@ func Validate(entries []Entry) error {
 					i, e.Op, e.EndEvent, e.BeginEvent)
 			}
 			lastEnd = e.EndEvent
-		} else {
-			if e.Err != "" {
-				return fmt.Errorf("entry %d (op %d): unacknowledged entry cannot have error", i, e.Op)
-			}
-			lastEnd = e.BeginEvent
+		} else if e.Err != "" {
+			return fmt.Errorf("entry %d (op %d): unacknowledged entry cannot have error", i, e.Op)
 		}
 
 		if !isValidKind(e.Kind) {
@@ -214,9 +211,13 @@ func Encode(writer io.Writer, entries []Entry) error {
 	if err := Validate(entries); err != nil {
 		return fmt.Errorf("history: %w", err)
 	}
+	cloned := Clone(entries)
+	if cloned == nil {
+		cloned = []Entry{}
+	}
 	doc := Document{
 		SchemaVersion: Version,
-		Entries:       Clone(entries),
+		Entries:       cloned,
 	}
 	return json.NewEncoder(writer).Encode(doc)
 }

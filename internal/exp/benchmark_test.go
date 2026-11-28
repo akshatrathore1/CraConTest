@@ -11,7 +11,9 @@ import (
 	"github.com/akshatrathore1/CraConTest/internal/candidate"
 	"github.com/akshatrathore1/CraConTest/internal/exp"
 	"github.com/akshatrathore1/CraConTest/internal/faults"
+	"github.com/akshatrathore1/CraConTest/internal/graph"
 	"github.com/akshatrathore1/CraConTest/internal/oracle"
+	"github.com/akshatrathore1/CraConTest/internal/trace"
 )
 
 func TestCalculateAUCNorm(t *testing.T) {
@@ -282,10 +284,10 @@ func TestMultiSeed_CalculateS100(t *testing.T) {
 	}
 
 	bugs100 := exp.CalculateBugs100(ranking, []oracle.Outcome{
-		{Candidate: c1, Class: oracle.ClassViolation, Signature: "sigA"},
+		{Candidate: c1, Class: oracle.ClassViolation, Signature: "v1:sigA"},
 		{Candidate: c2, Class: oracle.ClassValid},
-		{Candidate: c3, Class: oracle.ClassOpenError, Signature: "sigB"},
-		{Candidate: c4, Class: oracle.ClassViolation, Signature: "sigA"},
+		{Candidate: c3, Class: oracle.ClassOpenError, Signature: "v1:sigB"},
+		{Candidate: c4, Class: oracle.ClassViolation, Signature: "v1:sigA"},
 	})
 	if bugs100 != 2 {
 		t.Errorf("expected Bugs100=2, got %d", bugs100)
@@ -631,5 +633,245 @@ func TestMixShuffleSeedDistributionAndCollisionResistance(t *testing.T) {
 	streamB := exp.MixShuffleSeed(42, 0x2, 0)
 	if streamA == streamB {
 		t.Fatalf("expected distinct seeds for different domains: %x vs %x", streamA, streamB)
+	}
+}
+
+func TestCalculateSBudgetWithRealGraphViewAndCheckedMetrics(t *testing.T) {
+	events := []trace.Event{
+		{ID: 1, Kind: trace.KindCreate, File: "db/000001.log", Cat: "pebble-wal", Handle: 1},
+		{ID: 2, Kind: trace.KindOpBegin, Op: 1, OpKind: "set"},
+		{ID: 3, Kind: trace.KindWrite, File: "db/000001.log", Handle: 1, Data: []byte("a"), Len: 1},
+		{ID: 4, Kind: trace.KindOpEnd, Op: 1, OpKind: "set"},
+		{ID: 5, Kind: trace.KindSync, File: "db/000001.log", Handle: 1},
+	}
+	view, err := graph.Build(events)
+	if err != nil {
+		t.Fatalf("graph.Build: %v", err)
+	}
+	c1 := candidate.Candidate{Event: 1, Percent: 0, Seed: 1}
+	c2 := candidate.Candidate{Event: 2, Percent: 0, Seed: 2}
+	c3 := candidate.Candidate{Event: 3, Percent: 0, Seed: 3}
+	c4 := candidate.Candidate{Event: 4, Percent: 0, Seed: 4}
+	// Force shared StateKey between c1 and c2 to confirm View-based deduplication.
+	feat1 := view.Cuts[c1.Event]
+	feat1.StateKey = "SHARED_STATE"
+	view.Cuts[c1.Event] = feat1
+	feat2 := view.Cuts[c2.Event]
+	feat2.StateKey = "SHARED_STATE"
+	view.Cuts[c2.Event] = feat2
+	feat3 := view.Cuts[c3.Event]
+	feat3.StateKey = "OTHER_STATE"
+	view.Cuts[c3.Event] = feat3
+
+	outcomes := []oracle.Outcome{
+		{Candidate: c1, Class: oracle.ClassViolation, Rule: "prefix", Signature: "v1:a"},
+		{Candidate: c2, Class: oracle.ClassViolation, Rule: "prefix", Signature: "v1:a"},
+		{Candidate: c3, Class: oracle.ClassOpenError, Detail: "corrupt MANIFEST"},
+		{Candidate: c4, Class: oracle.ClassValid},
+	}
+	ranking := []candidate.Candidate{c1, c2, c3, c4}
+
+	// Shared StateKey deduplicates c1 and c2 into 1 failing state, plus c3 => 2 distinct failing states.
+	if s25 := exp.CalculateS25(ranking, outcomes, view); s25 != 2 {
+		t.Fatalf("CalculateS25 with real View = %d, want 2", s25)
+	}
+	// Negative budget safely returns 0 instead of panicking.
+	if sb := exp.CalculateSBudget(ranking, outcomes, view, -5); sb != 0 {
+		t.Fatalf("CalculateSBudget negative budget = %d, want 0", sb)
+	}
+
+	// Checked metric variants validate outcomes (ClassOracleError), permutations (duplicates/incomplete), and negative budget.
+	if _, err := exp.CalculateSBudgetChecked(ranking, outcomes, view, -1); err == nil {
+		t.Error("CalculateSBudgetChecked negative budget should fail")
+	}
+	if _, err := exp.CalculateSBudgetChecked([]candidate.Candidate{c1, c1, c3, c4}, outcomes, view, 25); err == nil {
+		t.Error("CalculateSBudgetChecked duplicate candidate should fail")
+	}
+	badOutcomes := append([]oracle.Outcome(nil), outcomes...)
+	badOutcomes[3] = oracle.Outcome{Candidate: c4, Class: oracle.ClassOracleError, Rule: "err", Detail: "fail"}
+	if _, err := exp.CalculateK1Checked(ranking, badOutcomes, false); err == nil {
+		t.Error("CalculateK1Checked ClassOracleError should fail")
+	}
+	if _, err := exp.CalculateBFullChecked(ranking, badOutcomes); err == nil {
+		t.Error("CalculateBFullChecked ClassOracleError should fail")
+	}
+	if _, err := exp.CalculateBugs100Checked([]candidate.Candidate{c1}, outcomes); err == nil {
+		t.Error("CalculateBugs100Checked incomplete ranking should fail")
+	}
+}
+
+func TestRunSingleSeedAndBenchmarkMultiFaultAndValidation(t *testing.T) {
+	// Verify MUT-8 alias (MUT-ROCKS-10460) and custom CompactAt & Workload.Dir.
+	cfg := exp.DefaultMultiSeedBenchmarkConfig()
+	cfg.WorkloadSeeds = []uint64{42}
+	cfg.Workload.Operations = 40
+	cfg.Workload.FlushEvery = 15
+	cfg.Workload.SyncEvery = 5
+	cfg.Workload.CompactAt = 25
+	cfg.Workload.Dir = "customdb"
+	cfg.B0PercentileCnt = 5
+	cfg.TrackMUT0 = false
+	cfg.FaultIDs = []string{faults.MutRocks10460, faults.MUT5, faults.MUT9}
+	cfg.WALDropK = 2
+	cfg.DirDropK = 2
+
+	res, err := exp.RunBenchmark(cfg, nil)
+	if err != nil {
+		t.Fatalf("RunBenchmark multi-fault custom Dir failed: %v", err)
+	}
+	if res.MUT0Runs != 0 || res.PebbleVersion == "" {
+		t.Fatalf("unexpected MUT0Runs=%d or empty PebbleVersion=%q", res.MUT0Runs, res.PebbleVersion)
+	}
+	if len(res.FaultSummaries) != 3 {
+		t.Fatalf("expected 3 fault summaries, got %d", len(res.FaultSummaries))
+	}
+	if m, ok := res.FaultSummaries[faults.MutRocks10460]; !ok || len(m.Runs) != 1 || m.Runs[0].UniverseSize == 0 {
+		t.Fatalf("unexpected MUT-ROCKS-10460 summary: %+v", m)
+	}
+
+	// Negative budget & MUT-8 CompactAt > Operations must fail validation cleanly.
+	badBudgetCfg := cfg
+	badBudgetCfg.Budgets = []int{-1, 5}
+	if _, err := exp.RunSingleSeedFault(42, faults.MUT1, badBudgetCfg); err == nil {
+		t.Error("expected RunSingleSeedFault negative budget error")
+	}
+
+	badCompactCfg := cfg
+	badCompactCfg.Workload.Operations = 20
+	badCompactCfg.Workload.CompactAt = 50
+	if _, err := exp.RunSingleSeedFault(42, faults.MutRocks10460, badCompactCfg); err == nil {
+		t.Error("expected MUT-8 CompactAt > Operations error")
+	}
+
+	// Duplicate seeds, duplicate canonical faults, duplicate policies fail upfront in RunBenchmark.
+	dupSeedCfg := exp.DefaultMultiSeedBenchmarkConfig()
+	dupSeedCfg.WorkloadSeeds = []uint64{42, 42}
+	dupSeedCfg.FaultIDs = []string{faults.MUT1}
+	if _, err := exp.RunBenchmark(dupSeedCfg, nil); err == nil {
+		t.Error("expected RunBenchmark duplicate seed error")
+	}
+
+	dupFaultCfg := exp.DefaultMultiSeedBenchmarkConfig()
+	dupFaultCfg.WorkloadSeeds = []uint64{42}
+	dupFaultCfg.FaultIDs = []string{faults.MUT5, faults.MutWalK}
+	if _, err := exp.RunBenchmark(dupFaultCfg, nil); err == nil {
+		t.Error("expected RunBenchmark duplicate canonical fault error")
+	}
+
+	dupPolCfg := exp.DefaultMultiSeedBenchmarkConfig()
+	dupPolCfg.WorkloadSeeds = []uint64{42}
+	dupPolCfg.FaultIDs = []string{faults.MUT1}
+	dupPolCfg.Policies = []int{0, 0}
+	if _, err := exp.RunBenchmark(dupPolCfg, nil); err == nil {
+		t.Error("expected RunBenchmark duplicate policy error")
+	}
+}
+
+func TestReportsAndCSVsCoverExtraFaultsCustomStrategiesAndNilGuards(t *testing.T) {
+	if err := exp.WriteMultiSeedCSV(nil, filepath.Join(t.TempDir(), "s.csv")); err == nil {
+		t.Error("expected error on nil result in WriteMultiSeedCSV")
+	}
+	if err := exp.WriteMultiSeedPerSeedCSV(nil, filepath.Join(t.TempDir(), "p.csv")); err == nil {
+		t.Error("expected error on nil result in WriteMultiSeedPerSeedCSV")
+	}
+	if err := exp.WriteMultiSeedReportToFile(nil, filepath.Join(t.TempDir(), "r.md")); err == nil {
+		t.Error("expected error on nil result in WriteMultiSeedReportToFile")
+	}
+	if err := exp.WriteEmpiricalCSV(nil, filepath.Join(t.TempDir(), "es.csv")); err == nil {
+		t.Error("expected error on nil result in WriteEmpiricalCSV")
+	}
+	if err := exp.WriteEmpiricalReportToFile(nil, filepath.Join(t.TempDir(), "er.md")); err == nil {
+		t.Error("expected error on nil result in WriteEmpiricalReportToFile")
+	}
+
+	// Custom extra fault + extra strategy + TrackMUT0 disabled + integer fallback in WriteMultiSeedPerSeedCSV.
+	customRes := &exp.BenchmarkResult{
+		Timestamp: "2026-11-01T00:00:00Z",
+		Config: exp.BenchmarkConfig{
+			WorkloadSeeds: []uint64{42},
+			FaultIDs:      []string{faults.MUT6, faults.MUT8, "MUT-X1_k2"},
+			Policies:      []int{0, 50, 100},
+			TrackMUT0:     false,
+			WALDropK:      2,
+			DirDropK:      3,
+		},
+		MUT0Runs: 0,
+		FaultSummaries: map[string]exp.FaultModelSummary{
+			faults.MUT6: {
+				FaultID:         faults.MUT6,
+				RunCount:        1,
+				ActiveSeeds:     1,
+				TotalSeeds:      1,
+				AvgUniverseSize: 80,
+				AvgFailures:     2,
+				AvgPanics:       1,
+				AvgHangs:        1,
+				StrategySummaries: map[string]exp.AggregatedStrategyStats{
+					"dcg":    {StrategyName: "DCG", K1FailureMedian: 1, K1FailureMean: 1},
+					"custom": {StrategyName: "Custom Strat", K1FailureMedian: 3, K1FailureMean: 3},
+				},
+				Runs: []exp.SingleRunResult{
+					{
+						Seed:          42,
+						FaultID:       faults.MUT6,
+						UniverseSize:  80,
+						TotalFailures: 2,
+						TotalPanics:   1,
+						TotalHangs:    1,
+						Strategies: map[string]exp.StrategyMetrics{
+							"dcg": {StrategyName: "DCG", K1Failure: 1, S25: 2, S100: 2, BFull: 4},
+						},
+					},
+				},
+			},
+			"MUT-X1_k2": {
+				FaultID:         "MUT-X1_k2",
+				RunCount:        1,
+				ActiveSeeds:     1,
+				TotalSeeds:      1,
+				AvgUniverseSize: 80,
+				AvgFailures:     1,
+				StrategySummaries: map[string]exp.AggregatedStrategyStats{
+					"custom": {StrategyName: "Custom Strat", K1FailureMedian: 2, K1FailureMean: 2},
+				},
+			},
+		},
+	}
+
+	mdEmp := exp.GenerateEmpiricalReportMarkdown(customRes)
+	if !strings.Contains(mdEmp, "not evaluated") || !strings.Contains(mdEmp, "### 3.1") || !strings.Contains(mdEmp, "### 3.2") {
+		t.Errorf("empirical report missing MUT0 not evaluated or sequential headings:\n%s", mdEmp)
+	}
+	if !strings.Contains(mdEmp, "panics: 1.0, hangs: 1.0") {
+		t.Errorf("empirical report missing panics/hangs breakdown:\n%s", mdEmp)
+	}
+
+	tmpDir := t.TempDir()
+	empCSV := filepath.Join(tmpDir, "emp.csv")
+	if err := exp.WriteEmpiricalCSV(customRes, empCSV); err != nil {
+		t.Fatalf("WriteEmpiricalCSV: %v", err)
+	}
+	empData, _ := os.ReadFile(empCSV)
+	if !strings.Contains(string(empData), "MUT-X1_k2") || !strings.Contains(string(empData), "Custom Strat") {
+		t.Errorf("WriteEmpiricalCSV omitted extra fault/strategy:\n%s", string(empData))
+	}
+
+	msCSV := filepath.Join(tmpDir, "ms.csv")
+	if err := exp.WriteMultiSeedCSV(customRes, msCSV); err != nil {
+		t.Fatalf("WriteMultiSeedCSV: %v", err)
+	}
+	msData, _ := os.ReadFile(msCSV)
+	if !strings.Contains(string(msData), "Custom Strat") || !strings.Contains(string(msData), "MUT-X1_k2") {
+		t.Errorf("WriteMultiSeedCSV omitted custom strategy or extra fault:\n%s", string(msData))
+	}
+
+	psCSV := filepath.Join(tmpDir, "ps.csv")
+	if err := exp.WriteMultiSeedPerSeedCSV(customRes, psCSV); err != nil {
+		t.Fatalf("WriteMultiSeedPerSeedCSV: %v", err)
+	}
+	psData, _ := os.ReadFile(psCSV)
+	// dcg had integer fields only (no Float fields): must fall back to 1.00, 2.00, 2.00, 4.00!
+	if !strings.Contains(string(psData), ",1.00,2.00,2.00,4.00,") {
+		t.Errorf("WriteMultiSeedPerSeedCSV did not fall back to integer fields:\n%s", string(psData))
 	}
 }

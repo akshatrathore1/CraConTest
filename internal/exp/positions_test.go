@@ -1,6 +1,7 @@
 package exp_test
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/akshatrathore1/CraConTest/internal/candidate"
@@ -28,6 +29,33 @@ func TestFailureKindNormalizesNumbers(t *testing.T) {
 	}
 	if exp.FailureKind(outcomes[0]) != "" || exp.FailureKind(outcomes[2]) != "v1:a" {
 		t.Fatal("valid outcomes have no kind; violations use their signature")
+	}
+
+	// Verify FailureKind handles Panic, Hang, empty Detail, ClassOracleError, and unnormalized vs normalized agreement.
+	oeUnnorm := oracle.Outcome{Class: oracle.ClassOpenError, Detail: "corrupt MANIFEST-000042"}
+	oeNorm := exp.NormalizeOutcome(oeUnnorm)
+	if exp.FailureKind(oeUnnorm) != oeNorm.Signature || exp.FailureKind(oeUnnorm) != "v1:open_error:manifest_corrupt" {
+		t.Fatalf("FailureKind open_error mismatch: unnorm=%q norm=%q", exp.FailureKind(oeUnnorm), oeNorm.Signature)
+	}
+
+	p1 := oracle.Outcome{Class: oracle.ClassPanic, Detail: "fatal at 0xc0001a2b00 step 42"}
+	p2 := oracle.Outcome{Class: oracle.ClassPanic, Detail: "fatal at 0xdeadbeef step 99"}
+	if exp.FailureKind(p1) != exp.FailureKind(p2) || !strings.HasPrefix(exp.FailureKind(p1), "v1:panic:") {
+		t.Fatalf("panic hex/number normalization failed: %q vs %q", exp.FailureKind(p1), exp.FailureKind(p2))
+	}
+
+	hEmpty := oracle.Outcome{Class: oracle.ClassHang, Detail: ""}
+	if got := exp.FailureKind(hEmpty); got != "v1:hang:timeout" {
+		t.Fatalf("empty hang FailureKind = %q, want v1:hang:timeout", got)
+	}
+
+	oErr := oracle.Outcome{Class: oracle.ClassOracleError, Rule: "missing_features", Signature: "v1:should_ignore"}
+	if got := exp.FailureKind(oErr); got != "" {
+		t.Fatalf("ClassOracleError FailureKind = %q, want empty", got)
+	}
+	validWithSig := oracle.Outcome{Class: oracle.ClassValid, Signature: "v1:stale"}
+	if got := exp.FailureKind(validWithSig); got != "" {
+		t.Fatalf("ClassValid FailureKind = %q, want empty", got)
 	}
 }
 
@@ -57,10 +85,39 @@ func TestDiscoveryPositions(t *testing.T) {
 	if _, err := exp.DiscoveryPositions(universe, universe[:5], outcomes); err == nil {
 		t.Fatal("a ranking that is not a permutation was accepted")
 	}
+	dupRanking := append([]candidate.Candidate(nil), universe[:5]...)
+	dupRanking = append(dupRanking, universe[0])
+	if _, err := exp.DiscoveryPositions(universe, dupRanking, outcomes); err == nil {
+		t.Fatal("a ranking with duplicate candidate was accepted")
+	}
+	foreignRanking := append([]candidate.Candidate(nil), universe[:5]...)
+	foreignRanking = append(foreignRanking, candidate.Candidate{Event: 9999})
+	if _, err := exp.DiscoveryPositions(universe, foreignRanking, outcomes); err == nil {
+		t.Fatal("a ranking with foreign candidate was accepted")
+	}
 	bad := append([]oracle.Outcome(nil), outcomes...)
 	bad[0] = oracle.Outcome{Candidate: universe[0], Class: oracle.ClassOracleError, Rule: "x", Detail: "y"}
 	if _, err := exp.DiscoveryPositions(universe, universe, bad); err == nil {
 		t.Fatal("an oracle_error table was accepted")
+	}
+}
+
+func TestRandomPositionsEdgeCases(t *testing.T) {
+	universe, outcomes := positionsTable()
+	if _, err := exp.RandomPositions(universe, outcomes, nil); err == nil {
+		t.Fatal("expected error for empty seeds slice")
+	}
+
+	allValid := make([]oracle.Outcome, len(universe))
+	for i, c := range universe {
+		allValid[i] = oracle.Outcome{Candidate: c, Class: oracle.ClassValid}
+	}
+	zeroSummary, err := exp.RandomPositions(universe, allValid, []uint64{1, 2, 3})
+	if err != nil {
+		t.Fatalf("RandomPositions all valid: %v", err)
+	}
+	if zeroSummary.FirstMedian != 0 || zeroSummary.AllKindsMedian != 0 || zeroSummary.Kinds != 0 || zeroSummary.Seeds != 3 {
+		t.Fatalf("unexpected zero-failure summary: %+v", zeroSummary)
 	}
 }
 

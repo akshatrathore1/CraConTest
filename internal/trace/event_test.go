@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math"
 	"math/rand/v2"
 	"reflect"
 	"sort"
@@ -97,28 +98,104 @@ func TestTraceV1PreallocateRoundTrip(test *testing.T) {
 
 func TestTraceV1RejectsInvalidRecords(test *testing.T) {
 	cases := map[string]func([]trace.Event){
-		"ID gap":                    func(events []trace.Event) { events[3].ID = 99 },
-		"unknown kind":              func(events []trace.Event) { events[3].Kind = "Future" },
-		"missing handle":            func(events []trace.Event) { events[3].Handle = 0 },
-		"reused handle":             func(events []trace.Event) { events[4].Handle = 2 },
-		"excess write count":        func(events []trace.Event) { events[3].Len = 5 },
-		"short write without error": func(events []trace.Event) { events[3].Len = 2 },
-		"payload on sync":           func(events []trace.Event) { events[8].Data = []byte("x") },
-		"wrong cursor":              func(events []trace.Event) { events[7].Off = 3 },
-		"directory mismatch":        func(events []trace.Event) { events[16].Dir = false },
-		"wrong resource close":      func(events []trace.Event) { events[19].Kind = trace.KindClose },
-		"overlapping operation":     func(events []trace.Event) { events[21].Kind = trace.KindOpBegin },
-		"path traversal":            func(events []trace.Event) { events[0].File = "../db" },
-		"absolute path":             func(events []trace.Event) { events[0].File = "/db" },
-		"full sync on write":        func(events []trace.Event) { events[3].FullSync = true },
-		"background attribution":    func(events []trace.Event) { events[3].Op = 1 },
-		"category on write":         func(events []trace.Event) { events[3].Cat = "pebble-wal" },
-		"category on sync":          func(events []trace.Event) { events[8].Cat = "pebble-wal" },
+		"ID gap":                         func(events []trace.Event) { events[3].ID = 99 },
+		"unknown kind":                   func(events []trace.Event) { events[3].Kind = "Future" },
+		"missing handle":                 func(events []trace.Event) { events[3].Handle = 0 },
+		"reused handle":                  func(events []trace.Event) { events[4].Handle = 2 },
+		"excess write count":             func(events []trace.Event) { events[3].Len = 5 },
+		"short write without error":      func(events []trace.Event) { events[3].Len = 2 },
+		"payload on sync":                func(events []trace.Event) { events[8].Data = []byte("x") },
+		"wrong cursor":                   func(events []trace.Event) { events[7].Off = 3 },
+		"directory mismatch":             func(events []trace.Event) { events[16].Dir = false },
+		"wrong resource close":           func(events []trace.Event) { events[19].Kind = trace.KindClose },
+		"overlapping operation":          func(events []trace.Event) { events[21].Kind = trace.KindOpBegin },
+		"path traversal":                 func(events []trace.Event) { events[0].File = "../db" },
+		"absolute path":                  func(events []trace.Event) { events[0].File = "/db" },
+		"full sync on write":             func(events []trace.Event) { events[3].FullSync = true },
+		"background attribution":         func(events []trace.Event) { events[3].Op = 1 },
+		"category on write":              func(events []trace.Event) { events[3].Cat = "pebble-wal" },
+		"category on sync":               func(events []trace.Event) { events[8].Cat = "pebble-wal" },
+		"created on Create":              func(events []trace.Event) { events[2].Created = true },
+		"backslash in path":              func(events []trace.Event) { events[0].File = `db\sub` },
+		"colon in path":                  func(events []trace.Event) { events[0].File = "C:db" },
+		"dot path":                       func(events []trace.Event) { events[0].File = "." },
+		"dotdot path":                    func(events []trace.Event) { events[0].File = ".." },
+		"read exceeds size":              func(events []trace.Event) { events[5].Len = 3 },
+		"negative read size":             func(events []trace.Event) { events[5].Size = -1 },
+		"write to readonly open":         func(events []trace.Event) { events[4].Kind = trace.KindOpen; events[5].Kind = trace.KindSyncData },
+		"syncdata on directory":          func(events []trace.Event) { events[16].Kind = trace.KindSyncData },
+		"syncto on directory":            func(events []trace.Event) { events[16].Kind = trace.KindSyncTo },
+		"unlock non-lock":                func(events []trace.Event) { events[14].Kind = trace.KindUnlock },
+		"engine event missing note":      func(events []trace.Event) { events[22].Note = "" },
+		"engine event nonzero op":        func(events []trace.Event) { events[22].Op = 2 },
+		"engine event bad input path":    func(events []trace.Event) { events[22].Inputs = []string{"../x"} },
+		"engine event bad output path":   func(events []trace.Event) { events[22].Outputs = []string{""} },
+		"failed remove missing file":     func(events []trace.Event) { events[12].File = ""; events[12].Err = "enoent" },
+		"failed rename missing file2":    func(events []trace.Event) { events[11].File2 = ""; events[11].Err = "enoent" },
+		"failed link missing file2":      func(events []trace.Event) { events[10].File2 = ""; events[10].Err = "enoent" },
+		"failed mkdirall missing file":   func(events []trace.Event) { events[0].File = ""; events[0].Err = "eacces" },
+		"writeAt off+len int64 overflow": func(events []trace.Event) { events[6].Off = math.MaxInt64 },
 	}
 	for name, corrupt := range cases {
 		test.Run(name, func(test *testing.T) {
 			events := contractTrace()
 			corrupt(events)
+			if err := trace.Validate(events); err == nil {
+				test.Fatal("invalid trace accepted")
+			}
+		})
+	}
+	extraInvalid := map[string][]trace.Event{
+		"write on readonly handle": {
+			{ID: 1, Kind: trace.KindCreate, File: "a", Handle: 1},
+			{ID: 2, Kind: trace.KindOpen, File: "a", Handle: 2},
+			{ID: 3, Kind: trace.KindWrite, File: "a", Handle: 2, Data: []byte("x"), Len: 1},
+		},
+		"read on ReuseForWrite handle": {
+			{ID: 1, Kind: trace.KindCreate, File: "a", Handle: 1},
+			{ID: 2, Kind: trace.KindClose, File: "a", Handle: 1},
+			{ID: 3, Kind: trace.KindReuseForWrite, File: "a", File2: "b", Handle: 2},
+			{ID: 4, Kind: trace.KindRead, File: "b", Handle: 2, Size: 1, Len: 0},
+		},
+		"ReuseForWrite missing file2": {
+			{ID: 1, Kind: trace.KindCreate, File: "a", Handle: 1},
+			{ID: 2, Kind: trace.KindClose, File: "a", Handle: 1},
+			{ID: 3, Kind: trace.KindReuseForWrite, File: "a", Handle: 2},
+		},
+		"failed ReuseForWrite missing file2": {
+			{ID: 1, Kind: trace.KindCreate, File: "a", Handle: 1},
+			{ID: 2, Kind: trace.KindClose, File: "a", Handle: 1},
+			{ID: 3, Kind: trace.KindReuseForWrite, File: "a", Err: "eperm"},
+		},
+		"Preallocate negative size": {
+			{ID: 1, Kind: trace.KindCreate, File: "a", Handle: 1},
+			{ID: 2, Kind: trace.KindPreallocate, File: "a", Handle: 1, Off: 0, Size: -1},
+		},
+		"Preallocate on readonly handle": {
+			{ID: 1, Kind: trace.KindCreate, File: "a", Handle: 1},
+			{ID: 2, Kind: trace.KindOpen, File: "a", Handle: 2},
+			{ID: 3, Kind: trace.KindPreallocate, File: "a", Handle: 2, Off: 0, Size: 64},
+		},
+		"Preallocate off+size overflow": {
+			{ID: 1, Kind: trace.KindCreate, File: "a", Handle: 1},
+			{ID: 2, Kind: trace.KindPreallocate, File: "a", Handle: 1, Off: math.MaxInt64 - 10, Size: 20},
+		},
+		"Preallocate with data": {
+			{ID: 1, Kind: trace.KindCreate, File: "a", Handle: 1},
+			{ID: 2, Kind: trace.KindPreallocate, File: "a", Handle: 1, Size: 8, Data: []byte("x")},
+		},
+		"read off+size int64 overflow": {
+			{ID: 1, Kind: trace.KindCreate, File: "a", Handle: 1},
+			{ID: 2, Kind: trace.KindWrite, File: "a", Handle: 1, Off: 0, Data: []byte("x"), Len: 1},
+			{ID: 3, Kind: trace.KindRead, File: "a", Handle: 1, Off: 1, Size: math.MaxInt64, Len: 0},
+		},
+		"writeAt off+len int64 boundary overflow": {
+			{ID: 1, Kind: trace.KindCreate, File: "a", Handle: 1},
+			{ID: 2, Kind: trace.KindWriteAt, File: "a", Handle: 1, Off: math.MaxInt64 - 1, Data: []byte("xy"), Len: 2},
+		},
+	}
+	for name, events := range extraInvalid {
+		test.Run(name, func(test *testing.T) {
 			if err := trace.Validate(events); err == nil {
 				test.Fatal("invalid trace accepted")
 			}
@@ -169,7 +246,7 @@ func TestTraceV1BoundaryCuts(test *testing.T) {
 }
 
 func TestTraceV1OperationMarkers(test *testing.T) {
-	for _, kind := range []string{"set", "delete", "range_delete", "batch", "get", "iterate", "flush", "compact"} {
+	for _, kind := range []string{"set", "delete", "range_delete", "batch", "ingest", "get", "iterate", "flush", "compact", "checkpoint", "ratchet"} {
 		events := []trace.Event{{ID: 1, Kind: trace.KindOpBegin, Op: 1, OpKind: kind}, {ID: 2, Kind: trace.KindOpEnd, Op: 1, OpKind: kind}}
 		if err := trace.Validate(events); err != nil {
 			test.Fatal(err)

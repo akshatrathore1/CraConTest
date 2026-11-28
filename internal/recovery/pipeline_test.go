@@ -16,10 +16,9 @@ import (
 	"github.com/cockroachdb/pebble/v2/vfs"
 )
 
-// TestOneCandidateCrashPipeline checks the single-candidate crash pipeline:
-// An end-to-end crash-recovery pipeline test executing:
+// TestEndpointCrashPipeline checks the crash pipeline end-to-end:
 // replay -> clone -> SafeOpen -> CheckIntegrity -> dump -> oracle
-// on endpoint candidates and obtaining verified outcome classes.
+// across all 0% and 100% endpoint candidates, verifying ClassValid outcomes.
 func TestOneCandidateCrashPipeline(t *testing.T) {
 	mem := vfs.NewCrashableMem()
 	rec := vfsrec.New(mem)
@@ -36,6 +35,12 @@ func TestOneCandidateCrashPipeline(t *testing.T) {
 	if err != nil {
 		t.Fatalf("pebble.Open: %v", err)
 	}
+	closed := false
+	defer func() {
+		if !closed {
+			_ = db.Close()
+		}
+	}()
 
 	var hist []history.Entry
 	numOps := 30
@@ -46,28 +51,16 @@ func TestOneCandidateCrashPipeline(t *testing.T) {
 		v := fmt.Sprintf("pipeline-v%03d", i)
 		sync := (i%5 == 0)
 
-		rec.Begin(opID, "set")
+		beginEv := rec.BeginEvent(opID, "set")
 		wo := pebble.NoSync
 		if sync {
 			wo = pebble.Sync
 		}
 		if err := db.Set([]byte(k), []byte(v), wo); err != nil {
-			rec.End(opID, "set", err.Error())
+			_ = rec.EndEvent(opID, "set", err.Error())
 			t.Fatalf("Set %d: %v", i, err)
 		}
-		rec.End(opID, "set", "")
-
-		events := rec.Events()
-		var beginEv, endEv uint64
-		for _, e := range events {
-			if e.Op == opID {
-				if e.Kind == trace.KindOpBegin {
-					beginEv = e.ID
-				} else if e.Kind == trace.KindOpEnd {
-					endEv = e.ID
-				}
-			}
-		}
+		endEv := rec.EndEvent(opID, "set", "")
 
 		hist = append(hist, history.Entry{
 			Op:         opID,
@@ -82,6 +75,7 @@ func TestOneCandidateCrashPipeline(t *testing.T) {
 	if err := db.Flush(); err != nil {
 		t.Fatalf("Flush: %v", err)
 	}
+	closed = true
 	if err := db.Close(); err != nil {
 		t.Fatalf("db.Close: %v", err)
 	}
@@ -102,62 +96,72 @@ func TestOneCandidateCrashPipeline(t *testing.T) {
 		t.Fatalf("empty candidate universe")
 	}
 
-	// Test 1: Terminal 100% retention candidate at the end of the trace.
-	terminalCand := universe[len(universe)-1]
-	if terminalCand.Percent != 100 {
-		terminalCand = universe[len(universe)-2]
-	}
-
-	// Step A: Replay trace prefix up to candidate cutoff.
-	state, err := replay.Build(traceEvents, terminalCand.Event)
+	state, err := replay.Build(traceEvents, 0)
 	if err != nil {
-		t.Fatalf("replay.Build at cut %d: %v", terminalCand.Event, err)
+		t.Fatalf("replay.Build: %v", err)
 	}
+	defer func() {
+		if err := state.Close(); err != nil {
+			t.Errorf("state.Close: %v", err)
+		}
+	}()
 
-	// Step B: CrashClone with candidate's retention policy and seed.
-	clonedFS, err := state.Clone(terminalCand.Percent, terminalCand.Seed)
-	if err != nil {
-		_ = state.Close()
-		t.Fatalf("state.Clone: %v", err)
+	var currentCut uint64
+	var seenZero, seenHundred int
+	for i, cand := range universe {
+		if cand.Event > currentCut {
+			if err := state.Advance(cand.Event); err != nil {
+				t.Fatalf("candidate %d state.Advance(%d): %v", i, cand.Event, err)
+			}
+			currentCut = cand.Event
+		}
+		clonedFS, err := state.Clone(cand.Percent, cand.Seed)
+		if err != nil {
+			t.Fatalf("candidate %d state.Clone: %v", i, err)
+		}
+
+		openRes := recovery.SafeOpen(clonedFS, "db", 10*time.Second)
+		if openRes.Panic != "" || openRes.Timeout || openRes.Err != nil {
+			t.Fatalf("candidate %d (%+v) SafeOpen failed: err=%v, panic=%s, timeout=%v",
+				i, cand, openRes.Err, openRes.Panic, openRes.Timeout)
+		}
+		if openRes.DB == nil {
+			t.Fatalf("candidate %d (%+v) SafeOpen returned nil DB", i, cand)
+		}
+
+		if err := recovery.CheckIntegrity(openRes.DB); err != nil {
+			_ = openRes.DB.Close()
+			t.Fatalf("candidate %d (%+v) CheckIntegrity failed: %v", i, cand, err)
+		}
+
+		dump, err := recovery.DumpContents(openRes.DB)
+		closeErr := openRes.DB.Close()
+		if err != nil {
+			t.Fatalf("candidate %d (%+v) DumpContents failed: %v", i, cand, err)
+		}
+		if closeErr != nil {
+			t.Fatalf("candidate %d (%+v) Close failed: %v", i, cand, closeErr)
+		}
+
+		outcome := oracle.Check(oracle.Context{
+			Candidate: cand,
+			Events:    traceEvents,
+			History:   hist,
+			Recovered: dump,
+		})
+		if outcome.Class != oracle.ClassValid {
+			t.Fatalf("oracle outcome for candidate %+v: got %s (rule=%s, detail=%s), want %s",
+				cand, outcome.Class, outcome.Rule, outcome.Detail, oracle.ClassValid)
+		}
+		switch cand.Percent {
+		case 0:
+			seenZero++
+		case 100:
+			seenHundred++
+		}
 	}
-	_ = state.Close()
-
-	// Step C: SafeOpen with panic recovery and timeout protection.
-	openRes := recovery.SafeOpen(clonedFS, "db", 10*time.Second)
-	if openRes.Panic != "" || openRes.Timeout || openRes.Err != nil {
-		t.Fatalf("recovery.SafeOpen failed on terminal candidate: err=%v, panic=%s, timeout=%v",
-			openRes.Err, openRes.Panic, openRes.Timeout)
+	if seenZero == 0 || seenHundred == 0 {
+		t.Fatalf("expected both 0%% and 100%% endpoint candidates, got zero=%d hundred=%d", seenZero, seenHundred)
 	}
-	if openRes.DB == nil {
-		t.Fatalf("recovery.SafeOpen returned nil DB")
-	}
-
-	// Step D: CheckIntegrity (CheckLevels and bidirectional key scans).
-	if err := recovery.CheckIntegrity(openRes.DB); err != nil {
-		_ = openRes.DB.Close()
-		t.Fatalf("recovery.CheckIntegrity failed: %v", err)
-	}
-
-	// Step E: DumpContents.
-	dump, err := recovery.DumpContents(openRes.DB)
-	_ = openRes.DB.Close()
-	if err != nil {
-		t.Fatalf("recovery.DumpContents failed: %v", err)
-	}
-
-	// Step F: Oracle verification.
-	outcome := oracle.Check(oracle.Context{
-		Candidate: terminalCand,
-		Events:    traceEvents,
-		History:   hist,
-		Recovered: dump,
-	})
-
-	if outcome.Class != oracle.ClassValid {
-		t.Fatalf("oracle outcome for terminal candidate: got %s (rule=%s, detail=%s), want %s",
-			outcome.Class, outcome.Rule, outcome.Detail, oracle.ClassValid)
-	}
-
-	t.Logf("Candidate (%d, %d%%, seed=%d): Outcome=%s",
-		terminalCand.Event, terminalCand.Percent, terminalCand.Seed, outcome.Class)
+	t.Logf("Verified %d endpoint candidates (0%%=%d, 100%%=%d): all %s", len(universe), seenZero, seenHundred, oracle.ClassValid)
 }

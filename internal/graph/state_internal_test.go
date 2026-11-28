@@ -185,3 +185,59 @@ func TestCrossDirectoryRenameRecordsBothParents(test *testing.T) {
 		test.Fatalf("cross-directory rename parents: %v", dirs)
 	}
 }
+
+func TestRemoveAllDoesNotResurrectDirectories(t *testing.T) {
+	events := []trace.Event{
+		{ID: 1, Kind: trace.KindMkdirAll, File: "dir/sub", Mode: 0755},
+		{ID: 2, Kind: trace.KindOpenDir, File: "dir", Handle: 1, Dir: true},
+		{ID: 3, Kind: trace.KindCreate, File: "dir/sub/f1", Handle: 2},
+		{ID: 4, Kind: trace.KindClose, File: "dir/sub/f1", Handle: 2},
+		{ID: 5, Kind: trace.KindRemoveAll, File: "dir"},
+	}
+	b := step(t, events)
+	for _, gone := range []string{"dir", "dir/sub", "dir/sub/f1"} {
+		if _, exists := b.names[gone]; exists {
+			t.Fatalf("RemoveAll resurrected deleted path %q in b.names", gone)
+		}
+	}
+	var dirRemoveDirID, subRemoveDirID uint64
+	for _, entry := range b.pending {
+		if entry.kind == "remove" && entry.path == "dir/sub" {
+			dirRemoveDirID = entry.dirID
+		}
+		if entry.kind == "remove" && entry.path == "dir/sub/f1" {
+			subRemoveDirID = entry.dirID
+		}
+	}
+	if dirRemoveDirID != b.handles[1] {
+		t.Fatalf("pending remove for dir/sub got dirID=%d, want real dir handle resource %d", dirRemoveDirID, b.handles[1])
+	}
+	if subRemoveDirID == 0 {
+		t.Fatalf("expected non-zero dirID for dir/sub/f1 pending remove")
+	}
+	// Syncing open handle on "dir" must clear remove:dir/sub pending entry.
+	if _, err := b.apply(trace.Event{ID: 6, Kind: trace.KindSync, File: "dir", Handle: 1, Dir: true}); err != nil {
+		t.Fatalf("sync dir: %v", err)
+	}
+	for _, entry := range b.pending {
+		if entry.path == "dir/sub" && entry.kind == "remove" {
+			t.Fatalf("sync on real dir handle did not clear remove:dir/sub")
+		}
+	}
+	// Subsequent MkdirAll("dir") must create a new resource and pending entry.
+	if _, err := b.apply(trace.Event{ID: 7, Kind: trace.KindMkdirAll, File: "dir", Mode: 0755}); err != nil {
+		t.Fatalf("recreate dir: %v", err)
+	}
+	if _, exists := b.names["dir"]; !exists {
+		t.Fatalf("MkdirAll after RemoveAll failed to recreate dir")
+	}
+	// No-op RemoveAll on nonexistent nested path must not invent parent directories.
+	if _, err := b.apply(trace.Event{ID: 8, Kind: trace.KindRemoveAll, File: "ghost/nested/item"}); err != nil {
+		t.Fatalf("noop RemoveAll: %v", err)
+	}
+	for _, phantom := range []string{"ghost", "ghost/nested"} {
+		if _, exists := b.names[phantom]; exists {
+			t.Fatalf("noop RemoveAll invented phantom directory %q", phantom)
+		}
+	}
+}

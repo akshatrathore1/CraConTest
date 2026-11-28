@@ -2,6 +2,7 @@ package exp_test
 
 import (
 	"bytes"
+	"strings"
 	"testing"
 
 	"github.com/akshatrathore1/CraConTest/internal/candidate"
@@ -588,5 +589,107 @@ func TestClassHangDistinctBugsTracking(t *testing.T) {
 	}
 	if summary.DistinctBugs != 1 {
 		t.Errorf("expected DistinctBugs=1, got %d", summary.DistinctBugs)
+	}
+}
+
+func TestNormalizeReasonsAndSignaturesEdgeCases(t *testing.T) {
+	// Words containing "table" as substring must not falsely map to table_corrupt.
+	if got := exp.NormalizeOpenErrorReason("database not writable by reader"); got == "table_corrupt" {
+		t.Errorf("false positive table_corrupt on 'writable': %q", got)
+	}
+	if got := exp.NormalizeOpenErrorReason("no suitable format"); got == "table_corrupt" {
+		t.Errorf("false positive table_corrupt on 'suitable': %q", got)
+	}
+	if got := exp.NormalizeOpenErrorReason("unexpected EOF reading 000001.sst"); got != "table_corrupt" {
+		t.Errorf("expected table_corrupt for .sst EOF, got %q", got)
+	}
+	if got := exp.NormalizeOpenErrorReason("unexpected EOF in MANIFEST-000002"); got != "manifest_corrupt" {
+		t.Errorf("expected manifest_corrupt for MANIFEST EOF, got %q", got)
+	}
+	if got := exp.NormalizeOpenErrorReason("key not found in store"); got != "not_exist" {
+		t.Errorf("expected not_exist for 'not found', got %q", got)
+	}
+	// Truncation at 32 chars must trim trailing underscores.
+	long := "alpha_beta_gamma_delta_epsilon_zeta_eta"
+	normLong := exp.NormalizeOpenErrorReason(long)
+	if len(normLong) > 32 || strings.HasSuffix(normLong, "_") {
+		t.Errorf("unexpected truncated reason: %q", normLong)
+	}
+	// Pre-prefixed unnormalized signatures are re-normalized while preserving clean v1:open_error:<snake> tags.
+	if got := exp.FormatOpenErrorSignature("v1:open_error:corrupt MANIFEST-000007"); got != "v1:open_error:manifest_corrupt" {
+		t.Errorf("FormatOpenErrorSignature pre-prefixed = %q", got)
+	}
+	if got := exp.FormatOpenErrorSignature("v1:open_error:custom_reason_1"); got != "v1:open_error:custom_reason_1" {
+		t.Errorf("FormatOpenErrorSignature clean = %q", got)
+	}
+
+	// Panic and Hang normalization with hex pointers and pre-prefixed strings.
+	p1 := exp.FormatPanicSignature("v1:panic:goroutine fail at 0xc0001a2b00 step 42")
+	p2 := exp.FormatPanicSignature("goroutine fail at 0xdeadbeef step 99")
+	if p1 != p2 || p1 != "v1:panic:goroutine fail at N step N" {
+		t.Errorf("FormatPanicSignature hex/num mismatch: %q vs %q", p1, p2)
+	}
+	if got := exp.FormatHangSignature("   "); got != "v1:hang:timeout" {
+		t.Errorf("FormatHangSignature blank = %q, want v1:hang:timeout", got)
+	}
+	if got := exp.FormatPanicSignature(""); got != "v1:panic:unknown" {
+		t.Errorf("FormatPanicSignature blank = %q, want v1:panic:unknown", got)
+	}
+}
+
+func TestEncodeDecodeOutcomesAndRankingErrors(t *testing.T) {
+	// DecodeOutcomes error cases: unknown field, trailing data, non-canonical event order.
+	for name, payload := range map[string]string{
+		"unknown_field": `{"schema_version":1,"extra":1,"outcomes":[]}`,
+		"trailing_data": `{"schema_version":1,"outcomes":[]}{"extra":true}`,
+		"non_canonical": `{"schema_version":1,"outcomes":[{"candidate":{"event":2,"percent":0,"seed":1},"class":"valid"},{"candidate":{"event":1,"percent":0,"seed":1},"class":"valid"}]}`,
+		"bad_version":   `{"schema_version":2,"outcomes":[]}`,
+	} {
+		if _, err := exp.DecodeOutcomes(strings.NewReader(payload)); err == nil {
+			t.Errorf("DecodeOutcomes(%s): expected error, got nil", name)
+		}
+	}
+
+	u := makeTestUniverse(3)
+	doc := exp.RankingDocument{
+		Strategy:    "custom",
+		RankingSeed: 7,
+		Candidates:  []candidate.Candidate{u[2], u[0], u[1]},
+	}
+	var buf bytes.Buffer
+	if err := exp.EncodeRanking(&buf, doc); err != nil {
+		t.Fatalf("EncodeRanking: %v", err)
+	}
+	decoded, err := exp.DecodeRanking(&buf)
+	if err != nil {
+		t.Fatalf("DecodeRanking: %v", err)
+	}
+	if decoded.SchemaVersion != exp.Version || decoded.Strategy != "custom" || len(decoded.Candidates) != 3 {
+		t.Fatalf("decoded ranking mismatch: %+v", decoded)
+	}
+
+	// EncodeRanking errors
+	if err := exp.EncodeRanking(&bytes.Buffer{}, exp.RankingDocument{Candidates: u}); err == nil {
+		t.Error("EncodeRanking empty strategy should fail")
+	}
+	if err := exp.EncodeRanking(&bytes.Buffer{}, exp.RankingDocument{Strategy: "s"}); err == nil {
+		t.Error("EncodeRanking nil candidates should fail")
+	}
+	if err := exp.EncodeRanking(&bytes.Buffer{}, exp.RankingDocument{Strategy: "s", Candidates: []candidate.Candidate{u[0], u[0]}}); err == nil {
+		t.Error("EncodeRanking duplicate candidate should fail")
+	}
+
+	// DecodeRanking errors
+	for name, payload := range map[string]string{
+		"bad_version":    `{"schema_version":2,"strategy":"s","candidates":[]}`,
+		"missing_strat":  `{"schema_version":1,"candidates":[]}`,
+		"nil_candidates": `{"schema_version":1,"strategy":"s"}`,
+		"unknown_field":  `{"schema_version":1,"strategy":"s","candidates":[],"extra":1}`,
+		"trailing_data":  `{"schema_version":1,"strategy":"s","candidates":[]}{"a":1}`,
+		"duplicate_cand": `{"schema_version":1,"strategy":"s","candidates":[{"event":1,"percent":0,"seed":1},{"event":1,"percent":0,"seed":1}]}`,
+	} {
+		if _, err := exp.DecodeRanking(strings.NewReader(payload)); err == nil {
+			t.Errorf("DecodeRanking(%s): expected error, got nil", name)
+		}
 	}
 }

@@ -1,9 +1,9 @@
 package exp_test
 
 import (
-	"bytes"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/akshatrathore1/CraConTest/internal/exp"
@@ -13,7 +13,7 @@ import (
 // main 1,000-operation runs (MUT-0 to MUT-4) from their stored outcome tables and checks them
 // against the committed CSVs and the reported totals. No candidate is executed.
 func TestMainRunArtifactsMatchStoredTables(t *testing.T) {
-	results := filepath.Join("..", "..", "results")
+	results := findResultsDir(t)
 	for _, run := range []struct {
 		name               string
 		failures, distinct int
@@ -30,16 +30,34 @@ func TestMainRunArtifactsMatchStoredTables(t *testing.T) {
 		}
 		out := t.TempDir()
 		csvPath := filepath.Join(out, "discovery.csv")
-		report, err := exp.GenerateG4Artifacts(runDir, csvPath, filepath.Join(out, "plot.svg"))
+		svgPath := filepath.Join(out, "plot.svg")
+		report, err := exp.GenerateG4Artifacts(runDir, csvPath, svgPath)
 		if err != nil {
 			t.Fatalf("main_%s: %v", run.name, err)
 		}
+		if len(report.B0Summary) == 0 {
+			t.Fatalf("main_%s: empty B0Summary", run.name)
+		}
+		if len(report.Curves) != 3 {
+			t.Fatalf("main_%s: expected 3 curves (B4, B5, B6), got %d", run.name, len(report.Curves))
+		}
 		for _, curve := range report.Curves {
+			if len(curve.Points) == 0 {
+				t.Fatalf("main_%s %s: empty Points", run.name, curve.Name)
+			}
 			last := curve.Points[len(curve.Points)-1]
 			if last.Failures != run.failures || last.DistinctBugs != run.distinct {
 				t.Errorf("main_%s %s: terminal failures=%d distinct=%d, want %d and %d",
 					run.name, curve.Name, last.Failures, last.DistinctBugs, run.failures, run.distinct)
 			}
+		}
+		svgBytes, err := os.ReadFile(svgPath)
+		if err != nil {
+			t.Fatalf("main_%s: read SVG %s: %v", run.name, svgPath, err)
+		}
+		svgText := string(svgBytes)
+		if !strings.Contains(svgText, "<svg") || !strings.Contains(svgText, "</svg>") {
+			t.Errorf("main_%s: malformed SVG %s", run.name, svgPath)
 		}
 		got, err := os.ReadFile(csvPath)
 		if err != nil {
@@ -49,9 +67,8 @@ func TestMainRunArtifactsMatchStoredTables(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		crlf := []byte("\r\n")
-		if !bytes.Equal(bytes.ReplaceAll(got, crlf, []byte("\n")), bytes.ReplaceAll(want, crlf, []byte("\n"))) {
-			t.Errorf("results/discovery_main_%s.csv is stale: regenerate it with cracontest evaluate", run.name)
+		if msg := diffCSVLines(got, want); msg != "" {
+			t.Errorf("results/discovery_main_%s.csv is stale (%s): regenerate it with cracontest evaluate", run.name, msg)
 		}
 	}
 }

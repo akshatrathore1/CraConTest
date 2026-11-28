@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"math"
 	"math/rand/v2"
+	"os"
 	"sort"
 	"strings"
 	"testing"
@@ -265,7 +267,10 @@ func TestReplayNamespaceAndErrorOperations(t *testing.T) {
 		t.Fatalf("Open file3: %v", err)
 	}
 	defer c3.Close()
-	content, _ := io.ReadAll(c3)
+	content, err := io.ReadAll(c3)
+	if err != nil {
+		t.Fatalf("ReadAll file3: %v", err)
+	}
 	if string(content) != "test" {
 		t.Fatalf("content got %q, want %q", string(content), "test")
 	}
@@ -311,6 +316,23 @@ func TestReplayCursorTrackingWithReadAndWrite(t *testing.T) {
 		t.Fatalf("replay.Build: %v", err)
 	}
 	defer state.Close()
+
+	cloned, err := state.Clone(100, 1)
+	if err != nil {
+		t.Fatalf("Clone: %v", err)
+	}
+	cf, err := cloned.Open("rw.txt")
+	if err != nil {
+		t.Fatalf("cloned.Open(rw.txt): %v", err)
+	}
+	defer cf.Close()
+	got, err := io.ReadAll(cf)
+	if err != nil {
+		t.Fatalf("ReadAll(rw.txt): %v", err)
+	}
+	if string(got) != "abcdef" {
+		t.Fatalf("replayed rw.txt content = %q, want %q", string(got), "abcdef")
+	}
 }
 
 func TestReplayPebbleCrashRecovery(t *testing.T) {
@@ -1013,23 +1035,30 @@ func TestReplayPartialCloneInPlaceOverwriteAfterSync(t *testing.T) {
 
 		// Check synced_dir file:
 		fSynced, err := cl50.Open("synced_dir/file.txt")
-		if err == nil {
-			b, _ := io.ReadAll(fSynced)
-			_ = fSynced.Close()
-			if bytes.Equal(b, dataA) {
-				sawUnretainedSynced = true
-			} else if bytes.Equal(b, dataB) {
-				sawRetainedSynced = true
-			} else {
-				t.Fatalf("seed %d: synced_dir/file.txt contains corrupted bytes: %q", seed, b[:16])
-			}
+		if err != nil {
+			t.Fatalf("seed %d: open synced_dir/file.txt: %v", seed, err)
+		}
+		b, readErr := io.ReadAll(fSynced)
+		closeErr := fSynced.Close()
+		if err := errors.Join(readErr, closeErr); err != nil {
+			t.Fatalf("seed %d: read synced_dir/file.txt: %v", seed, err)
+		}
+		if bytes.Equal(b, dataA) {
+			sawUnretainedSynced = true
+		} else if bytes.Equal(b, dataB) {
+			sawRetainedSynced = true
+		} else {
+			t.Fatalf("seed %d: synced_dir/file.txt contains corrupted bytes: %q", seed, b[:16])
 		}
 
 		// Check unsynced_dir file (when directory entry is retained):
 		fUnsynced, err := cl50.Open("unsynced_dir/file.txt")
 		if err == nil {
-			b, _ := io.ReadAll(fUnsynced)
-			_ = fUnsynced.Close()
+			b, readErr := io.ReadAll(fUnsynced)
+			closeErr := fUnsynced.Close()
+			if err := errors.Join(readErr, closeErr); err != nil {
+				t.Fatalf("seed %d: read unsynced_dir/file.txt: %v", seed, err)
+			}
 			if bytes.Equal(b, dataA) {
 				sawUnretainedUnsynced = true
 			} else if bytes.Equal(b, dataB) {
@@ -1037,6 +1066,8 @@ func TestReplayPartialCloneInPlaceOverwriteAfterSync(t *testing.T) {
 			} else {
 				t.Fatalf("seed %d: unsynced_dir/file.txt contains corrupted bytes: %q", seed, b[:16])
 			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("seed %d: open unsynced_dir/file.txt unexpected error: %v", seed, err)
 		}
 	}
 
@@ -1331,13 +1362,21 @@ func TestReplayEndpointEquivalenceAndBoundaryContainment(t *testing.T) {
 				if err != nil {
 					t.Fatalf("Open %s in Clone(%d): %v", p, pct, err)
 				}
-				bytesPct, _ := io.ReadAll(fPct)
-				_ = fPct.Close()
+				bytesPct, readErr := io.ReadAll(fPct)
+				closeErr := fPct.Close()
+				if err := errors.Join(readErr, closeErr); err != nil {
+					t.Fatalf("ReadAll %s in Clone(%d): %v", p, pct, err)
+				}
 
 				var bytes0 []byte
 				if f0, err := fs0.Open(p); err == nil {
-					bytes0, _ = io.ReadAll(f0)
-					_ = f0.Close()
+					bytes0, readErr = io.ReadAll(f0)
+					closeErr = f0.Close()
+					if err := errors.Join(readErr, closeErr); err != nil {
+						t.Fatalf("ReadAll %s in Clone(0): %v", p, err)
+					}
+				} else if !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("Open %s in Clone(0): %v", p, err)
 				} else if state.FileSyncedBytesForTesting() != nil {
 					bytes0 = state.FileSyncedBytesForTesting()[p]
 				}
@@ -1346,8 +1385,11 @@ func TestReplayEndpointEquivalenceAndBoundaryContainment(t *testing.T) {
 				if err != nil {
 					t.Fatalf("Open %s in Clone(100): %v", p, err)
 				}
-				bytes100, _ := io.ReadAll(f100)
-				_ = f100.Close()
+				bytes100, readErr := io.ReadAll(f100)
+				closeErr = f100.Close()
+				if err := errors.Join(readErr, closeErr); err != nil {
+					t.Fatalf("ReadAll %s in Clone(100): %v", p, err)
+				}
 
 				for off := 0; off < len(bytesPct); off += 4096 {
 					endPct := off + 4096
@@ -1544,8 +1586,13 @@ func TestDeterministicPartialCloneUnsyncedTruncation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got0, _ := io.ReadAll(cf)
-	_ = cf.Close()
+	got0, err := io.ReadAll(cf)
+	if closeErr := cf.Close(); closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !bytes.Equal(got0, syncedData) {
 		t.Fatalf("percent=0: expected synced data %q, got %q", string(syncedData), string(got0))
 	}
@@ -1560,10 +1607,64 @@ func TestDeterministicPartialCloneUnsyncedTruncation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got100, _ := io.ReadAll(cf100)
-	_ = cf100.Close()
+	got100, err := io.ReadAll(cf100)
+	if closeErr := cf100.Close(); closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !bytes.Equal(got100, shortData) {
 		t.Fatalf("percent=100: expected short data %q, got %q", string(shortData), string(got100))
+	}
+
+	// Verify 50% truncation via State.Clone across seeds: each clone has either full syncedData or shortData.
+	events := []trace.Event{
+		{ID: 1, Kind: trace.KindCreate, File: "test.txt", Handle: 1},
+		{ID: 2, Kind: trace.KindWrite, File: "test.txt", Handle: 1, Data: bytes.Clone(syncedData), Len: len(syncedData)},
+		{ID: 3, Kind: trace.KindSync, File: "test.txt", Handle: 1},
+		{ID: 4, Kind: trace.KindClose, File: "test.txt", Handle: 1},
+		{ID: 5, Kind: trace.KindOpenDir, File: "", Handle: 2, Dir: true},
+		{ID: 6, Kind: trace.KindSync, File: "", Handle: 2, Dir: true},
+		{ID: 7, Kind: trace.KindClose, File: "", Handle: 2, Dir: true},
+		{ID: 8, Kind: trace.KindCreate, File: "test.txt", Handle: 3},
+		{ID: 9, Kind: trace.KindWrite, File: "test.txt", Handle: 3, Data: bytes.Clone(shortData), Len: len(shortData)},
+		{ID: 10, Kind: trace.KindClose, File: "test.txt", Handle: 3},
+	}
+	state, err := replay.Replay(events)
+	if err != nil {
+		t.Fatalf("Replay truncation trace: %v", err)
+	}
+	defer state.Close()
+
+	var sawFull, sawShort bool
+	for seed := uint64(1); seed <= 64; seed++ {
+		cl50, err := state.Clone(50, seed)
+		if err != nil {
+			t.Fatalf("Clone(50, %d): %v", seed, err)
+		}
+		f50, err := cl50.Open("test.txt")
+		if err != nil {
+			t.Fatalf("seed %d Open(test.txt): %v", seed, err)
+		}
+		got50, err := io.ReadAll(f50)
+		if closeErr := f50.Close(); closeErr != nil {
+			t.Fatal(closeErr)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch {
+		case bytes.Equal(got50, syncedData):
+			sawFull = true
+		case bytes.Equal(got50, shortData):
+			sawShort = true
+		default:
+			t.Fatalf("seed %d: unexpected hybrid truncation content %q", seed, got50)
+		}
+	}
+	if !sawFull || !sawShort {
+		t.Fatalf("expected both full and truncated outcomes at 50%%, sawFull=%v sawShort=%v", sawFull, sawShort)
 	}
 }
 
@@ -1621,5 +1722,604 @@ func TestReplayWriteBoundsCheck(t *testing.T) {
 	errWriteAt := state.AdvanceStepForTesting(corruptWriteAt)
 	if errWriteAt == nil {
 		t.Errorf("expected error on corrupt writeAt length, got nil")
+	}
+}
+
+func TestReplayHardLinkZeroReadAndUnlinkedZeroHandle(t *testing.T) {
+	t.Run("HardLinkedAliasesStayByteIdenticalOnPartialClone", func(t *testing.T) {
+		blockA := bytes.Repeat([]byte("A"), 4096)
+		blockZ := bytes.Repeat([]byte("Z"), 4096)
+		events := []trace.Event{
+			{ID: 1, Kind: trace.KindMkdirAll, File: "db", Mode: 0755},
+			{ID: 2, Kind: trace.KindOpenDir, File: "", Handle: 1, Dir: true},
+			{ID: 3, Kind: trace.KindSync, File: "", Handle: 1, Dir: true},
+			{ID: 4, Kind: trace.KindOpenDir, File: "db", Handle: 2, Dir: true},
+			{ID: 5, Kind: trace.KindCreate, File: "db/a.sst", Handle: 3, Cat: "pebble-sst"},
+			{ID: 6, Kind: trace.KindWrite, File: "db/a.sst", Handle: 3, Data: blockA, Len: len(blockA)},
+			{ID: 7, Kind: trace.KindSyncData, File: "db/a.sst", Handle: 3},
+			{ID: 8, Kind: trace.KindClose, File: "db/a.sst", Handle: 3},
+			{ID: 9, Kind: trace.KindLink, File: "db/a.sst", File2: "db/b.sst"},
+			{ID: 10, Kind: trace.KindSync, File: "db", Handle: 2, Dir: true},
+			{ID: 11, Kind: trace.KindOpenReadWrite, File: "db/a.sst", Handle: 4, Cat: "pebble-sst"},
+			{ID: 12, Kind: trace.KindWriteAt, File: "db/a.sst", Handle: 4, Off: 0, Data: blockZ, Len: len(blockZ)},
+			{ID: 13, Kind: trace.KindClose, File: "db/a.sst", Handle: 4},
+		}
+		state, err := replay.Replay(events)
+		if err != nil {
+			t.Fatalf("replay.Replay: %v", err)
+		}
+		defer state.Close()
+
+		for seed := uint64(0); seed < 10; seed++ {
+			fs50, err := state.Clone(50, seed)
+			if err != nil {
+				t.Fatalf("Clone(50, %d): %v", seed, err)
+			}
+			fa, err := fs50.Open("db/a.sst")
+			if err != nil {
+				t.Fatalf("open db/a.sst: %v", err)
+			}
+			ba, readErr := io.ReadAll(fa)
+			closeErr := fa.Close()
+			if err := errors.Join(readErr, closeErr); err != nil {
+				t.Fatalf("read db/a.sst: %v", err)
+			}
+
+			fb, err := fs50.Open("db/b.sst")
+			if err != nil {
+				t.Fatalf("open db/b.sst: %v", err)
+			}
+			bb, readErr := io.ReadAll(fb)
+			closeErr = fb.Close()
+			if err := errors.Join(readErr, closeErr); err != nil {
+				t.Fatalf("read db/b.sst: %v", err)
+			}
+
+			if !bytes.Equal(ba, bb) {
+				t.Fatalf("seed %d: hard-linked aliases diverged under 50%% clone", seed)
+			}
+		}
+	})
+
+	t.Run("ZeroSizeReadChecksRecordedError", func(t *testing.T) {
+		events := []trace.Event{
+			{ID: 1, Kind: trace.KindCreate, File: "db.txt", Handle: 1},
+			{ID: 2, Kind: trace.KindWrite, File: "db.txt", Handle: 1, Data: []byte("hi"), Len: 2},
+			{ID: 3, Kind: trace.KindClose, File: "db.txt", Handle: 1},
+			{ID: 4, Kind: trace.KindOpenReadWrite, File: "db.txt", Handle: 2},
+			{ID: 5, Kind: trace.KindRead, File: "db.txt", Handle: 2, Size: 0, Err: "injected read error"},
+		}
+		if _, err := replay.Replay(events); err == nil {
+			t.Fatal("expected error mismatch on zero-byte KindRead with non-empty Err")
+		}
+	})
+
+	t.Run("UnlinkedOpenZeroByteHandleSnapshot", func(t *testing.T) {
+		events := []trace.Event{
+			{ID: 1, Kind: trace.KindCreate, File: "tmp.txt", Handle: 1},
+			{ID: 2, Kind: trace.KindRemove, File: "tmp.txt"},
+			{ID: 3, Kind: trace.KindSyncData, File: "tmp.txt", Handle: 1},
+		}
+		state, err := replay.Replay(events)
+		if err != nil {
+			t.Fatalf("replay.Replay: %v", err)
+		}
+		defer state.Close()
+		if len(state.FileSyncedBytesForTesting()["tmp.txt"]) != 0 {
+			t.Fatalf("expected empty snapshot for unlinked 0-byte file, got %q", state.FileSyncedBytesForTesting()["tmp.txt"])
+		}
+	})
+}
+
+func TestReplayPartialWritesAndBoundsValidation(t *testing.T) {
+	t.Run("PartialKindWriteAndKindWriteAt", func(t *testing.T) {
+		events := []trace.Event{
+			{ID: 1, Kind: trace.KindCreate, File: "data.txt", Handle: 1},
+			{ID: 2, Kind: trace.KindWrite, File: "data.txt", Handle: 1, Off: 0, Data: []byte("abcd"), Len: 2, Err: "short write"},
+			{ID: 3, Kind: trace.KindWrite, File: "data.txt", Handle: 1, Off: 2, Data: []byte("ef"), Len: 2},
+			{ID: 4, Kind: trace.KindWriteAt, File: "data.txt", Handle: 1, Off: 1, Data: []byte("XYZW"), Len: 2, Err: "short writeAt"},
+			{ID: 5, Kind: trace.KindWrite, File: "data.txt", Handle: 1, Off: 4, Data: []byte("zz"), Len: 0, Err: "enospc"},
+			{ID: 6, Kind: trace.KindClose, File: "data.txt", Handle: 1},
+		}
+		state, err := replay.Replay(events)
+		if err != nil {
+			t.Fatalf("replay.Replay partial writes: %v", err)
+		}
+		defer state.Close()
+
+		cloned, err := state.Clone(100, 1)
+		if err != nil {
+			t.Fatalf("Clone(100): %v", err)
+		}
+		f, err := cloned.Open("data.txt")
+		if err != nil {
+			t.Fatalf("Open(data.txt): %v", err)
+		}
+		defer f.Close()
+		got, err := io.ReadAll(f)
+		if err != nil {
+			t.Fatalf("ReadAll: %v", err)
+		}
+		if string(got) != "aXYf" {
+			t.Fatalf("partial write replay content = %q, want %q", string(got), "aXYf")
+		}
+	})
+
+	t.Run("ErrorBearingWriteBoundsCheck", func(t *testing.T) {
+		events := []trace.Event{
+			{ID: 1, Kind: trace.KindCreate, File: "f.txt", Handle: 1},
+		}
+		state, err := replay.Build(events, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer state.Close()
+
+		badCases := []trace.Event{
+			{ID: 2, Kind: trace.KindWrite, File: "f.txt", Handle: 1, Data: []byte("hi"), Len: 5, Err: "corrupt"},
+			{ID: 2, Kind: trace.KindWriteAt, File: "f.txt", Handle: 1, Off: 0, Data: []byte("hi"), Len: 5, Err: "corrupt"},
+			{ID: 2, Kind: trace.KindWrite, File: "f.txt", Handle: 1, Data: []byte("hi"), Len: -1, Err: "neg"},
+			{ID: 2, Kind: trace.KindWriteAt, File: "f.txt", Handle: 1, Off: -1, Data: []byte("hi"), Len: 2},
+			{ID: 2, Kind: trace.KindWrite, File: "f.txt", Handle: 1, Data: []byte("hi"), Len: 1},
+		}
+		for i, ev := range badCases {
+			if err := state.AdvanceStepForTesting(ev); err == nil {
+				t.Fatalf("badCases[%d]: expected error, got nil", i)
+			}
+		}
+	})
+}
+
+func TestReplayReuseForWritePreservesSnapshotAndLinks(t *testing.T) {
+	blockA := bytes.Repeat([]byte("A"), 4096)
+	blockB := bytes.Repeat([]byte("B"), 4096)
+
+	events := []trace.Event{
+		{ID: 1, Kind: trace.KindCreate, File: "old.log", Handle: 1, Cat: "pebble-wal"},
+		{ID: 2, Kind: trace.KindWrite, File: "old.log", Handle: 1, Data: blockA, Len: len(blockA)},
+		{ID: 3, Kind: trace.KindSyncData, File: "old.log", Handle: 1},
+		{ID: 4, Kind: trace.KindClose, File: "old.log", Handle: 1},
+		{ID: 5, Kind: trace.KindLink, File: "old.log", File2: "alias.log"},
+		{ID: 6, Kind: trace.KindReuseForWrite, File: "old.log", File2: "new.log", Handle: 2, Cat: "pebble-wal"},
+		{ID: 7, Kind: trace.KindWrite, File: "new.log", Handle: 2, Data: blockB, Len: len(blockB)},
+		{ID: 8, Kind: trace.KindClose, File: "new.log", Handle: 2},
+	}
+
+	state, err := replay.Replay(events)
+	if err != nil {
+		t.Fatalf("replay.Replay: %v", err)
+	}
+	defer state.Close()
+
+	synced := state.FileSyncedBytesForTesting()
+	if !bytes.Equal(synced["new.log"], blockA) {
+		t.Fatalf("new.log synced snapshot len=%d, want %d (blockA)", len(synced["new.log"]), len(blockA))
+	}
+
+	sawNew := false
+	for seed := uint64(1); seed <= 64; seed++ {
+		fs50, err := state.Clone(50, seed)
+		if err != nil {
+			t.Fatalf("Clone(50, %d): %v", seed, err)
+		}
+		fNew, errNew := fs50.Open("new.log")
+		if errNew == nil {
+			sawNew = true
+			bNew, err := io.ReadAll(fNew)
+			_ = fNew.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Durable blockA must be intact at offset 0 even under 50% clone,
+			// with optional unsynced blockB overwrite.
+			if len(bNew) != len(blockA) || (!bytes.Equal(bNew, blockA) && !bytes.Equal(bNew, blockB)) {
+				t.Fatalf("seed %d: new.log corrupted after ReuseForWrite: len=%d", seed, len(bNew))
+			}
+
+			fAlias, errAlias := fs50.Open("alias.log")
+			if errAlias == nil {
+				bAlias, err := io.ReadAll(fAlias)
+				_ = fAlias.Close()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !bytes.Equal(bNew, bAlias) {
+					t.Fatalf("seed %d: hard-linked alias.log diverged from reused new.log", seed)
+				}
+			}
+		} else if !errors.Is(errNew, os.ErrNotExist) {
+			t.Fatalf("seed %d: unexpected Open(new.log) error: %v", seed, errNew)
+		}
+	}
+	if !sawNew {
+		t.Fatal("expected new.log to be retained in at least one 50% clone")
+	}
+
+	// Failed ReuseForWrite must prune unlinked source from filePaths.
+	failEvents := []trace.Event{
+		{ID: 1, Kind: trace.KindCreate, File: "src.log", Handle: 1},
+		{ID: 2, Kind: trace.KindWrite, File: "src.log", Handle: 1, Data: []byte("abc"), Len: 3},
+		{ID: 3, Kind: trace.KindSync, File: "src.log", Handle: 1},
+		{ID: 4, Kind: trace.KindClose, File: "src.log", Handle: 1},
+		{ID: 5, Kind: trace.KindReuseForWrite, File: "src.log", File2: "missing/dst.log", Err: "no such file"},
+	}
+	failState, err := replay.Replay(failEvents)
+	if err != nil {
+		t.Fatalf("Replay failed ReuseForWrite: %v", err)
+	}
+	defer failState.Close()
+	if _, exists := failState.FileSyncedBytesForTesting()["src.log"]; exists {
+		t.Fatal("expected unlinked src.log to be pruned from filePaths after failed ReuseForWrite")
+	}
+}
+
+type failingTestFile struct {
+	vfs.File
+	statErr   error
+	readAtErr error
+	closeErr  error
+	syncErr   error
+}
+
+func (f failingTestFile) Stat() (vfs.FileInfo, error) {
+	if f.statErr != nil {
+		return nil, f.statErr
+	}
+	return f.File.Stat()
+}
+
+func (f failingTestFile) ReadAt(p []byte, off int64) (int, error) {
+	if f.readAtErr != nil {
+		return 0, f.readAtErr
+	}
+	return f.File.ReadAt(p, off)
+}
+
+func (f failingTestFile) Close() error {
+	_ = f.File.Close()
+	return f.closeErr
+}
+
+func (f failingTestFile) Sync() error {
+	if f.syncErr != nil {
+		return f.syncErr
+	}
+	return f.File.Sync()
+}
+
+type failingListFS struct {
+	vfs.FS
+	listErr error
+}
+
+func (fs failingListFS) List(dir string) ([]string, error) {
+	if fs.listErr != nil {
+		return nil, fs.listErr
+	}
+	return fs.FS.List(dir)
+}
+
+func TestReplayPartialCloneTypeReplacementNestedSyncAndErrors(t *testing.T) {
+	t.Run("SyncedFileReplacedByDir", func(t *testing.T) {
+		events := []trace.Event{
+			{ID: 1, Kind: trace.KindCreate, File: "node", Handle: 1},
+			{ID: 2, Kind: trace.KindWrite, File: "node", Handle: 1, Data: []byte("durable"), Len: 7},
+			{ID: 3, Kind: trace.KindSync, File: "node", Handle: 1},
+			{ID: 4, Kind: trace.KindClose, File: "node", Handle: 1},
+			{ID: 5, Kind: trace.KindOpenDir, File: "", Handle: 2, Dir: true},
+			{ID: 6, Kind: trace.KindSync, File: "", Handle: 2, Dir: true},
+			{ID: 7, Kind: trace.KindClose, File: "", Handle: 2, Dir: true},
+			{ID: 8, Kind: trace.KindRemove, File: "node"},
+			{ID: 9, Kind: trace.KindMkdirAll, File: "node", Mode: 0755},
+			{ID: 10, Kind: trace.KindCreate, File: "node/child.txt", Handle: 3},
+			{ID: 11, Kind: trace.KindWrite, File: "node/child.txt", Handle: 3, Data: []byte("kid"), Len: 3},
+			{ID: 12, Kind: trace.KindClose, File: "node/child.txt", Handle: 3},
+		}
+		state, err := replay.Replay(events)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer state.Close()
+
+		var sawFile, sawDir bool
+		for seed := uint64(1); seed <= 64; seed++ {
+			cl50, err := state.Clone(50, seed)
+			if err != nil {
+				t.Fatalf("Clone(50, %d): %v", seed, err)
+			}
+			fi, err := cl50.Stat("node")
+			if err != nil {
+				t.Fatalf("seed %d Stat(node): %v", seed, err)
+			}
+			if fi.IsDir() {
+				sawDir = true
+			} else {
+				sawFile = true
+				f, err := cl50.Open("node")
+				if err != nil {
+					t.Fatal(err)
+				}
+				b, err := io.ReadAll(f)
+				_ = f.Close()
+				if err != nil || string(b) != "durable" {
+					t.Fatalf("seed %d: durable file corrupted: %q %v", seed, b, err)
+				}
+			}
+		}
+		if !sawFile || !sawDir {
+			t.Fatalf("expected both file and dir outcomes across seeds, sawFile=%v sawDir=%v", sawFile, sawDir)
+		}
+	})
+
+	t.Run("SyncedDirReplacedByFile", func(t *testing.T) {
+		events := []trace.Event{
+			{ID: 1, Kind: trace.KindMkdirAll, File: "node", Mode: 0755},
+			{ID: 2, Kind: trace.KindCreate, File: "node/keep.txt", Handle: 1},
+			{ID: 3, Kind: trace.KindWrite, File: "node/keep.txt", Handle: 1, Data: []byte("keep"), Len: 4},
+			{ID: 4, Kind: trace.KindSync, File: "node/keep.txt", Handle: 1},
+			{ID: 5, Kind: trace.KindClose, File: "node/keep.txt", Handle: 1},
+			{ID: 6, Kind: trace.KindOpenDir, File: "node", Handle: 2, Dir: true},
+			{ID: 7, Kind: trace.KindSync, File: "node", Handle: 2, Dir: true},
+			{ID: 8, Kind: trace.KindClose, File: "node", Handle: 2, Dir: true},
+			{ID: 9, Kind: trace.KindOpenDir, File: "", Handle: 3, Dir: true},
+			{ID: 10, Kind: trace.KindSync, File: "", Handle: 3, Dir: true},
+			{ID: 11, Kind: trace.KindClose, File: "", Handle: 3, Dir: true},
+			{ID: 12, Kind: trace.KindRemoveAll, File: "node"},
+			{ID: 13, Kind: trace.KindCreate, File: "node", Handle: 4},
+			{ID: 14, Kind: trace.KindWrite, File: "node", Handle: 4, Data: []byte("newfile"), Len: 7},
+			{ID: 15, Kind: trace.KindClose, File: "node", Handle: 4},
+		}
+		state, err := replay.Replay(events)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer state.Close()
+
+		var sawFile, sawDir bool
+		for seed := uint64(1); seed <= 64; seed++ {
+			cl50, err := state.Clone(50, seed)
+			if err != nil {
+				t.Fatalf("Clone(50, %d): %v", seed, err)
+			}
+			fi, err := cl50.Stat("node")
+			if err != nil {
+				t.Fatalf("seed %d Stat(node): %v", seed, err)
+			}
+			if fi.IsDir() {
+				sawDir = true
+				f, err := cl50.Open("node/keep.txt")
+				if err != nil {
+					t.Fatalf("seed %d: Open(node/keep.txt): %v", seed, err)
+				}
+				b, err := io.ReadAll(f)
+				_ = f.Close()
+				if err != nil || string(b) != "keep" {
+					t.Fatalf("seed %d: keep.txt mismatch: %q %v", seed, b, err)
+				}
+			} else {
+				sawFile = true
+			}
+		}
+		if !sawFile || !sawDir {
+			t.Fatalf("expected both dir and file outcomes across seeds, sawDir=%v sawFile=%v", sawDir, sawFile)
+		}
+	})
+
+	t.Run("NestedSyncedDirUnderUnsyncedParentRetainsSyncedChildrenAtomically", func(t *testing.T) {
+		events := []trace.Event{
+			{ID: 1, Kind: trace.KindMkdirAll, File: "unsynced_parent", Mode: 0755},
+			{ID: 2, Kind: trace.KindCreate, File: "unsynced_parent/keep.txt", Handle: 1},
+			{ID: 3, Kind: trace.KindWrite, File: "unsynced_parent/keep.txt", Handle: 1, Data: []byte("durable"), Len: 7},
+			{ID: 4, Kind: trace.KindSync, File: "unsynced_parent/keep.txt", Handle: 1},
+			{ID: 5, Kind: trace.KindClose, File: "unsynced_parent/keep.txt", Handle: 1},
+			{ID: 6, Kind: trace.KindOpenDir, File: "unsynced_parent", Handle: 2, Dir: true},
+			{ID: 7, Kind: trace.KindSync, File: "unsynced_parent", Handle: 2, Dir: true},
+			{ID: 8, Kind: trace.KindClose, File: "unsynced_parent", Handle: 2, Dir: true},
+		}
+		state, err := replay.Replay(events)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer state.Close()
+
+		sawDir := false
+		for seed := uint64(1); seed <= 64; seed++ {
+			cl50, err := state.Clone(50, seed)
+			if err != nil {
+				t.Fatalf("Clone(50, %d): %v", seed, err)
+			}
+			if _, err := cl50.Stat("unsynced_parent"); err == nil {
+				sawDir = true
+				f, err := cl50.Open("unsynced_parent/keep.txt")
+				if err != nil {
+					t.Fatalf("seed %d: synced child missing inside retained nested-synced dir: %v", seed, err)
+				}
+				b, err := io.ReadAll(f)
+				_ = f.Close()
+				if err != nil || string(b) != "durable" {
+					t.Fatalf("seed %d: keep.txt content = %q, err=%v", seed, b, err)
+				}
+			}
+		}
+		if !sawDir {
+			t.Fatal("expected unsynced_parent to be retained in at least one seed")
+		}
+	})
+
+	t.Run("ErrorPropagationInPartialCloneAndUnlinkedSnapshot", func(t *testing.T) {
+		mem := vfs.NewCrashableMem()
+		boom := errors.New("injected io failure")
+		_, err := replay.DeterministicPartialCloneForTesting(
+			failingListFS{FS: mem, listErr: boom},
+			mem,
+			50,
+			rand.New(rand.NewPCG(0, 1)),
+			nil,
+		)
+		if !errors.Is(err, boom) {
+			t.Fatalf("expected List error propagation, got %v", err)
+		}
+
+		events := []trace.Event{
+			{ID: 1, Kind: trace.KindCreate, File: "tmp.txt", Handle: 1},
+			{ID: 2, Kind: trace.KindWrite, File: "tmp.txt", Handle: 1, Data: []byte("abc"), Len: 3},
+			{ID: 3, Kind: trace.KindRemove, File: "tmp.txt"},
+		}
+		state, err := replay.Build(events, 3)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer state.Close()
+		state.WrapHandleForTesting(1, func(inner vfs.File) vfs.File {
+			return failingTestFile{File: inner, readAtErr: boom}
+		})
+		err = state.AdvanceStepForTesting(trace.Event{ID: 4, Kind: trace.KindSyncData, File: "tmp.txt", Handle: 1})
+		if !errors.Is(err, boom) {
+			t.Fatalf("expected unlinked snapshot ReadAt error propagation, got %v", err)
+		}
+	})
+}
+
+func TestReplayAdvancePoisonCloseRetryPreallocateRemoveAllLock(t *testing.T) {
+	t.Run("PreallocateRemoveAllAndLock", func(t *testing.T) {
+		events := []trace.Event{
+			{ID: 1, Kind: trace.KindMkdirAll, File: "db", Mode: 0755},
+			{ID: 2, Kind: trace.KindLock, File: "db/LOCK", Handle: 1},
+			{ID: 3, Kind: trace.KindCreate, File: "db/data.sst", Handle: 2, Cat: "pebble-sst"},
+			{ID: 4, Kind: trace.KindPreallocate, File: "db/data.sst", Handle: 2, Off: 0, Size: 4096},
+			{ID: 5, Kind: trace.KindWrite, File: "db/data.sst", Handle: 2, Data: []byte("hello"), Len: 5},
+			{ID: 6, Kind: trace.KindClose, File: "db/data.sst", Handle: 2},
+			{ID: 7, Kind: trace.KindUnlock, File: "db/LOCK", Handle: 1},
+			{ID: 8, Kind: trace.KindRemoveAll, File: "db"},
+		}
+		state, err := replay.Build(events, 7)
+		if err != nil {
+			t.Fatalf("Build(7): %v", err)
+		}
+		defer state.Close()
+		if _, exists := state.FileSyncedBytesForTesting()["db/LOCK"]; !exists {
+			t.Fatal("expected db/LOCK to be tracked in filePaths after KindLock")
+		}
+		if err := state.Advance(8); err != nil {
+			t.Fatalf("Advance(8): %v", err)
+		}
+		if _, exists := state.FileSyncedBytesForTesting()["db/LOCK"]; exists {
+			t.Fatal("expected db/LOCK to be pruned after KindRemoveAll")
+		}
+		if _, exists := state.FileSyncedBytesForTesting()["db/data.sst"]; exists {
+			t.Fatal("expected db/data.sst to be pruned after KindRemoveAll")
+		}
+	})
+
+	t.Run("FailedDirectoryRenamePrunesChildSnapshots", func(t *testing.T) {
+		events := []trace.Event{
+			{ID: 1, Kind: trace.KindMkdirAll, File: "src", Mode: 0755},
+			{ID: 2, Kind: trace.KindCreate, File: "src/child.txt", Handle: 1},
+			{ID: 3, Kind: trace.KindWrite, File: "src/child.txt", Handle: 1, Data: []byte("data"), Len: 4},
+			{ID: 4, Kind: trace.KindSync, File: "src/child.txt", Handle: 1},
+			{ID: 5, Kind: trace.KindClose, File: "src/child.txt", Handle: 1},
+			{ID: 6, Kind: trace.KindRename, File: "src", File2: "missing/dst", Err: "open missing/dst: file does not exist"},
+		}
+		state, err := replay.Replay(events)
+		if err != nil {
+			t.Fatalf("Replay failed dir rename: %v", err)
+		}
+		defer state.Close()
+		if _, exists := state.FileSyncedBytesForTesting()["src/child.txt"]; exists {
+			t.Fatal("expected src/child.txt to be pruned after failed directory Rename unlinked src")
+		}
+	})
+
+	t.Run("AdvanceFailurePoisonsStateAndCloseDoesNotRetryErroredHandle", func(t *testing.T) {
+		events := []trace.Event{
+			{ID: 1, Kind: trace.KindCreate, File: "a.txt", Handle: 1},
+			{ID: 2, Kind: trace.KindWrite, File: "a.txt", Handle: 1, Data: []byte("abc"), Len: 3},
+			{ID: 3, Kind: trace.KindRead, File: "a.txt", Handle: 1, Off: 3, Size: 3, Len: 0},
+		}
+		state, err := replay.Build(events, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Close failure should still remove handle so second Close does not retry.
+		closeBoom := errors.New("close failed")
+		state.WrapHandleForTesting(1, func(inner vfs.File) vfs.File {
+			return failingTestFile{File: inner, closeErr: closeBoom}
+		})
+		if err := state.Close(); !errors.Is(err, closeBoom) {
+			t.Fatalf("first Close got %v, want %v", err, closeBoom)
+		}
+		if err := state.Close(); err != nil {
+			t.Fatalf("second Close retried errored handle: %v", err)
+		}
+
+		// Advance failure must poison State for subsequent Advance and Clone.
+		state2, err := replay.Build(events, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer state2.Close()
+		if err := state2.Advance(3); err == nil {
+			t.Fatal("expected Advance(3) to fail on read error mismatch")
+		}
+		if err := state2.Advance(3); err == nil {
+			t.Fatal("expected subsequent Advance after failure to return error")
+		}
+		if _, err := state2.Clone(100, 1); err == nil {
+			t.Fatal("expected Clone after Advance failure to return error")
+		}
+
+		// Negative sizes in Read/Preallocate/SyncTo must fail without panicking.
+		for _, bad := range []trace.Event{
+			{ID: 2, Kind: trace.KindRead, File: "a.txt", Handle: 1, Size: -5},
+			{ID: 2, Kind: trace.KindPreallocate, File: "a.txt", Handle: 1, Off: 0, Size: -1},
+			{ID: 2, Kind: trace.KindSyncTo, File: "a.txt", Handle: 1, Size: -1},
+		} {
+			if err := state2.AdvanceStepForTesting(bad); err == nil {
+				t.Fatalf("expected error on negative size event %+v", bad)
+			}
+		}
+	})
+}
+
+func TestReplayIncrementalAppendSyncSnapshot(t *testing.T) {
+	mem := vfs.NewCrashableMem()
+	rec := vfsrec.New(mem)
+
+	f, err := rec.Create("wal.log", "pebble-wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var expected []byte
+	for i := 0; i < 20; i++ {
+		chunk := bytes.Repeat([]byte{byte('a' + i)}, 128)
+		if _, err := f.Write(bytes.Clone(chunk)); err != nil {
+			t.Fatal(err)
+		}
+		expected = append(expected, chunk...)
+		if err := f.SyncData(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Now perform an in-place overwrite at offset 0 and sync again.
+	overwrite := []byte("OVERWRITE!")
+	if _, err := f.WriteAt(bytes.Clone(overwrite), 0); err != nil {
+		t.Fatal(err)
+	}
+	copy(expected[0:], overwrite)
+	if err := f.SyncData(); err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+
+	state, err := replay.Replay(rec.Events())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer state.Close()
+
+	got := state.FileSyncedBytesForTesting()["wal.log"]
+	if !bytes.Equal(got, expected) {
+		t.Fatalf("incremental + overwrite synced snapshot mismatch: len=%d want %d", len(got), len(expected))
 	}
 }
